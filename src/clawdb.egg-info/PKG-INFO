@@ -1,0 +1,41 @@
+Metadata-Version: 2.4
+Name: clawdb
+Version: 0.1.0
+Summary: Async memory backend for OpenClaw integration
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115.0
+Requires-Dist: uvicorn>=0.30.0
+Requires-Dist: pydantic>=2.8.0
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: pyarrow>=16.0.0
+Requires-Dist: prometheus-client>=0.21.0
+Requires-Dist: httpx>=0.27.0
+Requires-Dist: pyzmq>=26.0.0
+Requires-Dist: typing-extensions>=4.12.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.3.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.24.0; extra == "dev"
+
+# clawdb
+
+Async Python memory backend designed to replace OpenClaw memory modules via a dedicated memory plugin adapter.
+
+## Quick start
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+uvicorn clawdb.api:app --reload
+```
+
+## Integration target
+
+- OpenClaw memory tool compatibility (`memory_search`, `memory_get`)
+- Data path: in-memory pandas DataFrames + Parquet persistence
+- Durability: WAL-first, replay on startup
+- Async-by-default services and consumers
+- Queue backends: `inmemory`, `kafka`, `zeromq`
+- Deadlock safeguards via lock ordering and timeout
+- OpenClaw runtime auth/profile key reuse for embedding-capable search

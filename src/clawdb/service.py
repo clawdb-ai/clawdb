@@ -1,0 +1,430 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import math
+from time import monotonic
+from typing import Dict, List, Optional, Sequence
+
+from .config import ClawDBConfig
+from .dataframes import DataFrameStore
+from .embeddings import EmbeddingAuthContext, EmbeddingRouter
+from .locks import DeadlockSafeLockManager, LockRank
+from .metrics import CacheTelemetry
+from .metadata import DataFrameMetadataStore
+from .models import (
+    CacheHitReportResponse,
+    CapsuleRefreshRequest,
+    CapsuleRefreshResponse,
+    HealthResponse,
+    MessageAck,
+    MessageIn,
+    OpenClawMemoryReadResponse,
+    OpenClawMemorySearchRequest,
+    SearchRequest,
+    SearchResponse,
+)
+from .mq import AsyncMessageQueue, build_event, create_queue
+from .wal import WalManager
+
+
+class ClawDBService:
+    def __init__(self, config: Optional[ClawDBConfig] = None) -> None:
+        self.config = config or ClawDBConfig.from_env()
+        self.config.ensure_dirs()
+        self.df_store = DataFrameStore()
+        self.wal = WalManager(
+            wal_dir=self.config.wal_dir,
+            sync_policy=self.config.wal_sync_policy,
+            sync_interval_ms=self.config.wal_sync_interval_ms,
+        )
+        self.queue: AsyncMessageQueue = create_queue(
+            self.config.queue_backend,
+            self.config.queue_topic,
+            self.config.queue_zeromq_endpoint,
+        )
+        self.lock_manager = DeadlockSafeLockManager(
+            lock_timeout_seconds=self.config.lock_timeout_seconds,
+            watchdog_seconds=self.config.lock_watchdog_seconds,
+        )
+        self.embedding_router = EmbeddingRouter()
+        self.telemetry = CacheTelemetry()
+        self.metadata = DataFrameMetadataStore(self.config.metadata_parquet_path)
+        self._search_cache: Dict[str, List[dict]] = {}
+        self._embedding_cache: Dict[str, List[float]] = {}
+        self._idempotency_index: Dict[str, MessageAck] = {}
+        self._cache_cap = 10_000
+        self._flush_task: Optional[asyncio.Task] = None
+        self._queue_tasks: List[asyncio.Task] = []
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+        self._checkpoint_seq = 0
+
+    class BackpressureRejectedError(RuntimeError):
+        pass
+
+    async def startup(self) -> None:
+        await self._load_checkpoint_and_replay()
+        self._stop.clear()
+        self._flush_task = asyncio.create_task(self._periodic_flush_loop(), name="clawdb-flush")
+        self._queue_tasks = []
+        consumers = max(1, int(self.config.queue_consumer_count))
+        for idx in range(consumers):
+            self._queue_tasks.append(
+                asyncio.create_task(
+                    self._queue_consumer_loop(idx),
+                    name=f"clawdb-queue-{idx}",
+                )
+            )
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop(), name="clawdb-watchdog")
+
+    async def shutdown(self) -> None:
+        self._stop.set()
+        tasks: List[asyncio.Task] = []
+        if self._flush_task is not None:
+            tasks.append(self._flush_task)
+        tasks.extend(self._queue_tasks)
+        if self._watchdog_task is not None:
+            tasks.append(self._watchdog_task)
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self.queue.close()
+        await self.flush_now()
+
+    async def _load_checkpoint_and_replay(self) -> None:
+        ckpt_path = self.config.checkpoints_dir / "latest.json"
+        start_seq = 0
+        checkpoint = await self.metadata.load_checkpoint(slot="wal")
+        if checkpoint is not None:
+            start_seq = int(checkpoint.last_seq)
+            self._checkpoint_seq = start_seq
+            try:
+                await self.df_store.load_parquet(self.config.parquet_dir)
+            except Exception:
+                start_seq = 0
+                self._checkpoint_seq = 0
+        if ckpt_path.exists():
+            try:
+                data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+                file_start_seq = int(data.get("last_seq", 0))
+                if file_start_seq > start_seq:
+                    start_seq = file_start_seq
+                    self._checkpoint_seq = start_seq
+                    await self.df_store.load_parquet(self.config.parquet_dir)
+            except Exception:
+                start_seq = 0
+                self._checkpoint_seq = 0
+        for record in self.wal.replay(from_seq_exclusive=start_seq):
+            await self.df_store.apply_wal_record(record)
+            if record.event_type == "message_upsert":
+                key = str(record.payload.get("idempotency_key") or "")
+                if key:
+                    scoped = self._idempotency_scope(
+                        str(record.payload.get("tenant_id") or "default"),
+                        str(record.payload.get("session_id") or "default"),
+                        key,
+                    )
+                    self._idempotency_index[scoped] = MessageAck(
+                        wal_seq=record.seq,
+                        message_id=str(record.payload.get("message_id") or ""),
+                    )
+
+    async def flush_now(self) -> None:
+        await self.df_store.save_parquet(self.config.parquet_dir)
+        self._checkpoint_seq = self.wal.last_seq
+        payload = {"last_seq": self._checkpoint_seq}
+        await self.metadata.save_checkpoint(self._checkpoint_seq, slot="wal")
+        (self.config.checkpoints_dir / "latest.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
+
+    async def _periodic_flush_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(self.config.flush_interval_seconds)
+            await self.flush_now()
+
+    async def _queue_consumer_loop(self, worker_id: int) -> None:
+        async for event in self.queue.consume():
+            if self._stop.is_set():
+                break
+            if event.event_type in {"message_upsert", "capsule_refresh"}:
+                # Consumers can add async downstream work here (vector build, cache warm, etc.)
+                _ = worker_id
+
+    async def _watchdog_loop(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(max(1, int(self.config.lock_watchdog_seconds / 2)))
+            alerts = await self.lock_manager.watchdog_once()
+            for alert in alerts:
+                # Keep logging lightweight and structured.
+                print(alert)
+
+    def _cache_key(self, req: SearchRequest) -> str:
+        return (
+            f"{req.tenant_id or 'default'}::{req.session_id or '_'}::"
+            f"{req.query.strip().lower()}::{req.max_results}::{req.min_score}"
+        )
+
+    def _idempotency_scope(self, tenant_id: str, session_id: str, idempotency_key: str) -> str:
+        return f"{tenant_id}::{session_id}::{idempotency_key}"
+
+    async def _enforce_ingest_backpressure(self) -> None:
+        threshold = int(self.config.ingest_backpressure_lag_threshold)
+        if threshold <= 0:
+            return
+        max_wait_ms = max(0, int(self.config.ingest_backpressure_max_wait_ms))
+        poll_interval_ms = max(1, int(self.config.ingest_backpressure_poll_interval_ms))
+        started = monotonic()
+        while True:
+            lag = await self.queue.lag()
+            if lag <= threshold:
+                return
+            elapsed_ms = (monotonic() - started) * 1000.0
+            if elapsed_ms >= max_wait_ms:
+                raise ClawDBService.BackpressureRejectedError(
+                    f"ingest backpressure: queue lag {lag} exceeds threshold {threshold}"
+                )
+            await asyncio.sleep(poll_interval_ms / 1000.0)
+
+    async def ingest_message(self, req: MessageIn) -> MessageAck:
+        await self._enforce_ingest_backpressure()
+        payload = req.model_dump(mode="json")
+        lock_key = f"session:{req.tenant_id}:{req.session_id}"
+        async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
+            if req.idempotency_key:
+                scope = self._idempotency_scope(req.tenant_id, req.session_id, req.idempotency_key)
+                cached_ack = self._idempotency_index.get(scope)
+                if cached_ack is not None:
+                    return cached_ack
+            record = await self.wal.append("message_upsert", payload)
+            await self.df_store.add_message(payload)
+            await self.queue.publish(build_event(record.seq, "message_upsert", payload))
+            ack = MessageAck(wal_seq=record.seq, message_id=req.message_id)
+            if req.idempotency_key:
+                self._idempotency_index[scope] = ack
+                if len(self._idempotency_index) > self._cache_cap:
+                    self._idempotency_index.pop(next(iter(self._idempotency_index)))
+        return ack
+
+    def _embedding_cache_key(self, ctx: EmbeddingAuthContext, text: str) -> str:
+        model = ctx.model or "_default_"
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return f"{ctx.provider}:{model}:{digest}"
+
+    async def _embed_texts_cached(
+        self,
+        ctx: EmbeddingAuthContext,
+        texts: Sequence[str],
+    ) -> List[List[float]]:
+        cached_vectors: List[Optional[List[float]]] = []
+        misses: List[str] = []
+        miss_indexes: List[int] = []
+        for i, text in enumerate(texts):
+            key = self._embedding_cache_key(ctx, text)
+            vector = self._embedding_cache.get(key)
+            cached_vectors.append(vector)
+            if vector is None:
+                misses.append(text)
+                miss_indexes.append(i)
+
+        if misses:
+            generated = await self.embedding_router.embed_texts(ctx, misses)
+            for idx, vector in zip(miss_indexes, generated):
+                text = texts[idx]
+                key = self._embedding_cache_key(ctx, text)
+                self._embedding_cache[key] = vector
+                cached_vectors[idx] = vector
+
+        return [vector or [] for vector in cached_vectors]
+
+    def _cosine_similarity(self, left: Sequence[float], right: Sequence[float]) -> float:
+        if not left or not right:
+            return 0.0
+        dims = min(len(left), len(right))
+        if dims == 0:
+            return 0.0
+        dot = 0.0
+        left_norm = 0.0
+        right_norm = 0.0
+        for i in range(dims):
+            lv = float(left[i])
+            rv = float(right[i])
+            dot += lv * rv
+            left_norm += lv * lv
+            right_norm += rv * rv
+        if left_norm <= 0.0 or right_norm <= 0.0:
+            return 0.0
+        return dot / (math.sqrt(left_norm) * math.sqrt(right_norm))
+
+    async def search(
+        self,
+        req: SearchRequest,
+        embedding_ctx: Optional[EmbeddingAuthContext] = None,
+    ) -> SearchResponse:
+        started = monotonic()
+        key = self._cache_key(req)
+        if embedding_ctx:
+            key = f"{key}::emb:{embedding_ctx.provider}:{embedding_ctx.model or '_'}"
+        cached = self._search_cache.get(key)
+        cache_hit = cached is not None
+        if cache_hit:
+            results = cached
+        else:
+            raw = await self.df_store.hybrid_search(
+                query=req.query,
+                tenant_id=req.tenant_id,
+                session_id=req.session_id,
+                max_results=max(req.max_results * 5, req.max_results),
+                min_score=max(0.0, min(req.min_score, 0.15)),
+            )
+            rescored = raw
+            if embedding_ctx and raw:
+                try:
+                    texts = [req.query, *[item.snippet for item in raw]]
+                    vectors = await self._embed_texts_cached(embedding_ctx, texts)
+                    query_vec = vectors[0]
+                    msg_vecs = vectors[1:]
+                    merged = []
+                    for item, vector in zip(raw, msg_vecs):
+                        lexical_score = float(item.score_lexical or item.score)
+                        vector_score = self._cosine_similarity(query_vec, vector)
+                        semantic_score = float(item.score_semantic)
+                        combined = (
+                            (0.30 * lexical_score)
+                            + (0.20 * semantic_score)
+                            + (0.50 * max(0.0, vector_score))
+                        )
+                        updated = item.model_copy(
+                            update={
+                                "score": round(float(combined), 6),
+                                "score_vector": round(float(vector_score), 6),
+                            }
+                        )
+                        merged.append(updated)
+                    rescored = sorted(merged, key=lambda r: r.score, reverse=True)
+                except Exception:
+                    rescored = raw
+            filtered = [item for item in rescored if item.score >= req.min_score]
+            results = [item.model_dump() for item in filtered[: max(1, req.max_results)]]
+            self._search_cache[key] = results
+            if len(self._search_cache) > self._cache_cap:
+                self._search_cache.pop(next(iter(self._search_cache)))
+                self.telemetry.observe_eviction()
+        latency_ms = (monotonic() - started) * 1000.0
+        session_id = req.session_id or "_"
+        self.telemetry.observe_lookup(
+            cache_hit,
+            latency_ms,
+            tenant_id=req.tenant_id or "default",
+            session_id=session_id,
+            query_type="memory_search",
+            capsule_level="mixed",
+        )
+        await self.df_store.record_cache_lookup(
+            key=key,
+            tenant_id=req.tenant_id or "default",
+            session_id=session_id,
+            query_type="memory_search",
+            capsule_level="mixed",
+            hit=cache_hit,
+        )
+        if self.config.search_log_enabled:
+            print(
+                json.dumps(
+                    {
+                        "event": "memory.search",
+                        "tenant_id": req.tenant_id or "default",
+                        "session_id": session_id,
+                        "cache_hit": cache_hit,
+                        "query_type": "memory_search",
+                        "latency_ms": round(float(latency_ms), 3),
+                    }
+                )
+            )
+        return SearchResponse(wal_seq=self.wal.last_seq, cache_hit=cache_hit, results=results)
+
+    async def refresh_capsules(self, req: CapsuleRefreshRequest) -> CapsuleRefreshResponse:
+        payload = req.model_dump(mode="json")
+        lock_key = f"session:{req.tenant_id}:{req.session_id}"
+        async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
+            record = await self.wal.append("capsule_refresh", payload)
+            count = await self.df_store.refresh_capsules(req.tenant_id, req.session_id)
+            await self.queue.publish(build_event(record.seq, "capsule_refresh", payload))
+        return CapsuleRefreshResponse(wal_seq=record.seq, capsule_count=count)
+
+    async def health(self) -> HealthResponse:
+        lag = await self.queue.lag()
+        ratio = self.telemetry.hit_ratio(300)
+        status = "ok"
+        if lag > self.config.ingest_backpressure_lag_threshold:
+            status = "degraded"
+        if ratio < self.config.cache_hit_ratio_alert_threshold and (self.telemetry.hits_total + self.telemetry.misses_total) > 20:
+            status = "degraded"
+        return HealthResponse(
+            status=status,
+            wal_replay_lag=max(0, self.wal.last_seq - self._checkpoint_seq),
+            checkpoint_seq=self._checkpoint_seq,
+            cache_hit_ratio_5m=ratio,
+            queue_backend=self.config.queue_backend,
+            queue_lag=lag,
+        )
+
+    async def cache_hit_report(self) -> CacheHitReportResponse:
+        return CacheHitReportResponse(
+            memory_cache_hit_ratio_1m=self.telemetry.hit_ratio(60),
+            memory_cache_hit_ratio_5m=self.telemetry.hit_ratio(300),
+            memory_cache_hits_total=self.telemetry.hits_total,
+            memory_cache_misses_total=self.telemetry.misses_total,
+            memory_cache_evictions_total=self.telemetry.evictions_total,
+            memory_cache_lookup_latency_ms_p50=self.telemetry.p50_lookup_latency_ms(),
+        )
+
+    async def openclaw_memory_search(
+        self,
+        req: OpenClawMemorySearchRequest,
+        embedding_ctx: Optional[EmbeddingAuthContext] = None,
+    ):
+        internal = SearchRequest(
+            query=req.query,
+            tenant_id=req.tenantId or "default",
+            session_id=req.sessionKey,
+            max_results=req.maxResults or 6,
+            min_score=req.minScore or 0.0,
+        )
+        result = await self.search(internal, embedding_ctx=embedding_ctx)
+        return [
+            {
+                "path": item.path,
+                "startLine": item.start_line,
+                "endLine": item.end_line,
+                "score": item.score,
+                "scoreLexical": item.score_lexical,
+                "scoreSemantic": item.score_semantic,
+                "scoreVector": item.score_vector,
+                "snippet": item.snippet,
+                "source": item.source,
+                "sourceTier": item.source_tier,
+                "citation": item.citation,
+            }
+            for item in result.results
+        ]
+
+    async def openclaw_memory_get(
+        self,
+        rel_path: str,
+        from_line: int = 1,
+        lines: int = 200,
+    ) -> OpenClawMemoryReadResponse:
+        text, canonical_path = await self.df_store.virtual_memory_file(rel_path)
+        all_lines = text.splitlines()
+        start_idx = max(0, from_line - 1)
+        end_idx = min(len(all_lines), start_idx + max(1, lines))
+        sliced = "\n".join(all_lines[start_idx:end_idx])
+        return OpenClawMemoryReadResponse(text=sliced, path=canonical_path)

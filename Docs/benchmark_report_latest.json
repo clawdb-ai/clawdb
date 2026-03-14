@@ -1,0 +1,31 @@
+{
+  "config": {
+    "messages": 6000,
+    "sessions": 120,
+    "tenants": 8,
+    "ingest_concurrency": 96,
+    "cold_searches": 1200,
+    "hot_searches": 1200,
+    "queue_backend": "zeromq",
+    "random_seed": 20260315
+  },
+  "result": {
+    "ingest_ops": 6000,
+    "ingest_p50_ms": 82.79116699999989,
+    "ingest_p95_ms": 106.86258299999984,
+    "ingest_ops_per_sec": 1113.6971141602696,
+    "cold_search_ops": 1200,
+    "cold_search_p50_ms": 2.4057919999993516,
+    "cold_search_p95_ms": 2.9551249999997253,
+    "hot_search_ops": 1200,
+    "hot_search_p50_ms": 0.5665829999994543,
+    "hot_search_p95_ms": 0.7713749999993524,
+    "cache_hit_ratio_1m": 0.4997917534360683,
+    "cache_hit_ratio_5m": 0.4997917534360683,
+    "cache_hits_total": 1200,
+    "cache_misses_total": 1201,
+    "replay_startup_ms": 19.533457999999726,
+    "wal_last_seq": 6000,
+    "queue_backend": "zeromq"
+  }
+}

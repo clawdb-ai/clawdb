@@ -7,3 +7,11 @@ Icon?
 .Spotlight-V100
 .Trashes
 .fseventsd
+
+# Project runtime artifacts
+.pytest_cache/
+data/
+external/
+tests/
+__pycache__/
+*.pyc

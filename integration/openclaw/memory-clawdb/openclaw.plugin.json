@@ -1,0 +1,75 @@
+{
+  "id": "memory-clawdb",
+  "kind": "memory",
+  "uiHints": {
+    "baseUrl": {
+      "label": "clawdb Base URL",
+      "placeholder": "http://127.0.0.1:8080",
+      "help": "Base URL of the clawdb memory service"
+    },
+    "apiKey": {
+      "label": "API Key",
+      "sensitive": true,
+      "placeholder": "optional",
+      "help": "Optional bearer token used for clawdb requests"
+    },
+    "requestTimeoutMs": {
+      "label": "Request Timeout (ms)",
+      "placeholder": "10000",
+      "advanced": true
+    },
+    "embeddingProvider": {
+      "label": "Embedding Provider",
+      "placeholder": "openai",
+      "help": "Force a single provider from OpenClaw auth profiles",
+      "advanced": true
+    },
+    "embeddingProviders": {
+      "label": "Embedding Provider Order",
+      "help": "Try providers in order (for example openai,voyage,mistral)",
+      "advanced": true
+    },
+    "embeddingModel": {
+      "label": "Embedding Model",
+      "placeholder": "text-embedding-3-small",
+      "advanced": true
+    },
+    "embeddingBaseUrl": {
+      "label": "Embedding Base URL",
+      "placeholder": "https://api.openai.com/v1",
+      "advanced": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "baseUrl": {
+        "type": "string"
+      },
+      "apiKey": {
+        "type": "string"
+      },
+      "requestTimeoutMs": {
+        "type": "number",
+        "minimum": 100,
+        "maximum": 60000
+      },
+      "embeddingProvider": {
+        "type": "string"
+      },
+      "embeddingProviders": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "embeddingModel": {
+        "type": "string"
+      },
+      "embeddingBaseUrl": {
+        "type": "string"
+      }
+    }
+  }
+}

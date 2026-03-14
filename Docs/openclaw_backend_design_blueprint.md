@@ -90,7 +90,7 @@ Client/API
 - Async I/O clients: `httpx`, async DB driver variants as needed
 - DB metadata: PostgreSQL (`psycopg` / `SQLAlchemy` optional)
 - Background jobs: async worker pools; distributed workers only if queue backlog requires horizontal fan-out
-- Message queue: `Redpanda/Kafka` (primary) or `NATS JetStream` (low-latency alternative)
+- Message queue: `Redpanda/Kafka` (primary), `ZeroMQ` (ultra-low-latency single-node), or `NATS JetStream` (alternative)
 - Metrics: Prometheus client + OpenTelemetry
 
 ## 3.2 Retrieval Components
@@ -103,6 +103,7 @@ Client/API
 - Consumer path: idempotent async workers apply downstream jobs (indexing, cache warming, compaction triggers).
 - Queue contracts include: `event_id`, `wal_seq`, `tenant_id`, `session_id`, `event_type`, `created_at`.
 - Exactly-once is approximated via at-least-once delivery + idempotent consumers keyed by `event_id`.
+- For single-node high-throughput deployments, ZeroMQ PUSH/PULL is an approved queue backend.
 - Backpressure policy:
   - Pause non-critical consumers when lag exceeds threshold.
   - Prioritize write-path integrity and replay consumers.
@@ -201,6 +202,9 @@ The backend must behave as a drop-in replacement for official OpenClaw memory-re
 
 ### Retrieval Contract Adapter
 - Exposes equivalent query semantics for top-k retrieval, filters, and score explainability.
+- Reuses OpenClaw-resolved provider auth (`modelAuth.resolveApiKeyForProvider`) for embedding-capable search.
+- Supports signed requests from OpenClaw plugin to clawdb adapter endpoints.
+- Signed requests are enforced by default on `/v1/openclaw/memory/*`; unsigned mode is debug-only.
 
 ### Session/Context Adapter
 - Ensures session scoping and tiered memory behavior (`L0/L1/L2`) are compatible with upstream expectations.
@@ -351,6 +355,8 @@ The backend must behave as a drop-in replacement for official OpenClaw memory-re
 - [ ] Async-by-default task model is acceptable.
 - [ ] MQ technology choice and throughput targets are acceptable.
 - [ ] Deadlock prevention and watchdog policy are acceptable.
+- [ ] ClawDB module coverage is complete for OpenClaw memory masking.
+- [ ] OpenClaw `memory-clawdb` plugin compatibility tests are acceptable.
 
 ---
 
@@ -362,3 +368,33 @@ The backend must behave as a drop-in replacement for official OpenClaw memory-re
 - Cache-hit reporting elevated from optional monitoring to mandatory release criterion.
 - Async-first execution and high-performance MQ were made explicit architecture constraints.
 - Deadlock prevention, detection, and recovery controls were promoted to mandatory design requirements.
+
+---
+
+## 16. ClawDB Module Inventory (Implementation Scope)
+The following modules are required to fully mask OpenClaw memory-related functionality and support replacement of OpenViking+QMD memory flows.
+
+### 16.1 Core Python Modules
+- `clawdb.api`: async API gateway and OpenClaw-compatible endpoints.
+- `clawdb.service`: orchestration layer (write/search/capsule/health/cache-hit).
+- `clawdb.wal`: WAL append/checksum/replay manager.
+- `clawdb.dataframes`: in-memory pandas state + Parquet load-in/load-out.
+- `clawdb.mq`: async MQ abstraction (ZeroMQ default, in-memory dev fallback, Kafka/Redpanda production adapter).
+- `clawdb.locks`: deadlock-safe lock manager with ordering and watchdog.
+- `clawdb.metrics`: cache-hit and lookup-latency telemetry.
+- `clawdb.models`: API contracts for both clawdb-native and OpenClaw adapter payloads.
+- `clawdb.config`: runtime policy and durability settings.
+- `clawdb.auth`: OpenClaw bearer/signature parsing and verification.
+- `clawdb.embeddings`: provider-aware embedding router for hybrid rerank.
+- `clawdb.metadata`: checkpoint metadata persistence for replay orchestration.
+
+### 16.2 OpenClaw Integration Modules
+- `integration/openclaw/memory-clawdb/index.js`: memory slot plugin routing `memory_search` and `memory_get` to clawdb.
+- `integration/openclaw/memory-clawdb/openclaw.plugin.json`: plugin manifest and config schema.
+- `scripts/install_openclaw_integration.sh`: installs plugin into official OpenClaw clone and writes config template.
+- `scripts/bootstrap_openclaw.sh`: clones OpenClaw and installs dependencies/plugin for integration testing.
+- `scripts/smoke_test_integration.sh`: runs end-to-end integration smoke against OpenClaw profile `clawdb-test`.
+
+### 16.3 Test Coverage Modules
+- `tests/test_service.py`: ingestion/search/cache-hit/replay and deadlock-order baseline tests.
+- `Docs/implementation_audit_checklist.md`: execution audit checklist for module and integration sign-off.
