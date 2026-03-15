@@ -10,7 +10,7 @@
 This document is the implementation blueprint to validate before coding. It preserves the architectural intent of the imported OpenClaw backend design while applying the required constraints:
 
 1. Documentation language is English and future patches are expected in English.
-2. All Go/Rust implementation assumptions are replaced with Python implementations.
+2. All non-Python implementation assumptions are replaced with Python implementations.
 3. Runtime data path prioritizes in-memory pandas DataFrames and Parquet load-in/load-out.
 4. WAL remains mandatory for durability and recovery.
 5. Design aligns with official OpenClaw memory contracts and can replace memory-related modules, including a migration path that can also replace OpenViking + QMD memory orchestration.
@@ -67,7 +67,7 @@ Client/API
 ```
 
 ## 2.2 Non-Negotiable Runtime Rules
-- No production Go or Rust services in this blueprint.
+- No production non-Python services in this blueprint.
 - All non-trivial tasks (index updates, compaction, capsule refresh, replication events) run asynchronously.
 - High-performance MQ is mandatory for async event distribution and replay-safe pipelines.
 - All mutable memory state is reconstructed from WAL + Parquet checkpoints.
@@ -346,7 +346,7 @@ The backend must behave as a drop-in replacement for official OpenClaw memory-re
 
 ## 14. Review Checklist (For Your Double-Check)
 - [ ] English-only wording is acceptable for your team workflow.
-- [ ] Python-only replacement is acceptable (no Go/Rust runtime dependency).
+- [ ] Python-only replacement is acceptable (no non-Python runtime dependency).
 - [ ] DataFrame + Parquet approach fits expected memory size and cost envelope.
 - [ ] WAL durability policy matches your risk tolerance.
 - [ ] OpenClaw memory contract coverage is complete enough for drop-in replacement.
@@ -362,7 +362,7 @@ The backend must behave as a drop-in replacement for official OpenClaw memory-re
 
 ## 15. Explicit Delta From Imported Source
 - Language changed from mixed Chinese to English.
-- Go/Rust-centric implementation details replaced by Python stack and module contracts.
+- Legacy non-Python implementation details replaced by Python stack and module contracts.
 - Storage strategy made explicit as DataFrame hot state + Parquet persistence + WAL durability.
 - Compatibility/migration framing tightened to official OpenClaw replacement goals.
 - Cache-hit reporting elevated from optional monitoring to mandatory release criterion.

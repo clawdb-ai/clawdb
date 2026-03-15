@@ -35,7 +35,7 @@ Primary source anchors used in this map:
 | Scope And Intent | 9-23 | `Executive Summary` sections 1.1/1.3 (lines 25/40), `Technology Stack` (line 1113), storage and MQ references (lines 106-112, 1125) | Transformed + New Constraint | Consolidates original goals and architecture intent; explicitly adds Python-only, DataFrame+Parquet, async-first, deadlock controls, and mandatory cache-hit checks. |
 | 1. Executive Summary | 26-45 | `1. Executive Summary` (line 23 in source document), core features table (line 29 onward), design goals (line 40) | Adopted + Transformed | Keeps layered memory, hybrid retrieval, durability goals; rewrites into English KPI form and Python-oriented strategy. |
 | 2. Architecture Overview | 49-77 | `2. System Architecture Overview` (line 49 in source document), architecture/dataflow diagrams (lines 51-199), storage architecture (`3.5.1`, line 482) | Adopted + Extended | Preserves layered architecture; formalizes async orchestrator and MQ adapter in runtime topology. |
-| 3. Python Technology Stack | 80-110 | `6. Technology Stack` (line 1113 in source document), `3.4 Vector Retrieval Engine` (line 398 in source document), interface/API sections (951+) | Transformed | Replaces Go-first stack entries (`Gin/Echo`, `gonum`) with Python runtime/library choices while preserving capability categories. |
+| 3. Python Technology Stack | 80-110 | `6. Technology Stack` (line 1113 in source document), `3.4 Vector Retrieval Engine` (line 398 in source document), interface/API sections (951+) | Transformed | Replaces source non-Python stack entries with Python runtime/library choices while preserving capability categories. |
 | 4. Data Model (DataFrame + Parquet First) | 112-162 | `3.2.2 Capsule Structure` (line 293 in source document), `3.5.2 In-Memory Buffer Layer` (line 529 in source document), `3.5.3 WAL Format` (line 575 in source document), storage diagrams (line 486+) | Transformed + Extended | Converts conceptual structures into explicit DataFrame schemas and Parquet directory contract. |
 | 5. Durability: WAL Kept Intact | 165-187 | `3.5.3 WAL Format` (line 575 in source document), write flow (`4.1`, line 669), WAL+MQ steps (lines 717, 937, 940) | Adopted + Extended | Retains WAL-first durability and replay logic; adds explicit ACK policy and sequence-based checkpoint semantics. |
 | 6. OpenClaw Compatibility And Replacement Design | 190-214 | Background statement referencing OpenViking+QMD and OpenClaw Memory (line 27), interfaces (`5.x`, line 951), roadmap (`7.x`, line 1181) | Extended | Formalizes drop-in compatibility adapters and phased replacement controls absent as explicit contract in source. |
@@ -60,7 +60,7 @@ Primary source anchors used in this map:
 
 ## Known Intentional Divergences
 1. Language is normalized to English for ongoing development patches.
-2. Go/Rust implementation assumptions are removed in favor of Python.
+2. Non-Python implementation assumptions are removed in favor of Python.
 3. Data model is concretized as DataFrame + Parquet, while source was more implementation-agnostic in persistence detail.
 4. Async-first execution, high-performance MQ requirement, and deadlock-control policies are elevated to explicit hard constraints.
 5. Cache-hit reporting is promoted from observability guidance to release-blocking acceptance criteria.
