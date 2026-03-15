@@ -446,13 +446,9 @@ class DataFrameStore:
         origin: str = "normal",
     ) -> None:
         async with self._lock:
-            df = self._state.sessions_df
-            mask = (
-                (df["tenant_id"].astype(str) == tenant_id)
-                & (df["session_id"].astype(str) == session_id)
-            )
-            if not df[mask].empty:
+            if self._session_exists_locked(tenant_id, session_id):
                 return
+            df = self._state.sessions_df
             row = {
                 "tenant_id": tenant_id,
                 "session_id": session_id,
@@ -468,6 +464,7 @@ class DataFrameStore:
                     [df, row_df],
                     ignore_index=True,
                 )
+            self._invalidate_sessions_index_locked()
 
     async def add_message(self, payload: Dict[str, object]) -> None:
         tenant_id = str(payload.get("tenant_id") or "default")
@@ -554,6 +551,7 @@ class DataFrameStore:
                 [self._state.capsules_df, pd.DataFrame([row], columns=CAPSULES_COLUMNS)],
                 ignore_index=True,
             )
+            self._invalidate_capsules_index_locked()
             return int(self._state.capsules_df.shape[0])
 
     async def create_snapshot(
@@ -582,6 +580,7 @@ class DataFrameStore:
                     [self._state.snapshots_df, row_df],
                     ignore_index=True,
                 )
+            self._invalidate_snapshots_index_locked()
 
     async def fork_session(
         self,
@@ -620,6 +619,7 @@ class DataFrameStore:
                     [self._state.capsules_df, copied_caps[CAPSULES_COLUMNS]],
                     ignore_index=True,
                 )
+                self._invalidate_capsules_index_locked()
 
     async def spawn_session(
         self,
@@ -636,10 +636,8 @@ class DataFrameStore:
 
     async def list_snapshots(self, tenant_id: str, session_id: str) -> List[Dict[str, object]]:
         async with self._lock:
-            df = self._state.snapshots_df[
-                (self._state.snapshots_df["tenant_id"].astype(str) == tenant_id)
-                & (self._state.snapshots_df["session_id"].astype(str) == session_id)
-            ].sort_values("created_at", kind="stable")
+            df = self._snapshots_for_query_locked(tenant_id, session_id)
+            df = df.reset_index(drop=True).sort_values("created_at", kind="stable")
             out: List[Dict[str, object]] = []
             for _, row in df.iterrows():
                 out.append(
@@ -710,33 +708,16 @@ class DataFrameStore:
         hit: bool,
     ) -> None:
         async with self._lock:
-            cache_df = self._state.cache_index_df
             now = pd.Timestamp.utcnow()
-            if cache_df.empty:
-                row = {
-                    "key": key,
-                    "tenant_id": tenant_id,
-                    "session_id": session_id,
-                    "query_type": query_type,
-                    "capsule_level": capsule_level,
-                    "entity_type": "search",
-                    "entity_id": key,
-                    "last_access": now,
-                    "hit_count": 1 if hit else 0,
-                    "miss_count": 0 if hit else 1,
-                }
-                self._state.cache_index_df = pd.DataFrame([row], columns=CACHE_INDEX_COLUMNS)
-                return
-
-            mask = (
-                (cache_df["key"].astype(str) == key)
-                & (cache_df["tenant_id"].astype(str) == tenant_id)
-                & (cache_df["session_id"].astype(str) == session_id)
-                & (cache_df["query_type"].astype(str) == query_type)
-                & (cache_df["capsule_level"].astype(str) == capsule_level)
+            row_id = self._cache_lookup_row_id_locked(
+                key=key,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                query_type=query_type,
+                capsule_level=capsule_level,
             )
-            matched = cache_df[mask]
-            if matched.empty:
+            cache_df = self._state.cache_index_df
+            if row_id is None:
                 row = {
                     "key": key,
                     "tenant_id": tenant_id,
@@ -749,27 +730,29 @@ class DataFrameStore:
                     "hit_count": 1 if hit else 0,
                     "miss_count": 0 if hit else 1,
                 }
-                self._state.cache_index_df = pd.concat(
-                    [cache_df, pd.DataFrame([row], columns=CACHE_INDEX_COLUMNS)],
-                    ignore_index=True,
-                )
+                if cache_df.empty:
+                    self._state.cache_index_df = pd.DataFrame([row], columns=CACHE_INDEX_COLUMNS)
+                else:
+                    self._state.cache_index_df = pd.concat(
+                        [cache_df, pd.DataFrame([row], columns=CACHE_INDEX_COLUMNS)],
+                        ignore_index=True,
+                    )
+                self._invalidate_cache_lookup_index_locked()
                 return
-
-            idx = matched.index[0]
 
             def _safe_int(value: object) -> int:
                 if value is None or pd.isna(value):
                     return 0
                 return int(value)
 
-            self._state.cache_index_df.at[idx, "last_access"] = now
+            self._state.cache_index_df.at[row_id, "last_access"] = now
             if hit:
-                self._state.cache_index_df.at[idx, "hit_count"] = (
-                    _safe_int(self._state.cache_index_df.at[idx, "hit_count"]) + 1
+                self._state.cache_index_df.at[row_id, "hit_count"] = (
+                    _safe_int(self._state.cache_index_df.at[row_id, "hit_count"]) + 1
                 )
             else:
-                self._state.cache_index_df.at[idx, "miss_count"] = (
-                    _safe_int(self._state.cache_index_df.at[idx, "miss_count"]) + 1
+                self._state.cache_index_df.at[row_id, "miss_count"] = (
+                    _safe_int(self._state.cache_index_df.at[row_id, "miss_count"]) + 1
                 )
 
     def _token_score(self, text: str, query_tokens: List[str]) -> float:
@@ -935,10 +918,8 @@ class DataFrameStore:
 
     async def capsule_cards(self, tenant_id: str, session_id: str) -> List[Dict[str, object]]:
         async with self._lock:
-            df = self._state.capsules_df[
-                (self._state.capsules_df["tenant_id"].astype(str) == tenant_id)
-                & (self._state.capsules_df["session_id"].astype(str) == session_id)
-            ].sort_values("updated_at", kind="stable", ascending=False)
+            df = self._capsules_for_query_locked(tenant_id, session_id)
+            df = df.reset_index(drop=True).sort_values("updated_at", kind="stable", ascending=False)
             out: List[Dict[str, object]] = []
             for _, row in df.iterrows():
                 out.append(
@@ -1048,4 +1029,4 @@ class DataFrameStore:
             sessions_df=_read_all("sessions", SESSIONS_COLUMNS),
             snapshots_df=_read_all("snapshots", SNAPSHOTS_COLUMNS),
         )
-        self._invalidate_messages_index_locked()
+        self._invalidate_all_indexes_locked()
