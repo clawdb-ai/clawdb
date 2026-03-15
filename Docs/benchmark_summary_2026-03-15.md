@@ -25,26 +25,26 @@ Report artifacts:
 ## Results
 
 ### ZeroMQ backend
-- ingest p50: `82.79 ms`
-- ingest p95: `106.86 ms`
-- ingest throughput: `1113.70 ops/s`
-- cold search p50: `2.41 ms`
-- cold search p95: `2.96 ms`
+- ingest p50: `155.08 ms`
+- ingest p95: `175.81 ms`
+- ingest throughput: `621.41 ops/s`
+- cold search p50: `3.06 ms`
+- cold search p95: `3.43 ms`
 - hot search p50: `0.57 ms`
-- hot search p95: `0.77 ms`
+- hot search p95: `0.65 ms`
 - cache-hit ratio (1m): `0.4998`
-- replay startup: `19.53 ms`
+- replay startup: `18.97 ms`
 
 ### In-memory backend
-- ingest p50: `71.77 ms`
-- ingest p95: `87.66 ms`
-- ingest throughput: `1287.62 ops/s`
-- cold search p50: `2.42 ms`
-- cold search p95: `2.95 ms`
-- hot search p50: `0.58 ms`
-- hot search p95: `0.76 ms`
+- ingest p50: `143.63 ms`
+- ingest p95: `165.41 ms`
+- ingest throughput: `673.81 ops/s`
+- cold search p50: `3.04 ms`
+- cold search p95: `3.41 ms`
+- hot search p50: `0.57 ms`
+- hot search p95: `0.64 ms`
 - cache-hit ratio (1m): `0.4998`
-- replay startup: `20.30 ms`
+- replay startup: `19.36 ms`
 
 ## Blueprint target comparison
 - Read latency target (`P50 < 20 ms`, `P95 < 80 ms` mixed): met in this benchmark for search path.

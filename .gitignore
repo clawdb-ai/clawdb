@@ -12,6 +12,8 @@ Icon?
 .pytest_cache/
 data/
 external/
+Docs/
+scripts/
 tests/
 __pycache__/
 *.pyc

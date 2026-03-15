@@ -48,8 +48,8 @@ Reports:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Official Memory | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run |
 | OpenViking + QMD | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run | Not benchmarked in this repository run |
-| ClawDB (`zeromq`) | `82.79 ms` | `106.86 ms` | `1113.70` | `2.41 ms` | `2.96 ms` | `0.57 ms` | `0.77 ms` | `19.53 ms` |
-| ClawDB (`inmemory`) | `71.77 ms` | `87.66 ms` | `1287.62` | `2.42 ms` | `2.95 ms` | `0.58 ms` | `0.76 ms` | `20.30 ms` |
+| ClawDB (`zeromq`) | `155.08 ms` | `175.81 ms` | `621.41` | `3.06 ms` | `3.43 ms` | `0.57 ms` | `0.65 ms` | `18.97 ms` |
+| ClawDB (`inmemory`) | `143.63 ms` | `165.41 ms` | `673.81` | `3.04 ms` | `3.41 ms` | `0.57 ms` | `0.64 ms` | `19.36 ms` |
 
 Interpretation:
 - Search latency is already strong.

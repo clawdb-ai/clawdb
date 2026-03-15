@@ -10,6 +10,9 @@ from .auth import build_request_auth, verify_openclaw_signature_or_raise
 from .models import (
     CapsuleRefreshRequest,
     MessageIn,
+    SessionForkRequest,
+    SessionSnapshotRequest,
+    SessionSpawnRequest,
     OpenClawMemoryReadRequest,
     OpenClawMemorySearchRequest,
     SearchRequest,
@@ -57,6 +60,54 @@ async def session_memory(session_id: str):
         return await service.openclaw_memory_get(f"memory/{session_id}.md", 1, 5000)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/v1/memory/present/linear/{session_id}")
+async def present_linear(session_id: str, tenant_id: str = "default"):
+    try:
+        return await service.present_linear_im(tenant_id=tenant_id, session_id=session_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/v1/memory/present/capsules/{session_id}")
+async def present_capsules(session_id: str, tenant_id: str = "default"):
+    return await service.present_capsule_cards(tenant_id=tenant_id, session_id=session_id)
+
+
+@app.get("/v1/memory/present/forum/{session_id}")
+async def present_forum(session_id: str, tenant_id: str = "default"):
+    return await service.present_forum_style(tenant_id=tenant_id, session_id=session_id)
+
+
+@app.post("/v1/memory/sessions/snapshot")
+async def create_session_snapshot(req: SessionSnapshotRequest):
+    return await service.create_snapshot(req)
+
+
+@app.get("/v1/memory/sessions/{session_id}/snapshots")
+async def list_session_snapshots(session_id: str, tenant_id: str = "default"):
+    return await service.list_session_snapshots(tenant_id=tenant_id, session_id=session_id)
+
+
+@app.post("/v1/memory/sessions/fork")
+async def fork_session(req: SessionForkRequest):
+    return await service.fork_session(req)
+
+
+@app.post("/v1/memory/sessions/spawn")
+async def spawn_session(req: SessionSpawnRequest):
+    return await service.spawn_session(req)
+
+
+@app.get("/v1/memory/index/status")
+async def index_status():
+    return await service.index_status()
+
+
+@app.post("/v1/memory/index/rebuild")
+async def index_rebuild():
+    return await service.rebuild_indexes()
 
 
 @app.get("/v1/memory/health")

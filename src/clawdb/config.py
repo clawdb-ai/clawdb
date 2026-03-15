@@ -21,6 +21,12 @@ class ClawDBConfig:
     ingest_backpressure_lag_threshold: int
     ingest_backpressure_max_wait_ms: int
     ingest_backpressure_poll_interval_ms: int
+    idempotency_dedupe_enabled: bool
+    topic_auto_classify_enabled: bool
+    topic_gep_dim: int
+    topic_gep_concentration: float
+    topic_gep_sigma2: float
+    topic_gep_prior_sigma2: float
     openclaw_require_signature: bool
     flush_interval_seconds: int
     lock_timeout_seconds: float
@@ -30,14 +36,14 @@ class ClawDBConfig:
 
     @classmethod
     def from_env(cls) -> "ClawDBConfig":
+        def _env_bool(name: str, default: str) -> bool:
+            raw = os.getenv(name, default).strip().lower()
+            return raw in {"1", "true", "yes", "on"}
+
         root = Path(os.getenv("CLAWDB_DATA_ROOT", "data")).resolve()
         wal_dir = root / "wal"
         parquet_dir = root / "parquet"
         checkpoints_dir = root / "checkpoints"
-        require_signature_raw = os.getenv("CLAWDB_OPENCLAW_REQUIRE_SIGNATURE", "true")
-        require_signature = require_signature_raw.strip().lower() in {"1", "true", "yes", "on"}
-        search_log_enabled_raw = os.getenv("CLAWDB_SEARCH_LOG_ENABLED", "true")
-        search_log_enabled = search_log_enabled_raw.strip().lower() in {"1", "true", "yes", "on"}
         return cls(
             data_root=root,
             wal_dir=wal_dir,
@@ -63,14 +69,20 @@ class ClawDBConfig:
             ingest_backpressure_poll_interval_ms=int(
                 os.getenv("CLAWDB_INGEST_BACKPRESSURE_POLL_INTERVAL_MS", "10")
             ),
-            openclaw_require_signature=require_signature,
+            idempotency_dedupe_enabled=_env_bool("CLAWDB_IDEMPOTENCY_DEDUPE_ENABLED", "false"),
+            topic_auto_classify_enabled=_env_bool("CLAWDB_TOPIC_AUTO_CLASSIFY_ENABLED", "true"),
+            topic_gep_dim=max(8, int(os.getenv("CLAWDB_TOPIC_GEP_DIM", "64"))),
+            topic_gep_concentration=float(os.getenv("CLAWDB_TOPIC_GEP_CONCENTRATION", "0.8")),
+            topic_gep_sigma2=float(os.getenv("CLAWDB_TOPIC_GEP_SIGMA2", "0.7")),
+            topic_gep_prior_sigma2=float(os.getenv("CLAWDB_TOPIC_GEP_PRIOR_SIGMA2", "1.2")),
+            openclaw_require_signature=_env_bool("CLAWDB_OPENCLAW_REQUIRE_SIGNATURE", "true"),
             flush_interval_seconds=int(os.getenv("CLAWDB_FLUSH_INTERVAL_SECONDS", "10")),
             lock_timeout_seconds=float(os.getenv("CLAWDB_LOCK_TIMEOUT_SECONDS", "1.5")),
             lock_watchdog_seconds=float(os.getenv("CLAWDB_LOCK_WATCHDOG_SECONDS", "10")),
             cache_hit_ratio_alert_threshold=float(
                 os.getenv("CLAWDB_CACHE_HIT_RATIO_ALERT_THRESHOLD", "0.80")
             ),
-            search_log_enabled=search_log_enabled,
+            search_log_enabled=_env_bool("CLAWDB_SEARCH_LOG_ENABLED", "true"),
         )
 
     def ensure_dirs(self) -> None:

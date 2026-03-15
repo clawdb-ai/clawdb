@@ -92,6 +92,62 @@ class OpenClawMemoryReadResponse(BaseModel):
     path: str
 
 
+class SessionSnapshotRequest(BaseModel):
+    tenant_id: str = "default"
+    session_id: str
+    note: Optional[str] = None
+
+
+class SessionSnapshotResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    snapshot_id: str
+    wal_seq: int
+
+
+class SessionForkRequest(BaseModel):
+    tenant_id: str = "default"
+    source_session_id: str
+    target_session_id: Optional[str] = None
+    note: Optional[str] = None
+
+
+class SessionForkResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    source_session_id: str
+    target_session_id: str
+    snapshot_id: str
+    wal_seq: int
+
+
+class SessionSpawnRequest(BaseModel):
+    tenant_id: str = "default"
+    seed_session_id: Optional[str] = None
+    session_id: Optional[str] = None
+    note: Optional[str] = None
+
+
+class SessionSpawnResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    session_id: str
+    parent_session_id: Optional[str] = None
+    wal_seq: int
+
+
+class IndexStatusResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    trie_topics: int
+    session_count: int
+    snapshot_count: int
+    wal_seq: int
+
+
+class IndexRebuildResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    wal_seq: int
+    rebuilt_topics: int
+    rebuilt_messages: int
+
+
 class CacheHitReportResponse(BaseModel):
     memory_cache_hit_ratio_1m: float
     memory_cache_hit_ratio_5m: float

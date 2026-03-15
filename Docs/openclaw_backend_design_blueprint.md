@@ -1,8 +1,8 @@
 # OpenClaw Backend Design Blueprint (Integrated, English)
 
 ## Document Status
-- Version: `v1.2.0-blueprint`
-- Date: `2026-03-14`
+- Version: `v1.3.0-blueprint`
+- Date: `2026-03-15`
 - Status: `Review Draft (Pre-Implementation)`
 - Source Baseline: `~/Downloads/openclaw_backend_design.md` (imported conceptually)
 
@@ -398,3 +398,63 @@ The following modules are required to fully mask OpenClaw memory-related functio
 ### 16.3 Test Coverage Modules
 - `tests/test_service.py`: ingestion/search/cache-hit/replay and deadlock-order baseline tests.
 - `Docs/implementation_audit_checklist.md`: execution audit checklist for module and integration sign-off.
+
+---
+
+## 17. Section 7.1 Strict Implementation Matrix
+This section enforces strict implementation of every item in source document section `7.1` ("Phase Breakdown"), with explicit code ownership.
+
+### 17.1 Phase 1: Core Storage Layer (Buffer / WAL / DB Schema / MQ)
+| 7.1 Item | ClawDB Implementation | Status |
+|---|---|---|
+| Buffer Layer | `src/clawdb/dataframes.py` (`messages_df`, `capsules_df`, `cache_index_df`, `sessions_df`, `snapshots_df`) | Implemented |
+| WAL Engine | `src/clawdb/wal.py`, service write path in `src/clawdb/service.py` (`ingest_message`, `flush_now`, replay in `startup`) | Implemented |
+| DB Schema | DataFrame schema columns in `src/clawdb/dataframes.py` + Parquet partition layout in `save_parquet/load_parquet` | Implemented |
+| MQ Setup | `src/clawdb/mq.py` async queue abstraction, ZeroMQ default (`CLAWDB_QUEUE_BACKEND=zeromq`) | Implemented |
+
+### 17.2 Phase 2: Trie + Topic Detection (Trie / Capsule / Gauss-Ewens / Folder Judger)
+| 7.1 Item | ClawDB Implementation | Status |
+|---|---|---|
+| Trie Tree | `src/clawdb/trie.py` (`TopicTrie`) integrated in ingest/replay/search index status | Implemented |
+| Capsule Manager | capsule refresh/materialization in `src/clawdb/dataframes.py` (`refresh_capsules`, `capsule_cards`) + orchestration in `src/clawdb/service.py` | Implemented |
+| Gauss-Ewens GP | `src/clawdb/topics.py` (`GaussianEwensTopicModel`) integrated in ingest and replay | Implemented |
+| Folder Judger | `src/clawdb/folder_judger.py` used during ingest capsule-level assignment | Implemented |
+
+### 17.3 Phase 3: Vector Retrieval (HNSW / BM25 / n-top-k / Hybrid)
+| 7.1 Item | ClawDB Implementation | Status |
+|---|---|---|
+| HNSW Index | `src/clawdb/retrieval.py` (`HNSWIndex`, in-process cosine-compatible implementation) | Implemented |
+| BM25 Index | `src/clawdb/retrieval.py` (`BM25Index`) | Implemented |
+| n-top-k Search | `src/clawdb/retrieval.py` (`NTopKSearch`) | Implemented |
+| Hybrid Fusion | `src/clawdb/retrieval.py` (`HybridFusion`, `HybridRetrievalEngine`) | Implemented |
+
+### 17.4 Phase 4: IM Presentation Layer (Linear IM / Capsule Cards / Forum Style / Index Mgmt)
+| 7.1 Item | ClawDB Implementation | Status |
+|---|---|---|
+| Linear IM | `present_linear_im` in `src/clawdb/service.py`, endpoint `GET /v1/memory/present/linear/{session_id}` in `src/clawdb/api.py` | Implemented |
+| Capsule Cards | `present_capsule_cards` in `src/clawdb/service.py`, endpoint `GET /v1/memory/present/capsules/{session_id}` | Implemented |
+| Forum Style | `present_forum_style` in `src/clawdb/service.py`, endpoint `GET /v1/memory/present/forum/{session_id}` | Implemented |
+| Index Mgmt | `index_status` and `rebuild_indexes` in `src/clawdb/service.py`, API routes under `/v1/memory/index/*` | Implemented |
+
+### 17.5 Phase 5: Session Management (Session / Snapshot / Fork / Spawn)
+| 7.1 Item | ClawDB Implementation | Status |
+|---|---|---|
+| Session Manager | session table + lifecycle in `src/clawdb/dataframes.py` (`ensure_session`, `spawn_session`) | Implemented |
+| Snapshot Chain | `create_snapshot`, `list_snapshots` with WAL sequence linkage | Implemented |
+| Fork Logic | `fork_session` in data/store + service endpoint `POST /v1/memory/sessions/fork` | Implemented |
+| Spawn Logic | `spawn_session` in data/store + service endpoint `POST /v1/memory/sessions/spawn` | Implemented |
+
+### 17.6 Phase 6: Integration Validation (Unit / Integration / Load / Chaos)
+| 7.1 Item | ClawDB Implementation | Status |
+|---|---|---|
+| Unit Tests | `tests/test_service.py`, `tests/test_mq.py`, `tests/test_openclaw_adapter.py`, `tests/test_embedding_rerank.py` | Implemented |
+| Integration Tests | `scripts/smoke_test_integration.sh`, `Docs/openclaw_integration_test.md` | Implemented |
+| Load Tests | `scripts/load_test.py` | Implemented |
+| Chaos Tests | `scripts/chaos_test.py` | Implemented |
+
+### 17.7 Constraints Cross-Check (Mandatory)
+- Async-only task model: enforced via async API/service/queue methods.
+- High-performance message queue: ZeroMQ default with optional Kafka/Redpanda-style adapter path.
+- Deadlock control: global lock rank, timeout, watchdog (`src/clawdb/locks.py`).
+- Data persistence model: in-memory pandas DataFrames with Parquet load-in/load-out and WAL durability.
+- Cache-hit reporting: per-lookup telemetry and API endpoint `/v1/memory/metrics/cache-hit`.

@@ -2,8 +2,8 @@
 
 ## Document Status
 - Version: `v1.0.0-traceability`
-- Date: `2026-03-14`
-- Blueprint Target: `Docs/openclaw_backend_design_blueprint.md` (`v1.2.0-blueprint`)
+- Date: `2026-03-15`
+- Blueprint Target: `Docs/openclaw_backend_design_blueprint.md` (`v1.3.0-blueprint`)
 - Source Document: `~/Downloads/openclaw_backend_design.md`
 - Purpose: section-by-section audit mapping from the integrated blueprint back to the imported original design.
 
@@ -49,11 +49,12 @@ Primary source anchors used in this map:
 | 14. Review Checklist | 343-354 | Whole-document synthesis | New Constraint | Adds explicit approval gates before coding; not present as checklist format in source. |
 | 15. Explicit Delta From Imported Source | 357-364 | Whole-document synthesis | New Constraint | Records major intentional deviations (English rewrite, Python-only, async-first, deadlock controls, cache-hit release gating). |
 | 16. ClawDB Module Inventory (Implementation Scope) | 368-391 | `5. Interface Definitions` (line 951 in source document), `6. Technology Stack` (line 1113 in source document), `7. Implementation Roadmap` (line 1181 in source document) | Extended + New Constraint | Adds explicit module ownership/checklist for implementation and OpenClaw integration assets to enforce execution traceability, including auth/signing, embedding routing, and metadata checkpoint modules. |
+| 17. Section 7.1 Strict Implementation Matrix | 394-454 | `7.1 Phase Breakdown` (line 1183 in source document) | Adopted + Extended | Maps every Phase 1-6 item (Buffer/WAL/DB/MQ, Trie/Capsule/Gauss-Ewens/Folder, HNSW/BM25/n-top-k/Hybrid, presentation layer, session lifecycle, validation) to concrete modules and endpoints for auditability. |
 
 ---
 
 ## Coverage Summary
-- Blueprint sections mapped: `18/18` (including metadata sections).
+- Blueprint sections mapped: `19/19` (including metadata sections).
 - Source major sections covered: `8/8`.
 - Source appendix coverage: referenced where terminology/background needed.
 

@@ -51,3 +51,47 @@ Execution checklist to verify clawdb can fully replace OpenClaw memory-related m
 - [x] benchmark report generated for `zeromq` backend.
 - [x] benchmark report generated for `inmemory` backend.
 - [x] benchmark summary saved at `Docs/benchmark_summary_2026-03-15.md`.
+
+## G. Source Section 7.1 Roadmap Compliance (Strict)
+
+### G1. Phase 1: Core Storage Layer
+- [x] Buffer Layer implemented with in-memory pandas (`messages_df`, `capsules_df`, `cache_index_df`, `sessions_df`, `snapshots_df`).
+- [x] WAL Engine implemented and append-only semantics preserved.
+- [x] DB schema represented as DataFrame schemas + Parquet partitions (no SQLite runtime dependency).
+- [x] High-performance async MQ configured (`zeromq` default, additional backends available).
+
+### G2. Phase 2: Trie + Topic Detection
+- [x] Trie tree implementation exists and is updated during ingest/replay.
+- [x] Capsule manager flow exists (refresh/materialize/present capsule cards).
+- [x] Auto topic classification uses Gauss-Ewens process implementation.
+- [x] Folder judger assigns capsule level (`L0/L1/L2`) from topic growth.
+
+### G3. Phase 3: Vector Retrieval
+- [x] HNSW-style vector index path implemented.
+- [x] BM25 lexical retrieval implemented.
+- [x] n-top-k candidate gather implemented.
+- [x] Hybrid fusion implemented and used by search path.
+
+### G4. Phase 4: IM Presentation Layer
+- [x] Linear IM presentation endpoint available.
+- [x] Capsule cards presentation endpoint available.
+- [x] Forum-style presentation endpoint available.
+- [x] Index management endpoints (status/rebuild) available.
+
+### G5. Phase 5: Session Lifecycle
+- [x] Session manager implemented (session table and lifecycle operations).
+- [x] Snapshot chain with WAL sequence traceability implemented.
+- [x] Fork logic implemented and exposed via API.
+- [x] Spawn logic implemented and exposed via API.
+
+### G6. Phase 6: Validation Coverage
+- [x] Unit tests cover ingest/search/replay/MQ/OpenClaw adapter.
+- [x] Integration smoke test covers OpenClaw plugin path end-to-end.
+- [x] Load test script exists and runs successfully.
+- [x] Chaos test script exists and verifies recovery/read consistency.
+
+### G7. Additional Mandatory Constraints
+- [x] Async execution model is used across API/service/queue interfaces.
+- [x] Deadlock prevention includes lock ordering, timeout, and watchdog scanning.
+- [x] Every ingested message is stored in DataFrame memory and persisted to Parquet on flush/checkpoint.
+- [x] Cache-hit report endpoint and telemetry counters are present and queryable.

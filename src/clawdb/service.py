@@ -6,10 +6,12 @@ import json
 import math
 from time import monotonic
 from typing import Dict, List, Optional, Sequence
+from uuid import uuid4
 
 from .config import ClawDBConfig
 from .dataframes import DataFrameStore
 from .embeddings import EmbeddingAuthContext, EmbeddingRouter
+from .folder_judger import FolderJudger
 from .locks import DeadlockSafeLockManager, LockRank
 from .metrics import CacheTelemetry
 from .metadata import DataFrameMetadataStore
@@ -20,12 +22,24 @@ from .models import (
     HealthResponse,
     MessageAck,
     MessageIn,
+    IndexRebuildResponse,
+    IndexStatusResponse,
     OpenClawMemoryReadResponse,
     OpenClawMemorySearchRequest,
+    SearchResult,
+    SessionForkRequest,
+    SessionForkResponse,
+    SessionSnapshotRequest,
+    SessionSnapshotResponse,
+    SessionSpawnRequest,
+    SessionSpawnResponse,
     SearchRequest,
     SearchResponse,
 )
 from .mq import AsyncMessageQueue, build_event, create_queue
+from .retrieval import HybridRetrievalEngine, RetrievalDoc
+from .trie import TopicTrie
+from .topics import GaussianEwensTopicModel
 from .wal import WalManager
 
 
@@ -51,6 +65,15 @@ class ClawDBService:
         self.embedding_router = EmbeddingRouter()
         self.telemetry = CacheTelemetry()
         self.metadata = DataFrameMetadataStore(self.config.metadata_parquet_path)
+        self.topic_model = GaussianEwensTopicModel(
+            dim=self.config.topic_gep_dim,
+            concentration=self.config.topic_gep_concentration,
+            sigma2=self.config.topic_gep_sigma2,
+            prior_sigma2=self.config.topic_gep_prior_sigma2,
+        )
+        self.topic_trie = TopicTrie()
+        self.folder_judger = FolderJudger()
+        self.retrieval_engine = HybridRetrievalEngine(dim=self.config.topic_gep_dim)
         self._search_cache: Dict[str, List[dict]] = {}
         self._embedding_cache: Dict[str, List[float]] = {}
         self._idempotency_index: Dict[str, MessageAck] = {}
@@ -135,6 +158,11 @@ class ClawDBService:
                         wal_seq=record.seq,
                         message_id=str(record.payload.get("message_id") or ""),
                     )
+                topic_id = str(record.payload.get("topic_id") or "")
+                content = str(record.payload.get("content") or "")
+                if topic_id and content:
+                    self.topic_model.observe_replay(topic_id, content)
+                    self.topic_trie.insert(topic_id, content)
 
     async def flush_now(self) -> None:
         await self.df_store.save_parquet(self.config.parquet_dir)
@@ -154,7 +182,13 @@ class ClawDBService:
         async for event in self.queue.consume():
             if self._stop.is_set():
                 break
-            if event.event_type in {"message_upsert", "capsule_refresh"}:
+            if event.event_type in {
+                "message_upsert",
+                "capsule_refresh",
+                "session_snapshot",
+                "session_fork",
+                "session_spawn",
+            }:
                 # Consumers can add async downstream work here (vector build, cache warm, etc.)
                 _ = worker_id
 
@@ -195,19 +229,37 @@ class ClawDBService:
 
     async def ingest_message(self, req: MessageIn) -> MessageAck:
         await self._enforce_ingest_backpressure()
-        payload = req.model_dump(mode="json")
-        lock_key = f"session:{req.tenant_id}:{req.session_id}"
+        resolved_topic_id = req.topic_id
+        if self.config.topic_auto_classify_enabled and not resolved_topic_id:
+            resolved_topic_id = self.topic_model.propose_topic(req.content)
+        topic_id = resolved_topic_id or req.topic_id or "default"
+        topic_count = await self.df_store.count_topic_messages(req.tenant_id, topic_id)
+        judged_level = self.folder_judger.judge(topic_count + 1)
+        req_with_topic = req.model_copy(
+            update={
+                "topic_id": topic_id,
+                "capsule_level": judged_level,
+            }
+        )
+        payload = req_with_topic.model_dump(mode="json")
+        lock_key = f"session:{req_with_topic.tenant_id}:{req_with_topic.session_id}"
         async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
-            if req.idempotency_key:
-                scope = self._idempotency_scope(req.tenant_id, req.session_id, req.idempotency_key)
+            if self.config.idempotency_dedupe_enabled and req_with_topic.idempotency_key:
+                scope = self._idempotency_scope(
+                    req_with_topic.tenant_id,
+                    req_with_topic.session_id,
+                    req_with_topic.idempotency_key,
+                )
                 cached_ack = self._idempotency_index.get(scope)
                 if cached_ack is not None:
                     return cached_ack
             record = await self.wal.append("message_upsert", payload)
             await self.df_store.add_message(payload)
             await self.queue.publish(build_event(record.seq, "message_upsert", payload))
-            ack = MessageAck(wal_seq=record.seq, message_id=req.message_id)
-            if req.idempotency_key:
+            self.topic_model.observe(str(payload.get("topic_id") or "default"), req_with_topic.content)
+            self.topic_trie.insert(str(payload.get("topic_id") or "default"), req_with_topic.content)
+            ack = MessageAck(wal_seq=record.seq, message_id=req_with_topic.message_id)
+            if self.config.idempotency_dedupe_enabled and req_with_topic.idempotency_key:
                 self._idempotency_index[scope] = ack
                 if len(self._idempotency_index) > self._cache_cap:
                     self._idempotency_index.pop(next(iter(self._idempotency_index)))
@@ -277,13 +329,48 @@ class ClawDBService:
         if cache_hit:
             results = cached
         else:
-            raw = await self.df_store.hybrid_search(
-                query=req.query,
+            docs_raw = await self.df_store.message_documents(
                 tenant_id=req.tenant_id,
                 session_id=req.session_id,
-                max_results=max(req.max_results * 5, req.max_results),
-                min_score=max(0.0, min(req.min_score, 0.15)),
             )
+            docs = [
+                RetrievalDoc(doc_id=str(item["doc_id"]), text=str(item["content"]))
+                for item in docs_raw
+            ]
+            doc_map = {str(item["doc_id"]): item for item in docs_raw}
+            retrieval = self.retrieval_engine.search(
+                query=req.query,
+                docs=docs,
+                top_k=max(req.max_results * 5, req.max_results),
+            )
+            raw: List[SearchResult] = []
+            for doc_id, fused, bm25_score, vec_score in retrieval:
+                item = doc_map.get(doc_id)
+                if item is None:
+                    continue
+                raw.append(
+                    SearchResult(
+                        path=str(item["path"]),
+                        start_line=int(item["line_no"]),
+                        end_line=int(item["line_no"]),
+                        score=round(float(fused), 6),
+                        score_lexical=round(float(bm25_score), 6),
+                        score_semantic=0.0,
+                        score_vector=round(float(vec_score), 6),
+                        snippet=str(item["content"])[:700],
+                        source="memory",
+                        source_tier=str(item.get("capsule_level") or "L0"),
+                        citation=f"message:{item['message_id']}",
+                    )
+                )
+            if not raw:
+                raw = await self.df_store.hybrid_search(
+                    query=req.query,
+                    tenant_id=req.tenant_id,
+                    session_id=req.session_id,
+                    max_results=max(req.max_results * 5, req.max_results),
+                    min_score=max(0.0, min(req.min_score, 0.15)),
+                )
             rescored = raw
             if embedding_ctx and raw:
                 try:
@@ -349,6 +436,123 @@ class ClawDBService:
                 )
             )
         return SearchResponse(wal_seq=self.wal.last_seq, cache_hit=cache_hit, results=results)
+
+    async def create_snapshot(self, req: SessionSnapshotRequest) -> SessionSnapshotResponse:
+        snapshot_id = f"snap-{uuid4()}"
+        payload = req.model_dump(mode="json")
+        payload["snapshot_id"] = snapshot_id
+        payload["wal_seq"] = self.wal.last_seq
+        lock_key = f"session:{req.tenant_id}:{req.session_id}"
+        async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
+            record = await self.wal.append("session_snapshot", payload)
+            await self.df_store.create_snapshot(
+                tenant_id=req.tenant_id,
+                session_id=req.session_id,
+                snapshot_id=snapshot_id,
+                wal_seq=record.seq,
+                note=req.note or "",
+            )
+            await self.queue.publish(build_event(record.seq, "session_snapshot", payload))
+        return SessionSnapshotResponse(snapshot_id=snapshot_id, wal_seq=record.seq)
+
+    async def fork_session(self, req: SessionForkRequest) -> SessionForkResponse:
+        target = req.target_session_id or f"{req.source_session_id}-fork-{uuid4().hex[:8]}"
+        snapshot_id = f"snap-{uuid4()}"
+        payload = req.model_dump(mode="json")
+        payload["target_session_id"] = target
+        payload["snapshot_id"] = snapshot_id
+        lock_key = f"session:{req.tenant_id}:{req.source_session_id}"
+        async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
+            record = await self.wal.append("session_fork", payload)
+            await self.df_store.fork_session(
+                tenant_id=req.tenant_id,
+                source_session_id=req.source_session_id,
+                target_session_id=target,
+            )
+            await self.df_store.create_snapshot(
+                tenant_id=req.tenant_id,
+                session_id=req.source_session_id,
+                snapshot_id=snapshot_id,
+                wal_seq=record.seq,
+                note=req.note or "fork",
+            )
+            await self.queue.publish(build_event(record.seq, "session_fork", payload))
+        return SessionForkResponse(
+            source_session_id=req.source_session_id,
+            target_session_id=target,
+            snapshot_id=snapshot_id,
+            wal_seq=record.seq,
+        )
+
+    async def spawn_session(self, req: SessionSpawnRequest) -> SessionSpawnResponse:
+        target = req.session_id or f"spawn-{uuid4().hex[:12]}"
+        payload = req.model_dump(mode="json")
+        payload["session_id"] = target
+        lock_key = f"session:{req.tenant_id}:{target}"
+        async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
+            record = await self.wal.append("session_spawn", payload)
+            await self.df_store.spawn_session(
+                tenant_id=req.tenant_id,
+                session_id=target,
+                parent_session_id=req.seed_session_id,
+            )
+            await self.queue.publish(build_event(record.seq, "session_spawn", payload))
+        return SessionSpawnResponse(
+            session_id=target,
+            parent_session_id=req.seed_session_id,
+            wal_seq=record.seq,
+        )
+
+    async def list_session_snapshots(self, tenant_id: str, session_id: str) -> List[dict]:
+        return await self.df_store.list_snapshots(tenant_id=tenant_id, session_id=session_id)
+
+    async def present_linear_im(self, tenant_id: str, session_id: str) -> OpenClawMemoryReadResponse:
+        path = f"memory/{session_id}.md" if tenant_id == "default" else f"memory/{tenant_id}/{session_id}.md"
+        return await self.openclaw_memory_get(path, from_line=1, lines=5000)
+
+    async def present_capsule_cards(self, tenant_id: str, session_id: str) -> List[dict]:
+        cards = await self.df_store.capsule_cards(tenant_id=tenant_id, session_id=session_id)
+        if cards:
+            return cards
+        await self.refresh_capsules(CapsuleRefreshRequest(tenant_id=tenant_id, session_id=session_id))
+        return await self.df_store.capsule_cards(tenant_id=tenant_id, session_id=session_id)
+
+    async def present_forum_style(self, tenant_id: str, session_id: str) -> List[dict]:
+        return await self.df_store.forum_view(tenant_id=tenant_id, session_id=session_id)
+
+    async def index_status(self) -> IndexStatusResponse:
+        sessions = await self.df_store.session_count()
+        snapshots = await self.df_store.snapshot_count()
+        return IndexStatusResponse(
+            trie_topics=self.topic_trie.topic_count,
+            session_count=sessions,
+            snapshot_count=snapshots,
+            wal_seq=self.wal.last_seq,
+        )
+
+    async def rebuild_indexes(self) -> IndexRebuildResponse:
+        self.topic_trie = TopicTrie()
+        self.topic_model = GaussianEwensTopicModel(
+            dim=self.config.topic_gep_dim,
+            concentration=self.config.topic_gep_concentration,
+            sigma2=self.config.topic_gep_sigma2,
+            prior_sigma2=self.config.topic_gep_prior_sigma2,
+        )
+        docs = await self.df_store.message_documents(tenant_id="*", session_id=None)
+        rebuilt = 0
+        for item in docs:
+            topic_id = str(item.get("topic_id") or "default")
+            content = str(item.get("content") or "")
+            if not content:
+                continue
+            self.topic_trie.insert(topic_id, content)
+            self.topic_model.observe_replay(topic_id, content)
+            rebuilt += 1
+        return IndexRebuildResponse(
+            wal_seq=self.wal.last_seq,
+            rebuilt_topics=self.topic_trie.topic_count,
+            rebuilt_messages=rebuilt,
+        )
 
     async def refresh_capsules(self, req: CapsuleRefreshRequest) -> CapsuleRefreshResponse:
         payload = req.model_dump(mode="json")
