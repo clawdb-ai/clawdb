@@ -87,6 +87,44 @@ SNAPSHOTS_COLUMNS = [
 ]
 
 
+MESSAGE_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "session_id",
+    "channel",
+    "chat_type",
+    "group_id",
+    "topic_id",
+    "message_thread_id",
+    "ts",
+    "message_id",
+]
+
+CAPSULE_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "session_id",
+    "capsule_id",
+]
+
+SESSION_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "session_id",
+]
+
+SNAPSHOT_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "session_id",
+    "snapshot_id",
+]
+
+CACHE_LOOKUP_MULTIINDEX_LEVELS = [
+    "key",
+    "tenant_id",
+    "session_id",
+    "query_type",
+    "capsule_level",
+]
+
+
 @dataclass
 class DataFramesState:
     messages_df: pd.DataFrame
@@ -156,6 +194,245 @@ class DataFrameStore:
             }
         )
         self._lock = asyncio.Lock()
+        self._messages_indexed_df: Optional[pd.DataFrame] = None
+        self._messages_index_dirty = True
+        self._capsules_indexed_df: Optional[pd.DataFrame] = None
+        self._capsules_index_dirty = True
+        self._sessions_indexed_df: Optional[pd.DataFrame] = None
+        self._sessions_index_dirty = True
+        self._snapshots_indexed_df: Optional[pd.DataFrame] = None
+        self._snapshots_index_dirty = True
+        self._cache_lookup_indexed_df: Optional[pd.DataFrame] = None
+        self._cache_lookup_index_dirty = True
+
+    def _invalidate_messages_index_locked(self) -> None:
+        self._messages_indexed_df = None
+        self._messages_index_dirty = True
+
+    def _invalidate_capsules_index_locked(self) -> None:
+        self._capsules_indexed_df = None
+        self._capsules_index_dirty = True
+
+    def _invalidate_sessions_index_locked(self) -> None:
+        self._sessions_indexed_df = None
+        self._sessions_index_dirty = True
+
+    def _invalidate_snapshots_index_locked(self) -> None:
+        self._snapshots_indexed_df = None
+        self._snapshots_index_dirty = True
+
+    def _invalidate_cache_lookup_index_locked(self) -> None:
+        self._cache_lookup_indexed_df = None
+        self._cache_lookup_index_dirty = True
+
+    def _invalidate_all_indexes_locked(self) -> None:
+        self._invalidate_messages_index_locked()
+        self._invalidate_capsules_index_locked()
+        self._invalidate_sessions_index_locked()
+        self._invalidate_snapshots_index_locked()
+        self._invalidate_cache_lookup_index_locked()
+
+    def _build_messages_index_locked(self) -> pd.DataFrame:
+        df = self._state.messages_df
+        if df.empty:
+            empty = df.copy()
+            self._messages_indexed_df = empty.set_index(MESSAGE_MULTIINDEX_LEVELS, drop=False)
+            self._messages_index_dirty = False
+            return self._messages_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["session_id"] = indexed["session_id"].fillna("default").astype(str)
+        indexed["channel"] = indexed["channel"].fillna("").astype(str)
+        indexed["chat_type"] = indexed["chat_type"].fillna("").astype(str)
+        indexed["group_id"] = indexed["group_id"].fillna("").astype(str)
+        indexed["topic_id"] = indexed["topic_id"].fillna("default").astype(str)
+        indexed["message_thread_id"] = indexed["message_thread_id"].fillna("").astype(str)
+        indexed["message_id"] = indexed["message_id"].fillna("").astype(str)
+        indexed["ts"] = pd.to_datetime(indexed["ts"], utc=True, errors="coerce")
+        indexed["ts"] = indexed["ts"].fillna(pd.Timestamp.now(tz="UTC"))
+        indexed = indexed.set_index(MESSAGE_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._messages_indexed_df = indexed
+        self._messages_index_dirty = False
+        return indexed
+
+    def _messages_for_query_locked(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+        channel: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        group_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
+    ) -> pd.DataFrame:
+        if self._messages_index_dirty or self._messages_indexed_df is None:
+            indexed = self._build_messages_index_locked()
+        else:
+            indexed = self._messages_indexed_df
+        if indexed.empty:
+            return indexed
+        key = (
+            slice(None) if tenant_id == "*" else str(tenant_id),
+            slice(None) if session_id is None else str(session_id),
+            slice(None) if channel is None else str(channel),
+            slice(None) if chat_type is None else str(chat_type),
+            slice(None) if group_id is None else str(group_id),
+            slice(None) if topic_id is None else str(topic_id),
+            slice(None) if message_thread_id is None else str(message_thread_id),
+            slice(None),
+            slice(None),
+        )
+        try:
+            scoped = indexed.loc[key]
+        except KeyError:
+            return indexed.iloc[0:0].copy()
+        if isinstance(scoped, pd.Series):
+            return scoped.to_frame().T
+        return scoped
+
+    def _build_capsules_index_locked(self) -> pd.DataFrame:
+        df = self._state.capsules_df
+        if df.empty:
+            empty = df.copy()
+            self._capsules_indexed_df = empty.set_index(CAPSULE_MULTIINDEX_LEVELS, drop=False)
+            self._capsules_index_dirty = False
+            return self._capsules_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["session_id"] = indexed["session_id"].fillna("default").astype(str)
+        indexed["capsule_id"] = indexed["capsule_id"].fillna("").astype(str)
+        indexed = indexed.set_index(CAPSULE_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._capsules_indexed_df = indexed
+        self._capsules_index_dirty = False
+        return indexed
+
+    def _capsules_for_query_locked(self, tenant_id: str, session_id: str) -> pd.DataFrame:
+        if self._capsules_index_dirty or self._capsules_indexed_df is None:
+            indexed = self._build_capsules_index_locked()
+        else:
+            indexed = self._capsules_indexed_df
+        if indexed.empty:
+            return indexed
+        key = (str(tenant_id), str(session_id), slice(None))
+        try:
+            scoped = indexed.loc[key]
+        except KeyError:
+            return indexed.iloc[0:0].copy()
+        if isinstance(scoped, pd.Series):
+            return scoped.to_frame().T
+        return scoped
+
+    def _build_sessions_index_locked(self) -> pd.DataFrame:
+        df = self._state.sessions_df
+        if df.empty:
+            empty = df.copy()
+            self._sessions_indexed_df = empty.set_index(SESSION_MULTIINDEX_LEVELS, drop=False)
+            self._sessions_index_dirty = False
+            return self._sessions_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["session_id"] = indexed["session_id"].fillna("default").astype(str)
+        indexed = indexed.set_index(SESSION_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._sessions_indexed_df = indexed
+        self._sessions_index_dirty = False
+        return indexed
+
+    def _session_exists_locked(self, tenant_id: str, session_id: str) -> bool:
+        if self._sessions_index_dirty or self._sessions_indexed_df is None:
+            indexed = self._build_sessions_index_locked()
+        else:
+            indexed = self._sessions_indexed_df
+        if indexed.empty:
+            return False
+        return (str(tenant_id), str(session_id)) in indexed.index
+
+    def _build_snapshots_index_locked(self) -> pd.DataFrame:
+        df = self._state.snapshots_df
+        if df.empty:
+            empty = df.copy()
+            self._snapshots_indexed_df = empty.set_index(SNAPSHOT_MULTIINDEX_LEVELS, drop=False)
+            self._snapshots_index_dirty = False
+            return self._snapshots_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["session_id"] = indexed["session_id"].fillna("default").astype(str)
+        indexed["snapshot_id"] = indexed["snapshot_id"].fillna("").astype(str)
+        indexed = indexed.set_index(SNAPSHOT_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._snapshots_indexed_df = indexed
+        self._snapshots_index_dirty = False
+        return indexed
+
+    def _snapshots_for_query_locked(self, tenant_id: str, session_id: str) -> pd.DataFrame:
+        if self._snapshots_index_dirty or self._snapshots_indexed_df is None:
+            indexed = self._build_snapshots_index_locked()
+        else:
+            indexed = self._snapshots_indexed_df
+        if indexed.empty:
+            return indexed
+        key = (str(tenant_id), str(session_id), slice(None))
+        try:
+            scoped = indexed.loc[key]
+        except KeyError:
+            return indexed.iloc[0:0].copy()
+        if isinstance(scoped, pd.Series):
+            return scoped.to_frame().T
+        return scoped
+
+    def _build_cache_lookup_index_locked(self) -> pd.DataFrame:
+        df = self._state.cache_index_df
+        if df.empty:
+            empty = df.copy()
+            empty["_row_id"] = pd.Series(dtype="int64")
+            self._cache_lookup_indexed_df = empty.set_index(CACHE_LOOKUP_MULTIINDEX_LEVELS, drop=False)
+            self._cache_lookup_index_dirty = False
+            return self._cache_lookup_indexed_df
+        indexed = df.copy()
+        indexed["key"] = indexed["key"].fillna("").astype(str)
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["session_id"] = indexed["session_id"].fillna("_").astype(str)
+        indexed["query_type"] = indexed["query_type"].fillna("memory_search").astype(str)
+        indexed["capsule_level"] = indexed["capsule_level"].fillna("mixed").astype(str)
+        indexed["_row_id"] = indexed.index.astype(int)
+        indexed = indexed.set_index(CACHE_LOOKUP_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._cache_lookup_indexed_df = indexed
+        self._cache_lookup_index_dirty = False
+        return indexed
+
+    def _cache_lookup_row_id_locked(
+        self,
+        *,
+        key: str,
+        tenant_id: str,
+        session_id: str,
+        query_type: str,
+        capsule_level: str,
+    ) -> Optional[int]:
+        if self._cache_lookup_index_dirty or self._cache_lookup_indexed_df is None:
+            indexed = self._build_cache_lookup_index_locked()
+        else:
+            indexed = self._cache_lookup_indexed_df
+        if indexed.empty:
+            return None
+        lookup_key = (
+            str(key),
+            str(tenant_id),
+            str(session_id),
+            str(query_type),
+            str(capsule_level),
+        )
+        try:
+            hit = indexed.loc[lookup_key]
+        except KeyError:
+            return None
+        if isinstance(hit, pd.Series):
+            return int(hit["_row_id"])
+        return int(hit.iloc[0]["_row_id"])
+
+    def _chronological_messages(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        return df.reset_index(drop=True).sort_values("ts", kind="stable")
 
     @property
     def state(self) -> DataFramesState:
@@ -241,25 +518,24 @@ class DataFrameStore:
                     [self._state.messages_df, row_df],
                     ignore_index=True,
                 )
+            self._invalidate_messages_index_locked()
 
     async def count_topic_messages(self, tenant_id: str, topic_id: str) -> int:
         async with self._lock:
-            df = self._state.messages_df
-            mask = (
-                (df["tenant_id"].astype(str) == tenant_id)
-                & (df["topic_id"].astype(str) == topic_id)
+            scoped = self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=None,
+                topic_id=topic_id,
             )
-            return int(df[mask].shape[0])
+            return int(scoped.shape[0])
 
     async def refresh_capsules(self, tenant_id: str, session_id: str) -> int:
         async with self._lock:
-            subset = self._state.messages_df[
-                (self._state.messages_df["tenant_id"].astype(str) == tenant_id)
-                & (self._state.messages_df["session_id"].astype(str) == session_id)
-            ]
+            subset = self._messages_for_query_locked(tenant_id=tenant_id, session_id=session_id)
             if subset.empty:
                 return 0
-            summary = " ".join(subset["content"].astype(str).tail(20).tolist())[:2000]
+            ordered = self._chronological_messages(subset)
+            summary = " ".join(ordered["content"].astype(str).tail(20).tolist())[:2000]
             capsule_id = f"caps-{tenant_id}-{session_id}"
             row = {
                 "capsule_id": capsule_id,
@@ -320,10 +596,10 @@ class DataFrameStore:
             origin="fork",
         )
         async with self._lock:
-            src_msg = self._state.messages_df[
-                (self._state.messages_df["tenant_id"].astype(str) == tenant_id)
-                & (self._state.messages_df["session_id"].astype(str) == source_session_id)
-            ]
+            src_msg = self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=source_session_id,
+            )
             if not src_msg.empty:
                 copied = src_msg.copy()
                 copied["session_id"] = target_session_id
@@ -331,6 +607,7 @@ class DataFrameStore:
                     [self._state.messages_df, copied[MESSAGES_COLUMNS]],
                     ignore_index=True,
                 )
+                self._invalidate_messages_index_locked()
             src_caps = self._state.capsules_df[
                 (self._state.capsules_df["tenant_id"].astype(str) == tenant_id)
                 & (self._state.capsules_df["session_id"].astype(str) == source_session_id)
@@ -524,26 +801,20 @@ class DataFrameStore:
         message_thread_id: Optional[str] = None,
     ) -> List[Dict[str, object]]:
         async with self._lock:
-            df = self._state.messages_df
-            if tenant_id != "*":
-                df = df[df["tenant_id"].astype(str) == tenant_id]
-            if session_id:
-                df = df[df["session_id"].astype(str) == session_id]
-            if channel:
-                df = df[df["channel"].astype(str) == channel]
-            if chat_type:
-                df = df[df["chat_type"].astype(str) == chat_type]
-            if group_id:
-                df = df[df["group_id"].astype(str) == group_id]
-            if topic_id:
-                df = df[df["topic_id"].astype(str) == topic_id]
-            if message_thread_id:
-                df = df[df["message_thread_id"].astype(str) == message_thread_id]
+            df = self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                channel=channel,
+                chat_type=chat_type,
+                group_id=group_id,
+                topic_id=topic_id,
+                message_thread_id=message_thread_id,
+            )
             if df.empty:
                 return []
             grouped: Dict[str, int] = {}
             docs: List[Dict[str, object]] = []
-            for _, row in df.sort_values("ts", kind="stable").iterrows():
+            for _, row in self._chronological_messages(df).iterrows():
                 tid = str(row["tenant_id"])
                 sid = str(row["session_id"])
                 key = f"{tid}:{sid}"
@@ -591,25 +862,20 @@ class DataFrameStore:
             return []
         query_tokens = [t for t in query_clean.lower().split() if t]
         async with self._lock:
-            df = self._state.messages_df
-            df = df[df["tenant_id"].astype(str) == tenant_id]
-            if session_id:
-                df = df[df["session_id"].astype(str) == session_id]
-            if channel:
-                df = df[df["channel"].astype(str) == channel]
-            if chat_type:
-                df = df[df["chat_type"].astype(str) == chat_type]
-            if group_id:
-                df = df[df["group_id"].astype(str) == group_id]
-            if topic_id:
-                df = df[df["topic_id"].astype(str) == topic_id]
-            if message_thread_id:
-                df = df[df["message_thread_id"].astype(str) == message_thread_id]
+            df = self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                channel=channel,
+                chat_type=chat_type,
+                group_id=group_id,
+                topic_id=topic_id,
+                message_thread_id=message_thread_id,
+            )
             if df.empty:
                 return []
             scored: List[Tuple[float, SearchResult]] = []
             grouped: Dict[str, int] = {}
-            for _, row in df.sort_values("ts", kind="stable").iterrows():
+            for _, row in self._chronological_messages(df).iterrows():
                 sid = str(row["session_id"])
                 tid = str(row.get("tenant_id") or "default")
                 grouped_key = f"{tid}:{sid}"
@@ -648,10 +914,9 @@ class DataFrameStore:
 
     async def forum_view(self, tenant_id: str, session_id: str) -> List[Dict[str, object]]:
         async with self._lock:
-            df = self._state.messages_df[
-                (self._state.messages_df["tenant_id"].astype(str) == tenant_id)
-                & (self._state.messages_df["session_id"].astype(str) == session_id)
-            ].sort_values("ts", kind="stable")
+            df = self._chronological_messages(
+                self._messages_for_query_locked(tenant_id=tenant_id, session_id=session_id)
+            )
             if df.empty:
                 return []
             grouped: Dict[str, List[Dict[str, object]]] = {}
@@ -702,10 +967,9 @@ class DataFrameStore:
         else:
             raise FileNotFoundError(f"unsupported memory path: {rel_path}")
         async with self._lock:
-            df = self._state.messages_df[
-                (self._state.messages_df["tenant_id"].astype(str) == tenant_id)
-                & (self._state.messages_df["session_id"].astype(str) == session_id)
-            ].sort_values("ts", kind="stable")
+            df = self._chronological_messages(
+                self._messages_for_query_locked(tenant_id=tenant_id, session_id=session_id)
+            )
             if df.empty:
                 raise FileNotFoundError(f"no session memory found for tenant={tenant_id} session={session_id}")
             lines = []
@@ -784,3 +1048,4 @@ class DataFrameStore:
             sessions_df=_read_all("sessions", SESSIONS_COLUMNS),
             snapshots_df=_read_all("snapshots", SNAPSHOTS_COLUMNS),
         )
+        self._invalidate_messages_index_locked()
