@@ -3,7 +3,7 @@
 ## Document Status
 - Version: `v1.0.0-traceability`
 - Date: `2026-03-15`
-- Blueprint Target: `Docs/openclaw_backend_design_blueprint.md` (`v1.3.0-blueprint`)
+- Blueprint Target: `Docs/openclaw_backend_design_blueprint.md` (`v1.4.0-blueprint`)
 - Source Document: `~/Downloads/openclaw_backend_design.md`
 - Purpose: section-by-section audit mapping from the integrated blueprint back to the imported original design.
 
@@ -50,11 +50,14 @@ Primary source anchors used in this map:
 | 15. Explicit Delta From Imported Source | 357-364 | Whole-document synthesis | New Constraint | Records major intentional deviations (English rewrite, Python-only, async-first, deadlock controls, cache-hit release gating). |
 | 16. ClawDB Module Inventory (Implementation Scope) | 368-391 | `5. Interface Definitions` (line 951 in source document), `6. Technology Stack` (line 1113 in source document), `7. Implementation Roadmap` (line 1181 in source document) | Extended + New Constraint | Adds explicit module ownership/checklist for implementation and OpenClaw integration assets to enforce execution traceability, including auth/signing, embedding routing, and metadata checkpoint modules. |
 | 17. Section 7.1 Strict Implementation Matrix | 394-454 | `7.1 Phase Breakdown` (line 1183 in source document) | Adopted + Extended | Maps every Phase 1-6 item (Buffer/WAL/DB/MQ, Trie/Capsule/Gauss-Ewens/Folder, HNSW/BM25/n-top-k/Hybrid, presentation layer, session lifecycle, validation) to concrete modules and endpoints for auditability. |
+| 18. Official OpenClaw IM Channel Coverage And Schema Mapping | 463-562 | `2. System Architecture Overview` channel and flow context (line 49 in source document), `5. Interface Definitions` (line 951), `7.1 Phase Breakdown` (line 1183) | Extended + New Constraint | Adds explicit official-channel capability matrix and canonical DM/group/thread/topic schema mapping from OpenClaw source into clawdb schema design for topic organization and cross-channel compatibility. |
+| 19. OpenClaw/Codex Skill Onboarding (First-Choice Memory) | 567-584 | `7. Implementation Roadmap` (line 1181 in source document), `5. Interface Definitions` (line 951), `8. Risks And Mitigations` (line 1269) | Extended + New Constraint | Adds operational skill package and deterministic setup/verify scripts so users can switch to clawdb-first memory with lower integration friction and better auditability. |
+| 20. Schema Evolution And Migration Contract | 588-607 | `3.5 Data Storage And Persistence` (line 482 in source document), `7. Implementation Roadmap` (line 1181), `8. Risks And Mitigations` (line 1269) | Extended + New Constraint | Adds explicit schema-version management, parquet migration contract, startup preflight migration, and WAL-preserving upgrade safety guarantees. |
 
 ---
 
 ## Coverage Summary
-- Blueprint sections mapped: `19/19` (including metadata sections).
+- Blueprint sections mapped: `22/22` (including metadata sections).
 - Source major sections covered: `8/8`.
 - Source appendix coverage: referenced where terminology/background needed.
 
@@ -66,6 +69,7 @@ Primary source anchors used in this map:
 5. Cache-hit reporting is promoted from observability guidance to release-blocking acceptance criteria.
 6. Default queue baseline is set to ZeroMQ for low-latency single-node deployment, with Kafka/Redpanda retained for distributed scale.
 7. OpenClaw adapter routes enforce signed requests by default while reusing OpenClaw runtime auth/profile keys.
+8. First-class skill onboarding and schema migration preflight were added as explicit operational requirements.
 
 ## Audit Usage Notes
 - Use this file during design sign-off to verify each blueprint section has a provenance path.

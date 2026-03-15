@@ -15,6 +15,7 @@ from .folder_judger import FolderJudger
 from .locks import DeadlockSafeLockManager, LockRank
 from .metrics import CacheTelemetry
 from .metadata import DataFrameMetadataStore
+from .migrate import auto_migrate_if_needed
 from .models import (
     CacheHitReportResponse,
     CapsuleRefreshRequest,
@@ -88,6 +89,11 @@ class ClawDBService:
         pass
 
     async def startup(self) -> None:
+        await auto_migrate_if_needed(
+            data_root=self.config.data_root,
+            parquet_dir=self.config.parquet_dir,
+            metadata_parquet_path=self.config.metadata_parquet_path,
+        )
         await self._load_checkpoint_and_replay()
         self._stop.clear()
         self._flush_task = asyncio.create_task(self._periodic_flush_loop(), name="clawdb-flush")
@@ -124,15 +130,18 @@ class ClawDBService:
     async def _load_checkpoint_and_replay(self) -> None:
         ckpt_path = self.config.checkpoints_dir / "latest.json"
         start_seq = 0
+        parquet_loaded = False
         checkpoint = await self.metadata.load_checkpoint(slot="wal")
         if checkpoint is not None:
             start_seq = int(checkpoint.last_seq)
             self._checkpoint_seq = start_seq
             try:
                 await self.df_store.load_parquet(self.config.parquet_dir)
+                parquet_loaded = True
             except Exception:
                 start_seq = 0
                 self._checkpoint_seq = 0
+                parquet_loaded = False
         if ckpt_path.exists():
             try:
                 data = json.loads(ckpt_path.read_text(encoding="utf-8"))
@@ -141,9 +150,17 @@ class ClawDBService:
                     start_seq = file_start_seq
                     self._checkpoint_seq = start_seq
                     await self.df_store.load_parquet(self.config.parquet_dir)
+                    parquet_loaded = True
             except Exception:
                 start_seq = 0
                 self._checkpoint_seq = 0
+                parquet_loaded = False
+        if not parquet_loaded:
+            try:
+                await self.df_store.load_parquet(self.config.parquet_dir)
+                parquet_loaded = True
+            except Exception:
+                parquet_loaded = False
         for record in self.wal.replay(from_seq_exclusive=start_seq):
             await self.df_store.apply_wal_record(record)
             if record.event_type == "message_upsert":
@@ -203,7 +220,9 @@ class ClawDBService:
     def _cache_key(self, req: SearchRequest) -> str:
         return (
             f"{req.tenant_id or 'default'}::{req.session_id or '_'}::"
-            f"{req.query.strip().lower()}::{req.max_results}::{req.min_score}"
+            f"{req.query.strip().lower()}::{req.max_results}::{req.min_score}::"
+            f"{req.channel or '_'}::{req.chat_type or '_'}::{req.group_id or '_'}::"
+            f"{req.topic_id or '_'}::{req.message_thread_id or '_'}"
         )
 
     def _idempotency_scope(self, tenant_id: str, session_id: str, idempotency_key: str) -> str:
@@ -229,15 +248,31 @@ class ClawDBService:
 
     async def ingest_message(self, req: MessageIn) -> MessageAck:
         await self._enforce_ingest_backpressure()
+        normalized_channel = (req.channel or "").strip().lower() or None
+        normalized_chat_type = (req.chat_type or "").strip().lower() or None
         resolved_topic_id = req.topic_id
+        auto_topic_assigned = False
         if self.config.topic_auto_classify_enabled and not resolved_topic_id:
             resolved_topic_id = self.topic_model.propose_topic(req.content)
+            auto_topic_assigned = bool(resolved_topic_id)
         topic_id = resolved_topic_id or req.topic_id or "default"
+        topic_source = req.topic_source or ("gauss_ewens" if auto_topic_assigned else "explicit")
+        topic_path = req.topic_path or (
+            f"{req.topic_parent_id}/{topic_id}" if req.topic_parent_id else topic_id
+        )
+        topic_confidence = req.topic_confidence
+        if topic_confidence is None:
+            topic_confidence = 0.6 if auto_topic_assigned else 1.0
         topic_count = await self.df_store.count_topic_messages(req.tenant_id, topic_id)
         judged_level = self.folder_judger.judge(topic_count + 1)
         req_with_topic = req.model_copy(
             update={
+                "channel": normalized_channel,
+                "chat_type": normalized_chat_type,
                 "topic_id": topic_id,
+                "topic_path": topic_path,
+                "topic_source": topic_source,
+                "topic_confidence": topic_confidence,
                 "capsule_level": judged_level,
             }
         )
@@ -332,6 +367,11 @@ class ClawDBService:
             docs_raw = await self.df_store.message_documents(
                 tenant_id=req.tenant_id,
                 session_id=req.session_id,
+                channel=req.channel,
+                chat_type=req.chat_type,
+                group_id=req.group_id,
+                topic_id=req.topic_id,
+                message_thread_id=req.message_thread_id,
             )
             docs = [
                 RetrievalDoc(doc_id=str(item["doc_id"]), text=str(item["content"]))
@@ -361,6 +401,14 @@ class ClawDBService:
                         source="memory",
                         source_tier=str(item.get("capsule_level") or "L0"),
                         citation=f"message:{item['message_id']}",
+                        channel=str(item.get("channel") or "") or None,
+                        chat_type=str(item.get("chat_type") or "") or None,
+                        account_id=str(item.get("account_id") or "") or None,
+                        group_id=str(item.get("group_id") or "") or None,
+                        topic_id=str(item.get("topic_id") or "default"),
+                        topic_path=str(item.get("topic_path") or item.get("topic_id") or "default"),
+                        message_thread_id=str(item.get("message_thread_id") or "") or None,
+                        sender_id=str(item.get("sender_id") or "") or None,
                     )
                 )
             if not raw:
@@ -368,6 +416,11 @@ class ClawDBService:
                     query=req.query,
                     tenant_id=req.tenant_id,
                     session_id=req.session_id,
+                    channel=req.channel,
+                    chat_type=req.chat_type,
+                    group_id=req.group_id,
+                    topic_id=req.topic_id,
+                    message_thread_id=req.message_thread_id,
                     max_results=max(req.max_results * 5, req.max_results),
                     min_score=max(0.0, min(req.min_score, 0.15)),
                 )
@@ -616,6 +669,14 @@ class ClawDBService:
                 "source": item.source,
                 "sourceTier": item.source_tier,
                 "citation": item.citation,
+                "channel": item.channel,
+                "chatType": item.chat_type,
+                "accountId": item.account_id,
+                "groupId": item.group_id,
+                "topicId": item.topic_id,
+                "topicPath": item.topic_path,
+                "threadId": item.message_thread_id,
+                "senderId": item.sender_id,
             }
             for item in result.results
         ]

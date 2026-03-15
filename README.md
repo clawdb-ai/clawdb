@@ -108,6 +108,7 @@ python3 scripts/benchmark_features.py \
 ## OpenClaw Integration 🔌
 
 - Plugin source: `integration/openclaw/memory-clawdb/`
+- Skill pack (Codex/CC/OpenClaw compatible): `integration/openclaw/skills/clawdb-first-memory/`
 - Install helper: `scripts/install_openclaw_integration.sh`
 - Bootstrap helper: `scripts/bootstrap_openclaw.sh`
 - Smoke test: `scripts/smoke_test_integration.sh`
@@ -116,6 +117,17 @@ python3 scripts/benchmark_features.py \
 OpenClaw adapter routes are signed by default:
 - `POST /v1/openclaw/memory/search`
 - `POST /v1/openclaw/memory/get`
+
+Skill-driven first-choice memory setup:
+
+```bash
+bash integration/openclaw/skills/clawdb-first-memory/scripts/setup_first_choice_memory.sh \
+  --repo-root "$(pwd)" \
+  --openclaw-dir "$(pwd)/external/openclaw" \
+  --profile clawdb-test \
+  --base-url http://127.0.0.1:8080 \
+  --verify
+```
 
 ## Configuration 🛠️
 
@@ -145,6 +157,8 @@ Storage:
 - Replay uses checkpoint + WAL tail reconstruction.
 - Idempotency key support prevents duplicate ingest.
 - Tenant/session isolation is enforced in search and memory-get paths.
+- Schema migrations are versioned and WAL-preserving (`python -m clawdb.migrate`).
+- Startup can auto-migrate older parquet schemas (`CLAWDB_SCHEMA_AUTO_MIGRATE=true`, default).
 
 ## Project Status ✅
 

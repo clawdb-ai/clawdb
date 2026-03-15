@@ -12,7 +12,28 @@ class MessageIn(BaseModel):
     session_id: str
     role: Literal["user", "assistant", "system", "tool"]
     content: str
+    channel: Optional[str] = None
+    chat_type: Optional[Literal["direct", "group", "channel", "thread"]] = None
+    account_id: Optional[str] = None
+    from_id: Optional[str] = None
+    to_id: Optional[str] = None
+    sender_id: Optional[str] = None
+    sender_name: Optional[str] = None
+    sender_username: Optional[str] = None
+    sender_e164: Optional[str] = None
+    group_id: Optional[str] = None
+    group_subject: Optional[str] = None
+    group_channel: Optional[str] = None
+    group_space: Optional[str] = None
+    native_channel_id: Optional[str] = None
+    message_thread_id: Optional[str] = None
+    thread_parent_id: Optional[str] = None
+    reply_to_id: Optional[str] = None
     topic_id: Optional[str] = None
+    topic_parent_id: Optional[str] = None
+    topic_path: Optional[str] = None
+    topic_confidence: Optional[float] = None
+    topic_source: Optional[Literal["explicit", "gauss_ewens", "trie", "manual", "replay"]] = None
     capsule_level: Literal["L0", "L1", "L2"] = "L0"
     idempotency_key: Optional[str] = None
     message_id: str = Field(default_factory=lambda: str(uuid4()))
@@ -29,6 +50,11 @@ class SearchRequest(BaseModel):
     query: str
     tenant_id: str = "default"
     session_id: Optional[str] = None
+    channel: Optional[str] = None
+    chat_type: Optional[Literal["direct", "group", "channel", "thread"]] = None
+    group_id: Optional[str] = None
+    topic_id: Optional[str] = None
+    message_thread_id: Optional[str] = None
     max_results: int = 6
     min_score: float = 0.0
 
@@ -45,6 +71,14 @@ class SearchResult(BaseModel):
     source: Literal["memory", "sessions"] = "memory"
     source_tier: Literal["L0", "L1", "L2"] = "L0"
     citation: Optional[str] = None
+    channel: Optional[str] = None
+    chat_type: Optional[str] = None
+    account_id: Optional[str] = None
+    group_id: Optional[str] = None
+    topic_id: Optional[str] = None
+    topic_path: Optional[str] = None
+    message_thread_id: Optional[str] = None
+    sender_id: Optional[str] = None
 
 
 class SearchResponse(BaseModel):

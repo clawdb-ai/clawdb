@@ -1,9 +1,9 @@
 # OpenClaw Backend Design Blueprint (Integrated, English)
 
 ## Document Status
-- Version: `v1.3.0-blueprint`
+- Version: `v1.4.0-blueprint`
 - Date: `2026-03-15`
-- Status: `Review Draft (Pre-Implementation)`
+- Status: `Implementation Baseline`
 - Source Baseline: `~/Downloads/openclaw_backend_design.md` (imported conceptually)
 
 ## Scope And Intent
@@ -458,3 +458,137 @@ This section enforces strict implementation of every item in source document sec
 - Deadlock control: global lock rank, timeout, watchdog (`src/clawdb/locks.py`).
 - Data persistence model: in-memory pandas DataFrames with Parquet load-in/load-out and WAL durability.
 - Cache-hit reporting: per-lookup telemetry and API endpoint `/v1/memory/metrics/cache-hit`.
+
+---
+
+## 18. Official OpenClaw IM Channel Coverage And Schema Mapping
+This section is a direct investigation summary from official OpenClaw source (`external/openclaw`) and is used as the canonical compatibility baseline for clawdb IM metadata schema design.
+
+### 18.1 Official Channel Capability Matrix (Chat Types)
+| Channel | Supported chat types | Official source |
+|---|---|---|
+| `telegram` | `direct`, `group`, `channel`, `thread` | `external/openclaw/extensions/telegram/src/channel.ts:206` |
+| `whatsapp` | `direct`, `group` | `external/openclaw/extensions/whatsapp/src/channel.ts:61` |
+| `discord` | `direct`, `channel`, `thread` | `external/openclaw/extensions/discord/src/channel.ts:96` |
+| `irc` | `direct`, `group` | `external/openclaw/extensions/irc/src/channel.ts:82` |
+| `googlechat` | `direct`, `group`, `thread` | `external/openclaw/extensions/googlechat/src/channel.ts:101` |
+| `slack` | `direct`, `channel`, `thread` | `external/openclaw/extensions/slack/src/channel.ts:148` |
+| `signal` | `direct`, `group` | `external/openclaw/extensions/signal/src/channel.ts:122` |
+| `imessage` | `direct`, `group` | `external/openclaw/extensions/imessage/src/channel.ts:101` |
+| `line` | `direct`, `group` | `external/openclaw/extensions/line/src/channel.ts:125` |
+| `bluebubbles` | `direct`, `group` | `external/openclaw/extensions/bluebubbles/src/channel.ts:69` |
+| `feishu` | `direct`, `channel` | `external/openclaw/extensions/feishu/src/channel.ts:102` |
+| `matrix` | `direct`, `group`, `thread` | `external/openclaw/extensions/matrix/src/channel.ts:145` |
+| `mattermost` | `direct`, `channel`, `group`, `thread` | `external/openclaw/extensions/mattermost/src/channel.ts:268` |
+| `msteams` | `direct`, `channel`, `thread` | `external/openclaw/extensions/msteams/src/channel.ts:71` |
+| `nextcloud-talk` | `direct`, `group` | `external/openclaw/extensions/nextcloud-talk/src/channel.ts:74` |
+| `nostr` | `direct` | `external/openclaw/extensions/nostr/src/channel.ts:45` |
+| `synology-chat` | `direct` | `external/openclaw/extensions/synology-chat/src/channel.ts:57` |
+| `tlon` | `direct`, `group`, `thread` | `external/openclaw/extensions/tlon/src/channel.ts:294` |
+| `twitch` | `group` | `external/openclaw/extensions/twitch/src/plugin.ts:70` |
+| `zalo` | `direct`, `group` | `external/openclaw/extensions/zalo/src/channel.ts:73` |
+| `zalouser` | `direct`, `group` | `external/openclaw/extensions/zalouser/src/channel.ts:312` |
+| `webchat` (internal channel) | internal gateway message channel (session-based) | `external/openclaw/src/utils/message-channel.ts:15` |
+
+### 18.2 Canonical Inbound IM Context In OpenClaw
+Primary canonical inbound model:
+- `MsgContext` in `external/openclaw/src/auto-reply/templating.ts`.
+- Session key construction and peer-kind routing in `external/openclaw/src/routing/session-key.ts`.
+
+Canonical cross-channel fields used for DM/group/topic routing:
+- Core identity/session fields:
+  - `SessionKey`, `From`, `To`, `AccountId`, `ChatType`
+- Sender identity fields:
+  - `SenderId`, `SenderName`, `SenderUsername`, `SenderE164`
+- Group/channel organization fields:
+  - `GroupSubject`, `GroupChannel`, `GroupSpace`, `GroupMembers`
+- Thread/topic fields:
+  - `MessageThreadId`, `ThreadParentId`, `RootMessageId`, `ReplyToId`, `IsForum`, `TopicRequiredButMissing`
+- Native platform routing fields:
+  - `NativeChannelId`, `OriginatingChannel`, `OriginatingTo`
+
+### 18.3 DM/Group/Thread Schema Summary (Normalized)
+#### DM message schema (normalized)
+- Required:
+  - `tenant_id`, `session_id`, `role`, `content`
+- Strongly recommended:
+  - `channel`, `chat_type=direct`, `account_id`, `from_id`, `to_id`, `sender_id`
+- Optional reply/thread fields:
+  - `reply_to_id`, `message_thread_id`
+
+#### Group/channel message schema (normalized)
+- Required:
+  - `tenant_id`, `session_id`, `role`, `content`
+- Strongly recommended:
+  - `channel`, `chat_type in {group, channel}`, `group_id`, `group_subject/group_channel/group_space`, `sender_id`
+- Optional thread fields:
+  - `message_thread_id`, `thread_parent_id`, `reply_to_id`
+
+#### Topic-organization schema (normalized)
+- Required for topic-aware organization:
+  - `topic_id`
+- Recommended:
+  - `topic_parent_id`, `topic_path`, `topic_source`, `topic_confidence`
+- Source semantics:
+  - `explicit`: caller-provided topic
+  - `gauss_ewens`: auto-classified by GEP
+  - `manual` / `trie` / `replay`: operational/audit variants
+
+### 18.4 ClawDB Expanded Schema (Implemented)
+`MessageIn` and `messages_df` now persist the following OpenClaw-compatible IM fields:
+- Channel and routing:
+  - `channel`, `chat_type`, `account_id`, `from_id`, `to_id`, `native_channel_id`
+- Sender and group:
+  - `sender_id`, `sender_name`, `sender_username`, `sender_e164`, `group_id`, `group_subject`, `group_channel`, `group_space`
+- Thread and reply:
+  - `message_thread_id`, `thread_parent_id`, `reply_to_id`
+- Topic organization:
+  - `topic_id`, `topic_parent_id`, `topic_path`, `topic_source`, `topic_confidence`
+
+Search path now supports metadata filters:
+- `channel`, `chat_type`, `group_id`, `topic_id`, `message_thread_id`
+
+Search results now emit metadata for downstream routing/debugging:
+- `channel`, `chat_type`, `account_id`, `group_id`, `topic_id`, `topic_path`, `message_thread_id`, `sender_id`
+
+---
+
+## 19. OpenClaw/Codex Skill Onboarding (First-Choice Memory)
+To reduce integration friction, clawdb includes a compatible skill package for OpenClaw/Codex/CC workflows:
+
+- Skill root:
+  - `integration/openclaw/skills/clawdb-first-memory/SKILL.md`
+- Setup and verification scripts:
+  - `integration/openclaw/skills/clawdb-first-memory/scripts/setup_first_choice_memory.sh`
+  - `integration/openclaw/skills/clawdb-first-memory/scripts/verify_first_choice_memory.sh`
+  - `integration/openclaw/skills/clawdb-first-memory/scripts/install_skill_to_openclaw.sh`
+
+Skill guarantees:
+- Installs and links `memory-clawdb` plugin.
+- Forces OpenClaw memory slot to `memory-clawdb`.
+- Keeps OpenClaw auth/signing semantics and embedding credential reuse.
+- Runs deterministic health/status/search/get checks.
+- Provides migration workflow guidance (`python -m clawdb.migrate`).
+
+---
+
+## 20. Schema Evolution And Migration Contract
+ClawDB schema updates are handled through a first-party migration tool:
+
+- Module and CLI:
+  - `src/clawdb/migrate.py`
+  - `python -m clawdb.migrate --data-root data`
+- Startup preflight:
+  - `src/clawdb/service.py` calls auto-migration before parquet load and WAL replay.
+
+Required migration properties:
+- Versioned metadata checkpoint (`slot=schema_version`) in metadata parquet.
+- Dry-run plan mode (`--dry-run`) with missing-column detail per table.
+- Full backup support before rewrite (default enabled).
+- Idempotent reruns.
+- WAL-preserving behavior (WAL files are not reset or compacted by migration).
+- History remains readable from all presentation levels (`L0/L1/L2`, linear/capsule/forum views).
+
+Schema scope migrated:
+- `messages`, `capsules`, `cache_index`, `sessions`, `snapshots` parquet datasets.
+- Metadata checkpoint version update for post-migration replay consistency.

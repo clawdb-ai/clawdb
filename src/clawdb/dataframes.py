@@ -18,7 +18,28 @@ MESSAGES_COLUMNS = [
     "role",
     "content",
     "ts",
+    "channel",
+    "chat_type",
+    "account_id",
+    "from_id",
+    "to_id",
+    "sender_id",
+    "sender_name",
+    "sender_username",
+    "sender_e164",
+    "group_id",
+    "group_subject",
+    "group_channel",
+    "group_space",
+    "native_channel_id",
+    "message_thread_id",
+    "thread_parent_id",
+    "reply_to_id",
     "topic_id",
+    "topic_parent_id",
+    "topic_path",
+    "topic_confidence",
+    "topic_source",
     "embedding_ref",
     "capsule_level",
     "idempotency_key",
@@ -91,7 +112,27 @@ class DataFrameStore:
                 "session_id": "string",
                 "role": "string",
                 "content": "string",
+                "channel": "string",
+                "chat_type": "string",
+                "account_id": "string",
+                "from_id": "string",
+                "to_id": "string",
+                "sender_id": "string",
+                "sender_name": "string",
+                "sender_username": "string",
+                "sender_e164": "string",
+                "group_id": "string",
+                "group_subject": "string",
+                "group_channel": "string",
+                "group_space": "string",
+                "native_channel_id": "string",
+                "message_thread_id": "string",
+                "thread_parent_id": "string",
+                "reply_to_id": "string",
                 "topic_id": "string",
+                "topic_parent_id": "string",
+                "topic_path": "string",
+                "topic_source": "string",
                 "embedding_ref": "string",
                 "capsule_level": "string",
                 "idempotency_key": "string",
@@ -156,6 +197,7 @@ class DataFrameStore:
         session_id = str(payload["session_id"])
         await self.ensure_session(tenant_id=tenant_id, session_id=session_id)
         async with self._lock:
+            raw_topic_confidence = payload.get("topic_confidence")
             row = {
                 "message_id": str(payload["message_id"]),
                 "tenant_id": tenant_id,
@@ -163,7 +205,30 @@ class DataFrameStore:
                 "role": str(payload["role"]),
                 "content": str(payload["content"]),
                 "ts": pd.to_datetime(payload["ts"], utc=True),
+                "channel": str(payload.get("channel") or ""),
+                "chat_type": str(payload.get("chat_type") or ""),
+                "account_id": str(payload.get("account_id") or ""),
+                "from_id": str(payload.get("from_id") or ""),
+                "to_id": str(payload.get("to_id") or ""),
+                "sender_id": str(payload.get("sender_id") or ""),
+                "sender_name": str(payload.get("sender_name") or ""),
+                "sender_username": str(payload.get("sender_username") or ""),
+                "sender_e164": str(payload.get("sender_e164") or ""),
+                "group_id": str(payload.get("group_id") or ""),
+                "group_subject": str(payload.get("group_subject") or ""),
+                "group_channel": str(payload.get("group_channel") or ""),
+                "group_space": str(payload.get("group_space") or ""),
+                "native_channel_id": str(payload.get("native_channel_id") or ""),
+                "message_thread_id": str(payload.get("message_thread_id") or ""),
+                "thread_parent_id": str(payload.get("thread_parent_id") or ""),
+                "reply_to_id": str(payload.get("reply_to_id") or ""),
                 "topic_id": str(payload.get("topic_id") or "default"),
+                "topic_parent_id": str(payload.get("topic_parent_id") or ""),
+                "topic_path": str(payload.get("topic_path") or payload.get("topic_id") or "default"),
+                "topic_confidence": (
+                    float(raw_topic_confidence) if raw_topic_confidence is not None else None
+                ),
+                "topic_source": str(payload.get("topic_source") or ""),
                 "embedding_ref": str(payload.get("embedding_ref") or ""),
                 "capsule_level": str(payload.get("capsule_level") or "L0"),
                 "idempotency_key": str(payload.get("idempotency_key") or ""),
@@ -452,6 +517,11 @@ class DataFrameStore:
         self,
         tenant_id: str,
         session_id: Optional[str],
+        channel: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        group_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
     ) -> List[Dict[str, object]]:
         async with self._lock:
             df = self._state.messages_df
@@ -459,6 +529,16 @@ class DataFrameStore:
                 df = df[df["tenant_id"].astype(str) == tenant_id]
             if session_id:
                 df = df[df["session_id"].astype(str) == session_id]
+            if channel:
+                df = df[df["channel"].astype(str) == channel]
+            if chat_type:
+                df = df[df["chat_type"].astype(str) == chat_type]
+            if group_id:
+                df = df[df["group_id"].astype(str) == group_id]
+            if topic_id:
+                df = df[df["topic_id"].astype(str) == topic_id]
+            if message_thread_id:
+                df = df[df["message_thread_id"].astype(str) == message_thread_id]
             if df.empty:
                 return []
             grouped: Dict[str, int] = {}
@@ -477,7 +557,14 @@ class DataFrameStore:
                         "message_id": str(row["message_id"]),
                         "tenant_id": tid,
                         "session_id": sid,
+                        "channel": str(row.get("channel") or ""),
+                        "chat_type": str(row.get("chat_type") or ""),
+                        "account_id": str(row.get("account_id") or ""),
+                        "group_id": str(row.get("group_id") or ""),
                         "topic_id": str(row.get("topic_id") or "default"),
+                        "topic_path": str(row.get("topic_path") or row.get("topic_id") or "default"),
+                        "message_thread_id": str(row.get("message_thread_id") or ""),
+                        "sender_id": str(row.get("sender_id") or ""),
                         "capsule_level": str(row.get("capsule_level") or "L0"),
                         "content": str(row["content"]),
                         "path": path,
@@ -491,6 +578,11 @@ class DataFrameStore:
         query: str,
         tenant_id: str,
         session_id: Optional[str],
+        channel: Optional[str],
+        chat_type: Optional[str],
+        group_id: Optional[str],
+        topic_id: Optional[str],
+        message_thread_id: Optional[str],
         max_results: int,
         min_score: float,
     ) -> List[SearchResult]:
@@ -503,6 +595,16 @@ class DataFrameStore:
             df = df[df["tenant_id"].astype(str) == tenant_id]
             if session_id:
                 df = df[df["session_id"].astype(str) == session_id]
+            if channel:
+                df = df[df["channel"].astype(str) == channel]
+            if chat_type:
+                df = df[df["chat_type"].astype(str) == chat_type]
+            if group_id:
+                df = df[df["group_id"].astype(str) == group_id]
+            if topic_id:
+                df = df[df["topic_id"].astype(str) == topic_id]
+            if message_thread_id:
+                df = df[df["message_thread_id"].astype(str) == message_thread_id]
             if df.empty:
                 return []
             scored: List[Tuple[float, SearchResult]] = []
@@ -531,6 +633,14 @@ class DataFrameStore:
                     source="memory",
                     source_tier=str(row.get("capsule_level") or "L0"),
                     citation=f"message:{row['message_id']}",
+                    channel=str(row.get("channel") or "") or None,
+                    chat_type=str(row.get("chat_type") or "") or None,
+                    account_id=str(row.get("account_id") or "") or None,
+                    group_id=str(row.get("group_id") or "") or None,
+                    topic_id=str(row.get("topic_id") or "default"),
+                    topic_path=str(row.get("topic_path") or row.get("topic_id") or "default"),
+                    message_thread_id=str(row.get("message_thread_id") or "") or None,
+                    sender_id=str(row.get("sender_id") or "") or None,
                 )
                 scored.append((score, result))
         scored.sort(key=lambda item: item[0], reverse=True)

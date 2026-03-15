@@ -95,3 +95,35 @@ Execution checklist to verify clawdb can fully replace OpenClaw memory-related m
 - [x] Deadlock prevention includes lock ordering, timeout, and watchdog scanning.
 - [x] Every ingested message is stored in DataFrame memory and persisted to Parquet on flush/checkpoint.
 - [x] Cache-hit report endpoint and telemetry counters are present and queryable.
+
+## H. Official OpenClaw IM Channel And Schema Coverage
+- [x] Official IM channel capability matrix extracted from `external/openclaw/extensions/*` plugin capabilities (`chatTypes`).
+- [x] DM/group/thread canonical schema derived from OpenClaw `MsgContext` and routing/session-key core modules.
+- [x] ClawDB ingest schema expanded for OpenClaw channel metadata:
+  - [x] `channel`, `chat_type`, `account_id`
+  - [x] `from_id`, `to_id`, `sender_id`, `sender_name`, `sender_username`, `sender_e164`
+  - [x] `group_id`, `group_subject`, `group_channel`, `group_space`
+  - [x] `native_channel_id`, `message_thread_id`, `thread_parent_id`, `reply_to_id`
+- [x] Topic organization schema expanded and persisted:
+  - [x] `topic_parent_id`, `topic_path`, `topic_source`, `topic_confidence`
+- [x] Search/filter schema expanded with IM metadata dimensions:
+  - [x] `channel`, `chat_type`, `group_id`, `topic_id`, `message_thread_id`
+
+## I. Skill-Based Onboarding Coverage
+- [x] OpenClaw/Codex-compatible skill package exists: `integration/openclaw/skills/clawdb-first-memory/SKILL.md`.
+- [x] Skill includes deterministic setup script for first-choice memory slot selection.
+- [x] Skill includes verification script for `status/search/get` flow validation.
+- [x] Skill includes installer script to publish skill into OpenClaw state skills directory.
+- [x] Skill references migration workflow and OpenClaw auth/signing compatibility notes.
+
+## J. Schema Migration And Upgrade Safety
+- [x] Versioned schema migration module exists (`src/clawdb/migrate.py`).
+- [x] CLI path is available for users (`python -m clawdb.migrate`).
+- [x] Dry-run planning mode emits actionable migration plan output.
+- [x] Migration supports backup-before-write and configurable backup path.
+- [x] Migration rewrites all parquet tables to canonical schema shape (`messages/capsules/cache_index/sessions/snapshots`).
+- [x] Migration updates schema metadata version checkpoint in metadata parquet.
+- [x] Migration is idempotent on rerun.
+- [x] Startup auto-migration preflight is integrated and test-covered.
+- [x] WAL remains intact during migration (no reset/truncate in migration flow).
+- [x] Post-migration history remains readable from all memory/context presentation levels.
