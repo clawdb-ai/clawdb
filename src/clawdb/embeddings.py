@@ -22,7 +22,7 @@ class EmbeddingRouter:
         texts: List[str],
     ) -> List[List[float]]:
         provider = ctx.provider.strip().lower()
-        if provider == "openai":
+        if provider in {"openai", "kimi-coding", "kimi", "moonshot"}:
             return await self._embed_openai(ctx, texts)
         if provider == "voyage":
             return await self._embed_voyage(ctx, texts)
@@ -31,10 +31,17 @@ class EmbeddingRouter:
         raise RuntimeError(f"unsupported embedding provider: {ctx.provider}")
 
     async def _embed_openai(self, ctx: EmbeddingAuthContext, texts: List[str]) -> List[List[float]]:
-        url_base = (ctx.base_url or "https://api.openai.com/v1").rstrip("/")
+        provider = ctx.provider.strip().lower()
+        if provider in {"kimi-coding", "kimi", "moonshot"}:
+            default_base = "https://api.kimi.com/coding"
+            default_model = "k2p5"
+        else:
+            default_base = "https://api.openai.com/v1"
+            default_model = "text-embedding-3-small"
+        url_base = (ctx.base_url or default_base).rstrip("/")
         url = f"{url_base}/embeddings"
         payload = {
-            "model": ctx.model or "text-embedding-3-small",
+            "model": ctx.model or default_model,
             "input": texts,
         }
         headers = {
