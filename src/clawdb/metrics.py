@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from statistics import median
 from time import monotonic
-from typing import Deque, Tuple
+from typing import Deque, Dict, Mapping, Sequence, Tuple
 
 from prometheus_client import Counter, Histogram
+
+
+DEFAULT_HIT_AT_TARGETS: Dict[int, float] = {1: 0.50, 3: 0.75, 5: 0.85}
+DEFAULT_NDCG_AT_TARGETS: Dict[int, float] = {3: 0.70, 5: 0.80}
+DEFAULT_COLD_LATENCY_P95_MS_TARGET = 250.0
+DEFAULT_WARM_LATENCY_P95_MS_TARGET = 50.0
+DEFAULT_WORKING_SET_BYTES_TARGET = 512 * 1024 * 1024
+DEFAULT_REBUILD_TIME_MS_TARGET = 5_000.0
 
 
 CACHE_HITS = Counter("memory_cache_hits_total", "Total cache hits")
@@ -86,3 +95,68 @@ class CacheTelemetry:
         if not self._latency_ms:
             return 0.0
         return float(median(self._latency_ms))
+
+
+def aggregate_ranked_relevance(
+    ranked_match_keys: Sequence[Sequence[str]],
+    judgments: Mapping[str, float],
+) -> list[float]:
+    """
+    Resolve a ranked result list into graded relevance values.
+
+    Each judgment may satisfy at most one result so mirrored citations across tiers
+    do not inflate Hit@k or NDCG.
+    """
+
+    remaining = {
+        str(match_key): float(relevance)
+        for match_key, relevance in judgments.items()
+        if float(relevance) > 0.0
+    }
+    resolved: list[float] = []
+    for match_keys in ranked_match_keys:
+        best_key = ""
+        best_relevance = 0.0
+        for raw_key in match_keys:
+            key = str(raw_key)
+            relevance = float(remaining.get(key, 0.0))
+            if relevance > best_relevance:
+                best_key = key
+                best_relevance = relevance
+        resolved.append(best_relevance)
+        if best_key:
+            remaining.pop(best_key, None)
+    return resolved
+
+
+def hit_at_k(ranked_relevance: Sequence[float], k: int) -> float:
+    k = max(1, int(k))
+    return 1.0 if any(float(value) > 0.0 for value in ranked_relevance[:k]) else 0.0
+
+
+def ndcg_at_k(ranked_relevance: Sequence[float], ideal_relevance: Sequence[float], k: int) -> float:
+    k = max(1, int(k))
+    actual = _dcg(ranked_relevance[:k])
+    ideal = _dcg(sorted((float(value) for value in ideal_relevance), reverse=True)[:k])
+    if ideal <= 0.0:
+        return 0.0
+    return float(actual / ideal)
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    if not values:
+        return 0.0
+    bounded = min(100.0, max(0.0, float(q)))
+    ordered = sorted(float(value) for value in values)
+    rank = max(0, min(len(ordered) - 1, math.ceil((bounded / 100.0) * len(ordered)) - 1))
+    return float(ordered[rank])
+
+
+def _dcg(values: Sequence[float]) -> float:
+    score = 0.0
+    for idx, value in enumerate(values):
+        relevance = float(value)
+        if relevance <= 0.0:
+            continue
+        score += (2.0**relevance - 1.0) / math.log2(idx + 2.0)
+    return float(score)

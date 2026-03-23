@@ -422,11 +422,16 @@ Final results cite the returned entity itself. Derived results additionally carr
 
 ### Metrics and acceptance
 
-- [ ] Hit@k targets
-- [ ] NDCG targets
-- [ ] latency targets
-- [ ] memory budget / DDR budget
-- [ ] rebuild-time targets
+- [x] Hit@k targets
+  Judged retrieval acceptance runs over the current corpus must sustain aggregate `Hit@1 >= 0.50`, `Hit@3 >= 0.75`, and `Hit@5 >= 0.85`, measured by the acceptance benchmark path in `ClawDBService.evaluate_acceptance` and `/v1/memory/metrics/acceptance`.
+- [x] NDCG targets
+  The same judged benchmark must sustain aggregate `NDCG@3 >= 0.70` and `NDCG@5 >= 0.80`, with mirrored citations de-duplicated so one judged anchor only contributes once across raw, topic, capsule, rollup, and L0 hits.
+- [x] latency targets
+  Acceptance runs must report search latency over the judged query set with `cold p95 <= 250 ms` after cache clears and `warm p95 <= 50 ms` on the immediate cached repeat.
+- [x] memory budget / DDR budget
+  Acceptance runs must estimate the in-process working set as dataframe bytes plus hot-cache bytes plus topic/retrieval index bytes, and keep that total at or below `512 MiB`.
+- [x] rebuild-time targets
+  The authoritative raw-first `rebuild_indexes` path must complete within `5,000 ms` on the acceptance corpus that is being judged in the same benchmark run.
 
 ## Concrete Gap Checklist
 

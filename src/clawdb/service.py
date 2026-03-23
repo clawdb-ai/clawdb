@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import json
 import math
+import sys
+from collections import deque
 from time import monotonic
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Literal, Optional, Sequence, Set
 from uuid import uuid4
 
 from .config import ClawDBConfig
@@ -14,10 +16,14 @@ from .embeddings import EmbeddingAuthContext, EmbeddingRouter
 from .folder_judger import FolderJudger
 from .lineage import materialize_message_bundle, normalize_platform
 from .locks import DeadlockSafeLockManager, LockRank
-from .metrics import CacheTelemetry
+from .metrics import CacheTelemetry, aggregate_ranked_relevance, hit_at_k, ndcg_at_k, percentile
 from .metadata import DataFrameMetadataStore
 from .migrate import auto_migrate_if_needed
 from .models import (
+    AcceptanceBenchmarkRequest,
+    AcceptanceBenchmarkResponse,
+    AcceptanceCaseReport,
+    AcceptanceCheck,
     CacheHitReportResponse,
     CapsuleRefreshRequest,
     CapsuleRefreshResponse,
@@ -527,6 +533,100 @@ class ClawDBService:
             str(item.entity_id or item.path),
         )
 
+    def _acceptance_result_keys(self, item: SearchResult) -> List[str]:
+        keys: List[str] = []
+        if item.entity_id:
+            keys.append(f"entity:{item.entity_type}:{item.entity_id}")
+        if item.origin_message_id:
+            keys.append(f"origin:{item.origin_message_id}")
+        for citation in [item.citation, *item.citations]:
+            if citation:
+                keys.append(str(citation))
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for key in keys:
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(key)
+        return deduped
+
+    def _estimate_python_object_bytes(self, value: object, seen: Optional[Set[int]] = None) -> int:
+        if seen is None:
+            seen = set()
+        obj_id = id(value)
+        if obj_id in seen:
+            return 0
+        seen.add(obj_id)
+        size = sys.getsizeof(value)
+        if isinstance(value, dict):
+            for key, item in value.items():
+                size += self._estimate_python_object_bytes(key, seen)
+                size += self._estimate_python_object_bytes(item, seen)
+            return size
+        if isinstance(value, (list, tuple, set, frozenset, deque)):
+            for item in value:
+                size += self._estimate_python_object_bytes(item, seen)
+            return size
+        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+            return size + self._estimate_python_object_bytes(value.model_dump(mode="python"), seen)
+        if hasattr(value, "__dict__"):
+            return size + self._estimate_python_object_bytes(vars(value), seen)
+        return size
+
+    def _estimate_working_set_breakdown(self) -> tuple[int, int, int]:
+        state = self.df_store.state
+        dataframe_bytes = sum(
+            int(frame.memory_usage(index=True, deep=True).sum())
+            for frame in [
+                state.messages_df,
+                state.capsules_df,
+                state.session_rollups_df,
+                state.topics_df,
+                state.cache_index_df,
+                state.sessions_df,
+                state.snapshots_df,
+            ]
+        )
+        cache_bytes = self._estimate_python_object_bytes(
+            {
+                "search_cache": self._search_cache,
+                "embedding_cache": self._embedding_cache,
+                "idempotency_index": self._idempotency_index,
+            }
+        )
+        index_bytes = self._estimate_python_object_bytes(
+            {
+                "topic_trie": self.topic_trie,
+                "topic_model": self.topic_model,
+                "telemetry": self.telemetry,
+                "retrieval_engine": self.retrieval_engine,
+            }
+        )
+        return dataframe_bytes, cache_bytes, index_bytes
+
+    def _acceptance_check(
+        self,
+        *,
+        name: str,
+        actual: float,
+        target: float,
+        comparator: Literal["gte", "lte"],
+        unit: str,
+    ) -> AcceptanceCheck:
+        if comparator == "gte":
+            passed = float(actual) >= float(target)
+        else:
+            passed = float(actual) <= float(target)
+        return AcceptanceCheck(
+            name=name,
+            actual=float(actual),
+            target=float(target),
+            comparator=comparator,
+            passed=bool(passed),
+            unit=unit,
+        )
+
     async def search(
         self,
         req: SearchRequest,
@@ -807,6 +907,173 @@ class ClawDBService:
             memory_cache_misses_total=self.telemetry.misses_total,
             memory_cache_evictions_total=self.telemetry.evictions_total,
             memory_cache_lookup_latency_ms_p50=self.telemetry.p50_lookup_latency_ms(),
+        )
+
+    async def evaluate_acceptance(
+        self,
+        req: AcceptanceBenchmarkRequest,
+    ) -> AcceptanceBenchmarkResponse:
+        if not req.cases:
+            raise ValueError("at least one acceptance case is required")
+
+        hit_targets = {max(1, int(k)): float(v) for k, v in req.targets.hit_at.items()}
+        ndcg_targets = {max(1, int(k)): float(v) for k, v in req.targets.ndcg_at.items()}
+        max_requested_results = max(
+            [1, *hit_targets.keys(), *ndcg_targets.keys(), *[case.search.max_results for case in req.cases]]
+        )
+
+        hit_totals = {k: 0.0 for k in hit_targets}
+        ndcg_totals = {k: 0.0 for k in ndcg_targets}
+        case_reports: List[AcceptanceCaseReport] = []
+
+        prepared_searches = []
+        for case in req.cases:
+            search_req = case.search.model_copy(
+                update={"max_results": max(int(case.search.max_results), max_requested_results)}
+            )
+            prepared_searches.append(search_req)
+            judgments = {
+                str(judgment.match_key): float(judgment.relevance)
+                for judgment in case.judgments
+                if float(judgment.relevance) > 0.0
+            }
+            result = await self.search(search_req)
+            ranked_keys = [self._acceptance_result_keys(item) for item in result.results]
+            ranked_relevance = aggregate_ranked_relevance(ranked_keys, judgments)
+            ideal_relevance = sorted(judgments.values(), reverse=True)
+
+            case_hit = {k: hit_at_k(ranked_relevance, k) for k in hit_targets}
+            case_ndcg = {k: ndcg_at_k(ranked_relevance, ideal_relevance, k) for k in ndcg_targets}
+            for k, value in case_hit.items():
+                hit_totals[k] += float(value)
+            for k, value in case_ndcg.items():
+                ndcg_totals[k] += float(value)
+
+            top_match_keys = [
+                keys[0] if keys else str(item.entity_id or item.path)
+                for keys, item in zip(ranked_keys, result.results)
+            ]
+            case_reports.append(
+                AcceptanceCaseReport(
+                    label=case.label or search_req.query,
+                    query=search_req.query,
+                    hit_at=case_hit,
+                    ndcg_at=case_ndcg,
+                    top_match_keys=top_match_keys,
+                    matched_relevance=ranked_relevance,
+                )
+            )
+
+        case_count = max(1, len(req.cases))
+        hit_summary = {k: float(hit_totals[k] / case_count) for k in hit_targets}
+        ndcg_summary = {k: float(ndcg_totals[k] / case_count) for k in ndcg_targets}
+
+        latency_repetitions = max(1, int(req.latency_repetitions))
+        cold_samples: List[float] = []
+        warm_samples: List[float] = []
+        for _ in range(latency_repetitions):
+            for search_req in prepared_searches:
+                self._search_cache.clear()
+                started = monotonic()
+                await self.search(search_req)
+                cold_samples.append((monotonic() - started) * 1000.0)
+
+                started = monotonic()
+                await self.search(search_req)
+                warm_samples.append((monotonic() - started) * 1000.0)
+
+        cold_latency_p50 = percentile(cold_samples, 50.0)
+        cold_latency_p95 = percentile(cold_samples, 95.0)
+        warm_latency_p50 = percentile(warm_samples, 50.0)
+        warm_latency_p95 = percentile(warm_samples, 95.0)
+
+        rebuild_started = monotonic()
+        rebuild = await self.rebuild_indexes()
+        rebuild_time_ms = (monotonic() - rebuild_started) * 1000.0
+
+        dataframe_bytes, cache_bytes, index_bytes = self._estimate_working_set_breakdown()
+        working_set_bytes = int(dataframe_bytes + cache_bytes + index_bytes)
+
+        checks: List[AcceptanceCheck] = []
+        for k, target in hit_targets.items():
+            checks.append(
+                self._acceptance_check(
+                    name=f"hit@{k}",
+                    actual=hit_summary[k],
+                    target=target,
+                    comparator="gte",
+                    unit="ratio",
+                )
+            )
+        for k, target in ndcg_targets.items():
+            checks.append(
+                self._acceptance_check(
+                    name=f"ndcg@{k}",
+                    actual=ndcg_summary[k],
+                    target=target,
+                    comparator="gte",
+                    unit="ratio",
+                )
+            )
+        checks.append(
+            self._acceptance_check(
+                name="cold-latency-p95",
+                actual=cold_latency_p95,
+                target=req.targets.cold_latency_p95_ms,
+                comparator="lte",
+                unit="ms",
+            )
+        )
+        checks.append(
+            self._acceptance_check(
+                name="warm-latency-p95",
+                actual=warm_latency_p95,
+                target=req.targets.warm_latency_p95_ms,
+                comparator="lte",
+                unit="ms",
+            )
+        )
+        checks.append(
+            self._acceptance_check(
+                name="working-set-memory",
+                actual=float(working_set_bytes),
+                target=float(req.targets.max_working_set_bytes),
+                comparator="lte",
+                unit="bytes",
+            )
+        )
+        checks.append(
+            self._acceptance_check(
+                name="rebuild-time",
+                actual=rebuild_time_ms,
+                target=req.targets.max_rebuild_time_ms,
+                comparator="lte",
+                unit="ms",
+            )
+        )
+
+        return AcceptanceBenchmarkResponse(
+            passed=all(check.passed for check in checks),
+            case_count=case_count,
+            hit_at=hit_summary,
+            ndcg_at=ndcg_summary,
+            cold_latency_ms_p50=cold_latency_p50,
+            cold_latency_ms_p95=cold_latency_p95,
+            warm_latency_ms_p50=warm_latency_p50,
+            warm_latency_ms_p95=warm_latency_p95,
+            dataframe_bytes=dataframe_bytes,
+            cache_bytes=cache_bytes,
+            index_bytes=index_bytes,
+            working_set_bytes=working_set_bytes,
+            working_set_mebibytes=round(float(working_set_bytes / (1024 * 1024)), 6),
+            rebuild_time_ms=rebuild_time_ms,
+            authoritative_raw_messages=rebuild.authoritative_raw_messages,
+            rebuilt_projection_messages=rebuild.rebuilt_projection_messages,
+            rebuilt_session_rollups=rebuild.rebuilt_session_rollups,
+            rebuilt_topics=rebuild.rebuilt_topics,
+            rebuilt_capsules=rebuild.rebuilt_capsules,
+            checks=checks,
+            cases=case_reports,
         )
 
     async def openclaw_memory_search(

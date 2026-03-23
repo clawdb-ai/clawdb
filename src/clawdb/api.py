@@ -8,6 +8,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from .auth import build_request_auth, verify_openclaw_signature_or_raise
 from .models import (
+    AcceptanceBenchmarkRequest,
     CapsuleRefreshRequest,
     MessageIn,
     MessageEditRequest,
@@ -142,6 +143,14 @@ async def memory_health():
 @app.get("/v1/memory/metrics/cache-hit")
 async def cache_hit_report():
     return await service.cache_hit_report()
+
+
+@app.post("/v1/memory/metrics/acceptance")
+async def acceptance_report(req: AcceptanceBenchmarkRequest):
+    try:
+        return await service.evaluate_acceptance(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/metrics")

@@ -6,6 +6,15 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from .metrics import (
+    DEFAULT_COLD_LATENCY_P95_MS_TARGET,
+    DEFAULT_HIT_AT_TARGETS,
+    DEFAULT_NDCG_AT_TARGETS,
+    DEFAULT_REBUILD_TIME_MS_TARGET,
+    DEFAULT_WARM_LATENCY_P95_MS_TARGET,
+    DEFAULT_WORKING_SET_BYTES_TARGET,
+)
+
 
 class MessageIn(BaseModel):
     tenant_id: str = "default"
@@ -229,6 +238,75 @@ class CacheHitReportResponse(BaseModel):
     memory_cache_misses_total: int
     memory_cache_evictions_total: int
     memory_cache_lookup_latency_ms_p50: float
+
+
+class AcceptanceJudgment(BaseModel):
+    match_key: str
+    relevance: float = 1.0
+
+
+class AcceptanceSearchCase(BaseModel):
+    label: Optional[str] = None
+    search: SearchRequest
+    judgments: List[AcceptanceJudgment]
+
+
+class AcceptanceTargets(BaseModel):
+    hit_at: Dict[int, float] = Field(default_factory=lambda: dict(DEFAULT_HIT_AT_TARGETS))
+    ndcg_at: Dict[int, float] = Field(default_factory=lambda: dict(DEFAULT_NDCG_AT_TARGETS))
+    cold_latency_p95_ms: float = DEFAULT_COLD_LATENCY_P95_MS_TARGET
+    warm_latency_p95_ms: float = DEFAULT_WARM_LATENCY_P95_MS_TARGET
+    max_working_set_bytes: int = DEFAULT_WORKING_SET_BYTES_TARGET
+    max_rebuild_time_ms: float = DEFAULT_REBUILD_TIME_MS_TARGET
+
+
+class AcceptanceBenchmarkRequest(BaseModel):
+    cases: List[AcceptanceSearchCase]
+    latency_repetitions: int = 2
+    targets: AcceptanceTargets = Field(default_factory=AcceptanceTargets)
+
+
+class AcceptanceCheck(BaseModel):
+    name: str
+    actual: float
+    target: float
+    comparator: Literal["gte", "lte"]
+    passed: bool
+    unit: str
+
+
+class AcceptanceCaseReport(BaseModel):
+    label: str
+    query: str
+    hit_at: Dict[int, float]
+    ndcg_at: Dict[int, float]
+    top_match_keys: List[str] = Field(default_factory=list)
+    matched_relevance: List[float] = Field(default_factory=list)
+
+
+class AcceptanceBenchmarkResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    passed: bool
+    case_count: int
+    hit_at: Dict[int, float]
+    ndcg_at: Dict[int, float]
+    cold_latency_ms_p50: float
+    cold_latency_ms_p95: float
+    warm_latency_ms_p50: float
+    warm_latency_ms_p95: float
+    dataframe_bytes: int
+    cache_bytes: int
+    index_bytes: int
+    working_set_bytes: int
+    working_set_mebibytes: float
+    rebuild_time_ms: float
+    authoritative_raw_messages: int = 0
+    rebuilt_projection_messages: int = 0
+    rebuilt_session_rollups: int = 0
+    rebuilt_topics: int = 0
+    rebuilt_capsules: int = 0
+    checks: List[AcceptanceCheck] = Field(default_factory=list)
+    cases: List[AcceptanceCaseReport] = Field(default_factory=list)
 
 
 class WalRecord(BaseModel):
