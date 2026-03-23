@@ -77,8 +77,10 @@ MESSAGES_COLUMNS = [
     "thread_parent_id",
     "reply_to_id",
     "topic_id",
+    "source_topic_id",
     "topic_parent_id",
     "topic_path",
+    "source_topic_path",
     "topic_confidence",
     "topic_source",
     "embedding_ref",
@@ -1040,8 +1042,10 @@ class DataFrameStore:
                 "thread_parent_id": "string",
                 "reply_to_id": "string",
                 "topic_id": "string",
+                "source_topic_id": "string",
                 "topic_parent_id": "string",
                 "topic_path": "string",
+                "source_topic_path": "string",
                 "topic_source": "string",
                 "embedding_ref": "string",
                 "capsule_level": "string",
@@ -1130,7 +1134,30 @@ class DataFrameStore:
                 "tenant_id": "string",
                 "doc_id": "string",
                 "entity_type": "string",
+                "entity_id": "string",
+                "source_tier": "string",
+                "session_id": "string",
                 "text": "string",
+                "path": "string",
+                "start_line": "int64",
+                "end_line": "int64",
+                "snippet": "string",
+                "citation": "string",
+                "citations_json": "string",
+                "channel": "string",
+                "chat_type": "string",
+                "account_id": "string",
+                "group_id": "string",
+                "topic_id": "string",
+                "topic_path": "string",
+                "message_thread_id": "string",
+                "sender_id": "string",
+                "origin_message_id": "string",
+                "projection_kind": "string",
+                "projection_scope": "string",
+                "vector_ref": "string",
+                "vector_dim": "int64",
+                "vector_json": "string",
             }
         )
         self._state.lexical_index_df = self._state.lexical_index_df.astype(
@@ -1276,6 +1303,14 @@ class DataFrameStore:
         indexed["chat_type"] = indexed["chat_type"].fillna("").astype(str)
         indexed["group_id"] = indexed["group_id"].fillna("").astype(str)
         indexed["topic_id"] = indexed["topic_id"].fillna("default").astype(str)
+        if "source_topic_id" not in indexed.columns:
+            indexed["source_topic_id"] = indexed["topic_id"]
+        indexed["source_topic_id"] = indexed["source_topic_id"].fillna(indexed["topic_id"]).astype(str)
+        if "source_topic_path" not in indexed.columns:
+            indexed["source_topic_path"] = indexed.get("topic_path", pd.Series(["default"] * len(indexed)))
+        indexed["source_topic_path"] = indexed["source_topic_path"].fillna(
+            indexed.get("topic_path", indexed["topic_id"])
+        ).astype(str)
         indexed["message_thread_id"] = indexed["message_thread_id"].fillna("").astype(str)
         indexed["message_id"] = indexed["message_id"].fillna("").astype(str)
         indexed["origin_message_id"] = indexed["origin_message_id"].fillna("").astype(str)
@@ -1377,7 +1412,11 @@ class DataFrameStore:
         if group_id is not None:
             scoped = scoped[scoped["group_id"].astype(str) == str(group_id)]
         if topic_id is not None:
-            scoped = scoped[scoped["topic_id"].astype(str) == str(topic_id)]
+            canonical_ids = self._canonical_topic_ids_locked(tenant_id, [str(topic_id)])
+            if canonical_ids:
+                scoped = scoped[scoped["topic_id"].astype(str).isin(canonical_ids)]
+            else:
+                scoped = scoped[scoped["topic_id"].astype(str) == str(topic_id)]
         if message_thread_id is not None:
             scoped = scoped[scoped["message_thread_id"].astype(str) == str(message_thread_id)]
         return self._filter_message_rows(
@@ -1431,6 +1470,81 @@ class DataFrameStore:
                 if str(topic_id)
             }
         )
+
+    def _apply_materialized_topics_to_messages_locked(self) -> None:
+        if self._state.messages_df.empty:
+            return
+        scoped = self._state.messages_df.copy().reset_index(drop=True)
+        scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+        scoped["topic_id"] = scoped["topic_id"].fillna("default").astype(str)
+        if "source_topic_id" not in scoped.columns:
+            scoped["source_topic_id"] = scoped["topic_id"]
+        scoped["source_topic_id"] = scoped["source_topic_id"].fillna(scoped["topic_id"]).astype(str)
+        scoped["topic_path"] = scoped["topic_path"].fillna(scoped["topic_id"]).astype(str)
+        if "source_topic_path" not in scoped.columns:
+            scoped["source_topic_path"] = scoped["topic_path"]
+        scoped["source_topic_path"] = scoped["source_topic_path"].fillna(scoped["topic_path"]).astype(str)
+        scoped["topic_parent_id"] = scoped["topic_parent_id"].fillna("").astype(str)
+        scoped["projection_kind"] = scoped["projection_kind"].fillna("").astype(str)
+
+        if self._state.topics_df.empty:
+            scoped["topic_id"] = scoped["source_topic_id"]
+            scoped["topic_path"] = scoped["source_topic_path"]
+        else:
+            topics = self._state.topics_df.copy().reset_index(drop=True)
+            topics["tenant_id"] = topics["tenant_id"].fillna("default").astype(str)
+            topics["topic_id"] = topics["topic_id"].fillna("default").astype(str)
+            topics["canonical_topic_id"] = topics["canonical_topic_id"].fillna(topics["topic_id"]).astype(str)
+            topics["topic_path"] = topics["topic_path"].fillna(topics["canonical_topic_id"]).astype(str)
+            topics["topic_parent_id"] = topics["topic_parent_id"].fillna("").astype(str)
+
+            canonical_lookup = {
+                (str(row["tenant_id"]), str(row["topic_id"])): str(row["canonical_topic_id"] or row["topic_id"])
+                for _, row in topics.iterrows()
+            }
+            canonical_path_lookup: Dict[Tuple[str, str], str] = {}
+            canonical_parent_lookup: Dict[Tuple[str, str], str] = {}
+            for _, row in topics.iterrows():
+                tenant_key = str(row["tenant_id"])
+                canonical_topic_id = str(row["canonical_topic_id"] or row["topic_id"])
+                topic_key = str(row["topic_id"])
+                key = (tenant_key, canonical_topic_id)
+                if key not in canonical_path_lookup or topic_key == canonical_topic_id:
+                    canonical_path_lookup[key] = str(row["topic_path"] or canonical_topic_id)
+                    canonical_parent_lookup[key] = str(row["topic_parent_id"] or "")
+
+            canonical_ids = [
+                canonical_lookup.get((tenant_id, source_topic_id), source_topic_id)
+                for tenant_id, source_topic_id in zip(
+                    scoped["tenant_id"].astype(str).tolist(),
+                    scoped["source_topic_id"].astype(str).tolist(),
+                )
+            ]
+            scoped["topic_id"] = canonical_ids
+            scoped["topic_path"] = [
+                canonical_path_lookup.get(
+                    (tenant_id, canonical_topic_id),
+                    source_topic_path or canonical_topic_id,
+                )
+                for tenant_id, canonical_topic_id, source_topic_path in zip(
+                    scoped["tenant_id"].astype(str).tolist(),
+                    scoped["topic_id"].astype(str).tolist(),
+                    scoped["source_topic_path"].astype(str).tolist(),
+                )
+            ]
+            scoped["topic_parent_id"] = [
+                canonical_parent_lookup.get((tenant_id, canonical_topic_id), topic_parent_id)
+                for tenant_id, canonical_topic_id, topic_parent_id in zip(
+                    scoped["tenant_id"].astype(str).tolist(),
+                    scoped["topic_id"].astype(str).tolist(),
+                    scoped["topic_parent_id"].astype(str).tolist(),
+                )
+            ]
+
+        scoped.loc[scoped["projection_kind"].astype(str) == RAW_PROJECTION_KIND, "capsule_level"] = "L0"
+        scoped.loc[scoped["projection_kind"].astype(str) != RAW_PROJECTION_KIND, "capsule_level"] = "L1"
+        self._state.messages_df = scoped[MESSAGES_COLUMNS]
+        self._invalidate_messages_index_locked()
 
     def _topic_ids_for_session_locked(
         self,
@@ -1690,6 +1804,28 @@ class DataFrameStore:
     def _materialize_search_docs_locked(self) -> pd.DataFrame:
         rows: List[Dict[str, object]] = []
 
+        def _json_citations(values: Sequence[str]) -> str:
+            seen: set[str] = set()
+            ordered: List[str] = []
+            for item in values:
+                value = str(item or "").strip()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                ordered.append(value)
+            return json.dumps(ordered, separators=(",", ":"))
+
+        def _origin_bounds(frame: pd.DataFrame) -> List[str]:
+            if frame.empty:
+                return []
+            ordered = self._chronological_messages(frame)
+            first_origin = str(ordered.iloc[0].get("origin_message_id") or ordered.iloc[0]["message_id"])
+            last_origin = str(ordered.iloc[-1].get("origin_message_id") or ordered.iloc[-1]["message_id"])
+            citations = [f"origin:{first_origin}"]
+            if last_origin and last_origin != first_origin:
+                citations.append(f"origin:{last_origin}")
+            return citations
+
         raw_rows = authoritative_raw_messages(self._state.messages_df)
         if not raw_rows.empty:
             scoped_raw = self._chronological_messages(raw_rows).reset_index(drop=True)
@@ -1698,13 +1834,37 @@ class DataFrameStore:
                 if not origin_id:
                     continue
                 updated_at = row.get("updated_at") if pd.notna(row.get("updated_at")) else row.get("ts")
+                citations = [f"origin:{origin_id}"]
                 rows.append(
                     {
                         "tenant_id": str(row.get("tenant_id") or "default"),
                         "doc_id": f"raw:{origin_id}",
                         "entity_type": "raw_message",
+                        "entity_id": origin_id,
+                        "source_tier": "L0",
+                        "session_id": str(row.get("native_session_id") or ""),
                         "updated_at": _utc_timestamp(updated_at),
                         "text": str(row.get("content") or ""),
+                        "path": f"memory/raw/{_safe_path_fragment(row.get('tenant_id') or 'default')}/{origin_id}.md",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "snippet": _trim_text(row.get("content") or "", 700),
+                        "citation": citations[0],
+                        "citations_json": _json_citations(citations),
+                        "channel": str(row.get("channel") or ""),
+                        "chat_type": str(row.get("chat_type") or ""),
+                        "account_id": str(row.get("account_id") or ""),
+                        "group_id": str(row.get("group_id") or ""),
+                        "topic_id": str(row.get("topic_id") or "default"),
+                        "topic_path": str(row.get("topic_path") or row.get("topic_id") or "default"),
+                        "message_thread_id": str(row.get("message_thread_id") or ""),
+                        "sender_id": str(row.get("sender_id") or ""),
+                        "origin_message_id": origin_id,
+                        "projection_kind": str(row.get("projection_kind") or ""),
+                        "projection_scope": str(row.get("projection_scope") or ""),
+                        "vector_ref": "",
+                        "vector_dim": 0,
+                        "vector_json": "[]",
                     }
                 )
 
@@ -1717,6 +1877,15 @@ class DataFrameStore:
             rollups["window_key"] = rollups["window_key"].fillna("").astype(str)
             rollups["summary"] = rollups["summary"].fillna("").astype(str)
             rollups["updated_at"] = pd.to_datetime(rollups["updated_at"], utc=True, errors="coerce")
+            rollups["vector_ref"] = rollups["vector_ref"].fillna("").astype(str)
+            rollups["vector_json"] = rollups["vector_json"].fillna("[]").astype(str)
+            rollups["vector_dim"] = pd.to_numeric(rollups["vector_dim"], errors="coerce").fillna(0).astype(int)
+            projection_rows = self._messages_for_query_locked(
+                tenant_id="*",
+                session_id=None,
+                row_mode="projection",
+                include_deleted=False,
+            ).reset_index(drop=True)
             for _, row in rollups.iterrows():
                 primary = str(row.get("rollup_id") or "")
                 if not primary:
@@ -1727,13 +1896,54 @@ class DataFrameStore:
                         f"{str(row.get('window_kind') or '')}:"
                         f"{str(row.get('window_key') or '')}"
                     )
+                supporting = projection_rows[
+                    (projection_rows["tenant_id"].astype(str) == str(row.get("tenant_id") or "default"))
+                    & (projection_rows["session_id"].astype(str) == str(row.get("session_id") or ""))
+                ]
+                bucket_start = pd.to_datetime(row.get("bucket_start"), utc=True, errors="coerce")
+                bucket_end = pd.to_datetime(row.get("bucket_end"), utc=True, errors="coerce")
+                if pd.notna(bucket_start):
+                    supporting = supporting[supporting["ts"] >= bucket_start]
+                if pd.notna(bucket_end):
+                    supporting = supporting[supporting["ts"] < bucket_end]
+                citations = [primary, *_origin_bounds(supporting)]
                 rows.append(
                     {
                         "tenant_id": str(row.get("tenant_id") or "default"),
                         "doc_id": primary,
                         "entity_type": "session_rollup",
+                        "entity_id": primary,
+                        "source_tier": "L1",
+                        "session_id": str(row.get("session_id") or ""),
                         "updated_at": _utc_timestamp(row.get("updated_at")),
                         "text": str(row.get("summary") or ""),
+                        "path": (
+                            "memory/rollups/"
+                            f"{_safe_path_fragment(row.get('session_id') or '')}/"
+                            f"{_safe_path_fragment(row.get('window_kind') or '')}/"
+                            f"{_safe_path_fragment(row.get('window_key') or '')}.md"
+                        ),
+                        "start_line": 1,
+                        "end_line": 1,
+                        "snippet": _trim_text(row.get("summary") or "", 700),
+                        "citation": primary,
+                        "citations_json": _json_citations(citations),
+                        "channel": "",
+                        "chat_type": "",
+                        "account_id": "",
+                        "group_id": "",
+                        "topic_id": "",
+                        "topic_path": "",
+                        "message_thread_id": "",
+                        "sender_id": "",
+                        "origin_message_id": (
+                            citations[1].split(":", 1)[1] if len(citations) > 1 else ""
+                        ),
+                        "projection_kind": "",
+                        "projection_scope": str(row.get("session_id") or ""),
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "vector_dim": int(row.get("vector_dim") or 0),
+                        "vector_json": str(row.get("vector_json") or "[]"),
                     }
                 )
 
@@ -1752,15 +1962,61 @@ class DataFrameStore:
             )
             if topic_rows.empty:
                 continue
+            topic_state = self._state.topics_df.copy().reset_index(drop=True)
+            topic_state["tenant_id"] = topic_state["tenant_id"].fillna("default").astype(str)
+            topic_state["topic_id"] = topic_state["topic_id"].fillna("default").astype(str)
+            topic_state["canonical_topic_id"] = topic_state["canonical_topic_id"].fillna(topic_state["topic_id"]).astype(str)
+            topic_aliases: Dict[str, set[str]] = {}
+            scoped_topic_state = topic_state[topic_state["tenant_id"].astype(str) == str(tenant_id)]
+            for _, topic_state_row in scoped_topic_state.iterrows():
+                canonical_id = str(topic_state_row["canonical_topic_id"] or topic_state_row["topic_id"])
+                topic_aliases.setdefault(canonical_id, set()).add(str(topic_state_row["topic_id"]))
+            tenant_raw_rows = raw_rows[raw_rows["tenant_id"].astype(str) == str(tenant_id)].copy()
+            if "source_topic_id" not in tenant_raw_rows.columns:
+                tenant_raw_rows["source_topic_id"] = tenant_raw_rows["topic_id"]
+            tenant_raw_rows["source_topic_id"] = tenant_raw_rows["source_topic_id"].fillna(
+                tenant_raw_rows["topic_id"]
+            ).astype(str)
             for _, row in topic_rows.iterrows():
                 canonical_topic_id = str(row.get("canonical_topic_id") or row.get("topic_id") or "default")
+                aliases = topic_aliases.get(canonical_topic_id, {canonical_topic_id})
+                supporting = tenant_raw_rows[
+                    tenant_raw_rows["source_topic_id"].astype(str).isin(sorted(aliases))
+                    | (tenant_raw_rows["topic_id"].astype(str) == canonical_topic_id)
+                ]
+                citations = [f"topic:{canonical_topic_id}", *_origin_bounds(supporting)]
                 rows.append(
                     {
                         "tenant_id": tenant_id,
                         "doc_id": f"topic:{canonical_topic_id}",
                         "entity_type": "topic",
+                        "entity_id": canonical_topic_id,
+                        "source_tier": "L2",
+                        "session_id": f"topic:{canonical_topic_id}",
                         "updated_at": _utc_timestamp(row.get("updated_at")),
                         "text": str(row.get("summary") or row.get("vector_text") or ""),
+                        "path": f"memory/topics/{_safe_path_fragment(canonical_topic_id)}.md",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "snippet": _trim_text(row.get("summary") or row.get("vector_text") or "", 700),
+                        "citation": f"topic:{canonical_topic_id}",
+                        "citations_json": _json_citations(citations),
+                        "channel": "",
+                        "chat_type": "",
+                        "account_id": "",
+                        "group_id": "",
+                        "topic_id": canonical_topic_id,
+                        "topic_path": str(row.get("topic_path") or canonical_topic_id),
+                        "message_thread_id": "",
+                        "sender_id": "",
+                        "origin_message_id": (
+                            citations[1].split(":", 1)[1] if len(citations) > 1 else ""
+                        ),
+                        "projection_kind": "",
+                        "projection_scope": "",
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "vector_dim": int(row.get("vector_dim") or 0),
+                        "vector_json": str(row.get("vector_json") or "[]"),
                     }
                 )
 
@@ -1770,17 +2026,54 @@ class DataFrameStore:
             capsules["capsule_id"] = capsules["capsule_id"].fillna("").astype(str)
             capsules["summary"] = capsules["summary"].fillna("").astype(str)
             capsules["updated_at"] = pd.to_datetime(capsules["updated_at"], utc=True, errors="coerce")
+            capsules["vector_ref"] = capsules["vector_ref"].fillna("").astype(str)
+            capsules["vector_json"] = capsules["vector_json"].fillna("[]").astype(str)
+            capsules["vector_dim"] = pd.to_numeric(capsules["vector_dim"], errors="coerce").fillna(0).astype(int)
             for _, row in capsules.iterrows():
                 capsule_id = str(row.get("capsule_id") or "")
                 if not capsule_id:
                     continue
+                first_origin = str(row.get("first_origin_message_id") or "").strip()
+                last_origin = str(row.get("last_origin_message_id") or "").strip()
+                citations = [
+                    f"capsule:{capsule_id}",
+                    *( [f"origin:{first_origin}"] if first_origin else [] ),
+                    *( [f"origin:{last_origin}"] if last_origin and last_origin != first_origin else [] ),
+                ]
                 rows.append(
                     {
                         "tenant_id": str(row.get("tenant_id") or "default"),
                         "doc_id": f"capsule:{capsule_id}",
                         "entity_type": "capsule",
+                        "entity_id": capsule_id,
+                        "source_tier": "L2",
+                        "session_id": str(row.get("session_id") or ""),
                         "updated_at": _utc_timestamp(row.get("updated_at")),
                         "text": str(row.get("summary") or ""),
+                        "path": (
+                            "memory/capsules/"
+                            f"{_safe_path_fragment(row.get('topic_id') or 'default')}/"
+                            f"{int(row.get('capsule_ordinal') or 0):04d}.md"
+                        ),
+                        "start_line": 1,
+                        "end_line": 1,
+                        "snippet": _trim_text(row.get("summary") or "", 700),
+                        "citation": f"capsule:{capsule_id}",
+                        "citations_json": _json_citations(citations),
+                        "channel": "",
+                        "chat_type": "",
+                        "account_id": "",
+                        "group_id": "",
+                        "topic_id": str(row.get("topic_id") or "default"),
+                        "topic_path": str(row.get("topic_path") or row.get("topic_id") or "default"),
+                        "message_thread_id": "",
+                        "sender_id": "",
+                        "origin_message_id": first_origin,
+                        "projection_kind": "",
+                        "projection_scope": "",
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "vector_dim": int(row.get("vector_dim") or 0),
+                        "vector_json": str(row.get("vector_json") or "[]"),
                     }
                 )
 
@@ -1790,8 +2083,31 @@ class DataFrameStore:
         frame["tenant_id"] = frame["tenant_id"].fillna("default").astype(str)
         frame["doc_id"] = frame["doc_id"].fillna("").astype(str)
         frame["entity_type"] = frame["entity_type"].fillna("").astype(str)
+        frame["entity_id"] = frame["entity_id"].fillna("").astype(str)
+        frame["source_tier"] = frame["source_tier"].fillna("L0").astype(str)
+        frame["session_id"] = frame["session_id"].fillna("").astype(str)
         frame["updated_at"] = pd.to_datetime(frame["updated_at"], utc=True, errors="coerce")
         frame["text"] = frame["text"].fillna("").astype(str)
+        frame["path"] = frame["path"].fillna("").astype(str)
+        frame["start_line"] = pd.to_numeric(frame["start_line"], errors="coerce").fillna(1).astype(int)
+        frame["end_line"] = pd.to_numeric(frame["end_line"], errors="coerce").fillna(1).astype(int)
+        frame["snippet"] = frame["snippet"].fillna("").astype(str)
+        frame["citation"] = frame["citation"].fillna("").astype(str)
+        frame["citations_json"] = frame["citations_json"].fillna("[]").astype(str)
+        frame["channel"] = frame["channel"].fillna("").astype(str)
+        frame["chat_type"] = frame["chat_type"].fillna("").astype(str)
+        frame["account_id"] = frame["account_id"].fillna("").astype(str)
+        frame["group_id"] = frame["group_id"].fillna("").astype(str)
+        frame["topic_id"] = frame["topic_id"].fillna("").astype(str)
+        frame["topic_path"] = frame["topic_path"].fillna("").astype(str)
+        frame["message_thread_id"] = frame["message_thread_id"].fillna("").astype(str)
+        frame["sender_id"] = frame["sender_id"].fillna("").astype(str)
+        frame["origin_message_id"] = frame["origin_message_id"].fillna("").astype(str)
+        frame["projection_kind"] = frame["projection_kind"].fillna("").astype(str)
+        frame["projection_scope"] = frame["projection_scope"].fillna("").astype(str)
+        frame["vector_ref"] = frame["vector_ref"].fillna("").astype(str)
+        frame["vector_dim"] = pd.to_numeric(frame["vector_dim"], errors="coerce").fillna(0).astype(int)
+        frame["vector_json"] = frame["vector_json"].fillna("[]").astype(str)
         frame = frame.sort_values(
             ["tenant_id", "doc_id", "updated_at"],
             ascending=[True, True, True],
@@ -1827,7 +2143,30 @@ class DataFrameStore:
         indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
         indexed["doc_id"] = indexed["doc_id"].fillna("").astype(str)
         indexed["entity_type"] = indexed["entity_type"].fillna("").astype(str)
+        indexed["entity_id"] = indexed["entity_id"].fillna("").astype(str)
+        indexed["source_tier"] = indexed["source_tier"].fillna("L0").astype(str)
+        indexed["session_id"] = indexed["session_id"].fillna("").astype(str)
         indexed["text"] = indexed["text"].fillna("").astype(str)
+        indexed["path"] = indexed["path"].fillna("").astype(str)
+        indexed["start_line"] = pd.to_numeric(indexed["start_line"], errors="coerce").fillna(1).astype(int)
+        indexed["end_line"] = pd.to_numeric(indexed["end_line"], errors="coerce").fillna(1).astype(int)
+        indexed["snippet"] = indexed["snippet"].fillna("").astype(str)
+        indexed["citation"] = indexed["citation"].fillna("").astype(str)
+        indexed["citations_json"] = indexed["citations_json"].fillna("[]").astype(str)
+        indexed["channel"] = indexed["channel"].fillna("").astype(str)
+        indexed["chat_type"] = indexed["chat_type"].fillna("").astype(str)
+        indexed["account_id"] = indexed["account_id"].fillna("").astype(str)
+        indexed["group_id"] = indexed["group_id"].fillna("").astype(str)
+        indexed["topic_id"] = indexed["topic_id"].fillna("").astype(str)
+        indexed["topic_path"] = indexed["topic_path"].fillna("").astype(str)
+        indexed["message_thread_id"] = indexed["message_thread_id"].fillna("").astype(str)
+        indexed["sender_id"] = indexed["sender_id"].fillna("").astype(str)
+        indexed["origin_message_id"] = indexed["origin_message_id"].fillna("").astype(str)
+        indexed["projection_kind"] = indexed["projection_kind"].fillna("").astype(str)
+        indexed["projection_scope"] = indexed["projection_scope"].fillna("").astype(str)
+        indexed["vector_ref"] = indexed["vector_ref"].fillna("").astype(str)
+        indexed["vector_dim"] = pd.to_numeric(indexed["vector_dim"], errors="coerce").fillna(0).astype(int)
+        indexed["vector_json"] = indexed["vector_json"].fillna("[]").astype(str)
         indexed["updated_at"] = pd.to_datetime(indexed["updated_at"], utc=True, errors="coerce")
         indexed = indexed.set_index(SEARCH_DOC_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
         self._search_docs_indexed_df = indexed
@@ -2295,6 +2634,7 @@ class DataFrameStore:
                 self._state.messages_df,
                 vector_dim=vector_dim,
             )
+            self._apply_materialized_topics_to_messages_locked()
             self._rebuild_embedding_index_metadata_locked()
             return int(self._state.topics_df.shape[0])
 
@@ -2324,6 +2664,7 @@ class DataFrameStore:
             self._state.sessions_df = rebuilt["sessions"]
             self._state.session_rollups_df = rebuilt["session_rollups"]
             self._state.topics_df = rebuilt["topics"]
+            self._apply_materialized_topics_to_messages_locked()
             self._state.capsules_df = rebuilt["capsules"]
             self._state.embedding_index_metadata_df = rebuilt["embedding_index_metadata"]
             self._rebuild_search_indexes_locked(vector_dim=vector_dim)
@@ -3076,18 +3417,65 @@ class DataFrameStore:
             ):
                 return []
 
+            if self._search_docs_index_dirty or self._search_docs_indexed_df is None:
+                search_docs_indexed = self._build_search_docs_index_locked()
+            else:
+                search_docs_indexed = self._search_docs_indexed_df
+
             docs: List[Dict[str, object]] = []
             projection_rows = projection_rows.reset_index(drop=True)
             raw_rows = self._chronological_messages(raw_rows)
             rollup_rows = rollup_rows.reset_index(drop=True)
             topic_rows = topic_rows.reset_index(drop=True)
             capsule_rows = capsule_rows.reset_index(drop=True)
+
+            def _persisted_doc(doc_id: str) -> Optional[Dict[str, object]]:
+                if search_docs_indexed is None or search_docs_indexed.empty:
+                    return None
+                try:
+                    hit = search_docs_indexed.loc[(str(tenant_id), str(doc_id))]
+                except KeyError:
+                    return None
+                row = hit if isinstance(hit, pd.Series) else hit.iloc[-1]
+                try:
+                    citations = json.loads(str(row.get("citations_json") or "[]"))
+                except json.JSONDecodeError:
+                    citations = []
+                return {
+                    "doc_id": str(row.get("doc_id") or doc_id),
+                    "text": str(row.get("text") or ""),
+                    "path": str(row.get("path") or ""),
+                    "start_line": int(row.get("start_line") or 1),
+                    "end_line": int(row.get("end_line") or row.get("start_line") or 1),
+                    "snippet": str(row.get("snippet") or "")[:700],
+                    "source_tier": str(row.get("source_tier") or "L0"),
+                    "entity_type": str(row.get("entity_type") or "raw_message"),
+                    "entity_id": str(row.get("entity_id") or row.get("doc_id") or doc_id),
+                    "citation": str(row.get("citation") or "") or None,
+                    "citations": [str(item) for item in citations if str(item)],
+                    "channel": str(row.get("channel") or "") or None,
+                    "chat_type": str(row.get("chat_type") or "") or None,
+                    "account_id": str(row.get("account_id") or "") or None,
+                    "group_id": str(row.get("group_id") or "") or None,
+                    "topic_id": str(row.get("topic_id") or "") or None,
+                    "topic_path": str(row.get("topic_path") or "") or None,
+                    "message_thread_id": str(row.get("message_thread_id") or "") or None,
+                    "sender_id": str(row.get("sender_id") or "") or None,
+                    "origin_message_id": str(row.get("origin_message_id") or "") or None,
+                    "projection_kind": str(row.get("projection_kind") or "") or None,
+                    "projection_scope": str(row.get("projection_scope") or "") or None,
+                }
             for idx, (_, row) in enumerate(raw_rows.iterrows(), start=1):
                 origin_id = str(row.get("origin_message_id") or row["message_id"])
+                primary = f"raw:{origin_id}"
+                persisted = _persisted_doc(primary)
+                if persisted is not None:
+                    docs.append(persisted)
+                    continue
                 citations = [f"origin:{origin_id}"]
                 docs.append(
                     {
-                        "doc_id": f"raw:{origin_id}",
+                        "doc_id": primary,
                         "text": str(row.get("content") or ""),
                         "path": f"memory/raw/{_safe_path_fragment(tenant_id)}/{origin_id}.md",
                         "start_line": idx,
@@ -3124,6 +3512,9 @@ class DataFrameStore:
                 for _, row in scoped_topics.iterrows():
                     canonical_id = str(row["canonical_topic_id"] or row["topic_id"])
                     topic_aliases.setdefault(canonical_id, set()).add(str(row["topic_id"]))
+            if "source_topic_id" not in raw_rows.columns:
+                raw_rows = raw_rows.copy()
+                raw_rows["source_topic_id"] = raw_rows["topic_id"]
 
             def _origin_bounds(frame: pd.DataFrame) -> List[str]:
                 if frame.empty:
@@ -3240,6 +3631,10 @@ class DataFrameStore:
                         "rollup:"
                         f"{tenant_id}:{session_key}:{str(row.get('window_kind') or '')}:{str(row.get('window_key') or '')}"
                     )
+                    persisted = _persisted_doc(primary)
+                    if persisted is not None:
+                        docs.append(persisted)
+                        continue
                     citations = _dedupe_citations([primary, *_origin_bounds(supporting)], limit=3)
                     docs.append(
                         {
@@ -3283,9 +3678,16 @@ class DataFrameStore:
                 )
                 for _, row in ordered_topics.iterrows():
                     canonical_topic_id = str(row.get("canonical_topic_id") or row.get("topic_id") or "default")
-                    aliases = topic_aliases.get(canonical_topic_id, {canonical_topic_id})
-                    supporting = raw_rows[raw_rows["topic_id"].astype(str).isin(sorted(aliases))]
                     primary = f"topic:{canonical_topic_id}"
+                    persisted = _persisted_doc(primary)
+                    if persisted is not None:
+                        docs.append(persisted)
+                        continue
+                    aliases = topic_aliases.get(canonical_topic_id, {canonical_topic_id})
+                    supporting = raw_rows[
+                        raw_rows["source_topic_id"].astype(str).isin(sorted(aliases))
+                        | (raw_rows["topic_id"].astype(str) == canonical_topic_id)
+                    ]
                     citations = _dedupe_citations([primary, *_origin_bounds(supporting)], limit=3)
                     docs.append(
                         {
@@ -3327,6 +3729,10 @@ class DataFrameStore:
                     first_origin = str(row.get("first_origin_message_id") or "").strip()
                     last_origin = str(row.get("last_origin_message_id") or "").strip()
                     primary = f"capsule:{capsule_id}"
+                    persisted = _persisted_doc(primary)
+                    if persisted is not None:
+                        docs.append(persisted)
+                        continue
                     citations = _dedupe_citations(
                         [
                             primary,

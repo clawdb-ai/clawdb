@@ -486,8 +486,14 @@ def materialize_topic_lifecycle(
         return pd.DataFrame(columns=TOPICS_COLUMNS)
     scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
     scoped["topic_id"] = scoped["topic_id"].fillna("default").astype(str)
+    if "source_topic_id" not in scoped.columns:
+        scoped["source_topic_id"] = scoped["topic_id"]
+    scoped["source_topic_id"] = scoped["source_topic_id"].fillna(scoped["topic_id"]).astype(str)
     scoped["topic_parent_id"] = scoped["topic_parent_id"].fillna("").astype(str)
     scoped["topic_path"] = scoped["topic_path"].fillna(scoped["topic_id"]).astype(str)
+    if "source_topic_path" not in scoped.columns:
+        scoped["source_topic_path"] = scoped["topic_path"]
+    scoped["source_topic_path"] = scoped["source_topic_path"].fillna(scoped["topic_path"]).astype(str)
     scoped["message_state"] = scoped["message_state"].fillna("active").astype(str)
     scoped["content"] = scoped["content"].fillna("").astype(str)
     scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
@@ -496,21 +502,22 @@ def materialize_topic_lifecycle(
         return pd.DataFrame(columns=TOPICS_COLUMNS)
 
     seeds: Dict[Tuple[str, str], TopicSlice] = {}
-    for (tenant_id, topic_id), group in scoped.groupby(["tenant_id", "topic_id"], sort=True):
+    for (tenant_id, source_topic_id), group in scoped.groupby(["tenant_id", "source_topic_id"], sort=True):
         ordered = group.sort_values("ts", kind="stable").reset_index(drop=True)
         live_rows = ordered[ordered["message_state"].astype(str) != MESSAGE_STATE_DELETED].copy()
         parent_hint = _mode_string(
             live_rows["topic_parent_id"].astype(str).tolist() or ordered["topic_parent_id"].astype(str).tolist()
         )
         path_hint = _mode_string(
-            live_rows["topic_path"].astype(str).tolist() or ordered["topic_path"].astype(str).tolist(),
-            default=str(topic_id),
+            live_rows["source_topic_path"].astype(str).tolist()
+            or ordered["source_topic_path"].astype(str).tolist(),
+            default=str(source_topic_id),
         )
         if not parent_hint:
             parent_hint = _path_parent_hint(path_hint)
-        seeds[(str(tenant_id), str(topic_id))] = _build_topic_slice(
+        seeds[(str(tenant_id), str(source_topic_id))] = _build_topic_slice(
             tenant_id=str(tenant_id),
-            topic_id=str(topic_id),
+            topic_id=str(source_topic_id),
             parent_hint=parent_hint,
             path_hint=path_hint,
             messages=_build_topic_messages(live_rows, resolved_dim),

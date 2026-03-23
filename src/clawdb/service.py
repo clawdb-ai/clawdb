@@ -488,8 +488,6 @@ class ClawDBService:
         topic_confidence = req.topic_confidence
         if topic_confidence is None:
             topic_confidence = 0.6 if auto_topic_assigned else 1.0
-        topic_count = await self.df_store.count_topic_messages(req.tenant_id, topic_id)
-        judged_level = self.folder_judger.judge(topic_count + 1)
         req_with_topic = req.model_copy(
             update={
                 "channel": normalized_channel,
@@ -499,7 +497,6 @@ class ClawDBService:
                 "topic_path": topic_path,
                 "topic_source": topic_source,
                 "topic_confidence": topic_confidence,
-                "capsule_level": judged_level,
             }
         )
         payload = materialize_message_bundle(req_with_topic.model_dump(mode="json"))

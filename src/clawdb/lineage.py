@@ -224,6 +224,7 @@ def materialize_projection_rows(raw_message: Mapping[str, object]) -> List[Dict[
                 **source,
                 "message_id": projection_message_id(origin_message_id, spec.kind, spec.scope),
                 "session_id": spec.session_id,
+                "capsule_level": "L1",
                 "projection_kind": spec.kind,
                 "projection_scope": spec.scope,
                 "visibility": spec.visibility,
@@ -272,12 +273,19 @@ def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, objec
         "thread_parent_id": str(payload.get("thread_parent_id") or ""),
         "reply_to_id": str(payload.get("reply_to_id") or ""),
         "topic_id": str(payload.get("topic_id") or "default"),
+        "source_topic_id": str(payload.get("source_topic_id") or payload.get("topic_id") or "default"),
         "topic_parent_id": str(payload.get("topic_parent_id") or ""),
         "topic_path": str(payload.get("topic_path") or payload.get("topic_id") or "default"),
+        "source_topic_path": str(
+            payload.get("source_topic_path")
+            or payload.get("topic_path")
+            or payload.get("topic_id")
+            or "default"
+        ),
         "topic_confidence": payload.get("topic_confidence"),
         "topic_source": str(payload.get("topic_source") or ""),
         "embedding_ref": str(payload.get("embedding_ref") or deterministic_embedding_ref("raw_message", content)),
-        "capsule_level": str(payload.get("capsule_level") or "L0"),
+        "capsule_level": "L0",
         "idempotency_key": str(payload.get("idempotency_key") or ""),
         "visibility": "raw",
         "platform": platform,

@@ -16,8 +16,31 @@ SEARCH_DOC_COLUMNS = [
     "tenant_id",
     "doc_id",
     "entity_type",
+    "entity_id",
+    "source_tier",
+    "session_id",
     "updated_at",
     "text",
+    "path",
+    "start_line",
+    "end_line",
+    "snippet",
+    "citation",
+    "citations_json",
+    "channel",
+    "chat_type",
+    "account_id",
+    "group_id",
+    "topic_id",
+    "topic_path",
+    "message_thread_id",
+    "sender_id",
+    "origin_message_id",
+    "projection_kind",
+    "projection_scope",
+    "vector_ref",
+    "vector_dim",
+    "vector_json",
 ]
 
 LEXICAL_INDEX_COLUMNS = [
@@ -155,7 +178,13 @@ def materialize_vector_index(search_docs_frame: pd.DataFrame, *, dim: int) -> pd
         doc_id = str(row.get("doc_id") or "")
         if not doc_id:
             continue
-        vector = [float(value) for value in _vectorize(str(row.get("text") or ""), resolved_dim)]
+        provided_vector = parse_vector_json(row.get("vector_json"))
+        if provided_vector:
+            vector = [float(value) for value in provided_vector]
+            vector_dim = max(8, int(row.get("vector_dim") or len(vector) or resolved_dim))
+        else:
+            vector = [float(value) for value in _vectorize(str(row.get("text") or ""), resolved_dim)]
+            vector_dim = resolved_dim
         updated_at = pd.to_datetime(row.get("updated_at"), utc=True, errors="coerce")
         if pd.isna(updated_at):
             updated_at = pd.Timestamp.now(tz="UTC")
@@ -163,7 +192,7 @@ def materialize_vector_index(search_docs_frame: pd.DataFrame, *, dim: int) -> pd
             {
                 "tenant_id": str(row.get("tenant_id") or "default"),
                 "doc_id": doc_id,
-                "vector_dim": resolved_dim,
+                "vector_dim": int(vector_dim),
                 "vector_json": serialize_vector_json(vector),
                 "vector_norm": float(math.sqrt(sum(value * value for value in vector))),
                 "updated_at": updated_at,

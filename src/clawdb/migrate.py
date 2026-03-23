@@ -179,8 +179,13 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
         "thread_parent_id": "",
         "reply_to_id": "",
         "topic_id": "default",
+        "source_topic_id": lambda df: df.get("topic_id", pd.Series(["default"] * len(df))),
         "topic_parent_id": "",
         "topic_path": lambda df: df.get("topic_id", pd.Series(["default"] * len(df))),
+        "source_topic_path": lambda df: df.get(
+            "topic_path",
+            df.get("topic_id", pd.Series(["default"] * len(df))),
+        ),
         "topic_confidence": 1.0,
         "topic_source": "explicit",
         "embedding_ref": "",
@@ -228,9 +233,16 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
     out["thread_parent_id"] = _fill_string(out["thread_parent_id"])
     out["reply_to_id"] = _fill_string(out["reply_to_id"])
     out["topic_id"] = _fill_string(out["topic_id"], "default")
+    out["source_topic_id"] = _fill_string(out["source_topic_id"], "default")
     out["topic_parent_id"] = _fill_string(out["topic_parent_id"])
     out["topic_path"] = _fill_string(out["topic_path"])
+    out["source_topic_path"] = _fill_string(out["source_topic_path"])
+    out.loc[out["source_topic_id"] == "", "source_topic_id"] = out.loc[out["source_topic_id"] == "", "topic_id"]
     out.loc[out["topic_path"] == "", "topic_path"] = out.loc[out["topic_path"] == "", "topic_id"]
+    out.loc[out["source_topic_path"] == "", "source_topic_path"] = out.loc[
+        out["source_topic_path"] == "",
+        "topic_path",
+    ]
     out["topic_source"] = _fill_string(out["topic_source"], "explicit")
     out["topic_confidence"] = _to_float(out["topic_confidence"], 1.0)
     out["embedding_ref"] = _fill_string(out["embedding_ref"])
@@ -280,6 +292,9 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
         if raw_rows:
             out = pd.concat([out, pd.DataFrame(raw_rows, columns=MESSAGES_COLUMNS)], ignore_index=True)
             out = out.drop_duplicates(subset=["message_id"], keep="first")
+    raw_mask = out["projection_kind"].astype(str) == RAW_PROJECTION_KIND
+    out.loc[raw_mask, "capsule_level"] = "L0"
+    out.loc[~raw_mask, "capsule_level"] = "L1"
     return out[MESSAGES_COLUMNS]
 
 
@@ -474,15 +489,61 @@ def _normalize_search_docs(frame: pd.DataFrame) -> pd.DataFrame:
         "tenant_id": "default",
         "doc_id": "",
         "entity_type": "",
+        "entity_id": "",
+        "source_tier": "L0",
+        "session_id": "",
         "updated_at": pd.Timestamp.now(tz="UTC"),
         "text": "",
+        "path": "",
+        "start_line": 1,
+        "end_line": 1,
+        "snippet": "",
+        "citation": "",
+        "citations_json": "[]",
+        "channel": "",
+        "chat_type": "",
+        "account_id": "",
+        "group_id": "",
+        "topic_id": "",
+        "topic_path": "",
+        "message_thread_id": "",
+        "sender_id": "",
+        "origin_message_id": "",
+        "projection_kind": "",
+        "projection_scope": "",
+        "vector_ref": "",
+        "vector_dim": 0,
+        "vector_json": "[]",
     }
     out = _ensure_columns(frame, SEARCH_DOC_COLUMNS, defaults)
     out["tenant_id"] = _fill_string(out["tenant_id"], "default")
     out["doc_id"] = _fill_string(out["doc_id"])
     out["entity_type"] = _fill_string(out["entity_type"])
+    out["entity_id"] = _fill_string(out["entity_id"])
+    out["source_tier"] = _fill_string(out["source_tier"], "L0")
+    out["session_id"] = _fill_string(out["session_id"])
     out["updated_at"] = _to_datetime_utc(out["updated_at"])
     out["text"] = _fill_string(out["text"])
+    out["path"] = _fill_string(out["path"])
+    out["start_line"] = _to_int(out["start_line"], 1)
+    out["end_line"] = _to_int(out["end_line"], 1)
+    out["snippet"] = _fill_string(out["snippet"])
+    out["citation"] = _fill_string(out["citation"])
+    out["citations_json"] = _fill_string(out["citations_json"], "[]")
+    out["channel"] = _fill_string(out["channel"])
+    out["chat_type"] = _fill_string(out["chat_type"])
+    out["account_id"] = _fill_string(out["account_id"])
+    out["group_id"] = _fill_string(out["group_id"])
+    out["topic_id"] = _fill_string(out["topic_id"])
+    out["topic_path"] = _fill_string(out["topic_path"])
+    out["message_thread_id"] = _fill_string(out["message_thread_id"])
+    out["sender_id"] = _fill_string(out["sender_id"])
+    out["origin_message_id"] = _fill_string(out["origin_message_id"])
+    out["projection_kind"] = _fill_string(out["projection_kind"])
+    out["projection_scope"] = _fill_string(out["projection_scope"])
+    out["vector_ref"] = _fill_string(out["vector_ref"])
+    out["vector_dim"] = _to_int(out["vector_dim"], 0)
+    out["vector_json"] = _fill_string(out["vector_json"], "[]")
     return out[SEARCH_DOC_COLUMNS]
 
 
