@@ -513,7 +513,10 @@ class ClawDBService:
                 if cached_ack is not None:
                     return cached_ack
             record = await self.wal.append("message_upsert", payload)
-            upsert_result = await self.df_store.apply_message_bundle(payload)
+            upsert_result = await self.df_store.apply_message_bundle(
+                payload,
+                vector_dim=self.config.topic_gep_dim,
+            )
             await self.df_store.enqueue_semantic_refresh(
                 tenant_id=req_with_topic.tenant_id,
                 wal_seq=record.seq,
@@ -564,6 +567,7 @@ class ClawDBService:
                 origin_message_id=resolved_origin,
                 content=req.content,
                 edited_at=req.ts,
+                vector_dim=self.config.topic_gep_dim,
             )
             if not result.found:
                 raise KeyError("message origin not found")
@@ -610,6 +614,7 @@ class ClawDBService:
                 tenant_id=req.tenant_id,
                 origin_message_id=resolved_origin,
                 deleted_at=req.ts,
+                vector_dim=self.config.topic_gep_dim,
             )
             if not result.found:
                 raise KeyError("message origin not found")
@@ -748,6 +753,8 @@ class ClawDBService:
             for frame in [
                 state.messages_df,
                 state.capsules_df,
+                state.beliefs_df,
+                state.projections_df,
                 state.session_rollups_df,
                 state.topics_df,
                 state.search_docs_df,
@@ -1016,6 +1023,40 @@ class ClawDBService:
 
     async def present_forum_style(self, tenant_id: str, session_id: str) -> List[dict]:
         return await self.df_store.forum_view(tenant_id=tenant_id, session_id=session_id)
+
+    async def list_projection_state(
+        self,
+        *,
+        tenant_id: str = "default",
+        session_id: Optional[str] = None,
+        projection_kind: Optional[str] = None,
+        origin_message_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        include_deleted: bool = False,
+    ) -> List[dict]:
+        return await self.df_store.list_projection_state(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            projection_kind=projection_kind,
+            origin_message_id=origin_message_id,
+            group_id=group_id,
+            include_deleted=include_deleted,
+        )
+
+    async def list_belief_state(
+        self,
+        *,
+        tenant_id: str = "default",
+        scope_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+    ) -> List[dict]:
+        return await self.df_store.list_belief_state(
+            tenant_id=tenant_id,
+            scope_type=scope_type,
+            session_id=session_id,
+            topic_id=topic_id,
+        )
 
     async def index_status(self) -> IndexStatusResponse:
         sessions = await self.df_store.session_count()

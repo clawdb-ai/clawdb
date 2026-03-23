@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
+from .beliefs import BELIEFS_COLUMNS
 from .capsules import CAPSULES_COLUMNS
 from .dataframes import (
     CACHE_INDEX_COLUMNS,
@@ -30,11 +31,12 @@ from .lineage import (
     normalize_platform_identities,
 )
 from .metadata import DataFrameMetadataStore
+from .projections import PROJECTIONS_COLUMNS
 from .search_index import LEXICAL_INDEX_COLUMNS, SEARCH_DOC_COLUMNS, VECTOR_INDEX_COLUMNS
 from .topics import TOPICS_COLUMNS
 
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 11
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -68,6 +70,8 @@ class SchemaMigrationResult:
 TABLE_COLUMNS: Mapping[str, List[str]] = {
     "messages": MESSAGES_COLUMNS,
     "capsules": CAPSULES_COLUMNS,
+    "beliefs": BELIEFS_COLUMNS,
+    "projections": PROJECTIONS_COLUMNS,
     "session_rollups": SESSION_ROLLUPS_COLUMNS,
     "topics": TOPICS_COLUMNS,
     "search_docs": SEARCH_DOC_COLUMNS,
@@ -316,8 +320,16 @@ def _normalize_capsules(frame: pd.DataFrame) -> pd.DataFrame:
         "first_origin_message_id": "",
         "last_origin_message_id": "",
         "source_message_ids_json": "[]",
+        "source_session_ids_json": "[]",
+        "source_topic_ids_json": "[]",
+        "active_message_count": 0,
+        "edited_message_count": 0,
+        "topic_message_count": 0,
+        "topic_body_char_count": 0,
         "source_first_ts": pd.Timestamp.now(tz="UTC"),
         "source_last_ts": pd.Timestamp.now(tz="UTC"),
+        "opened_at": pd.Timestamp.now(tz="UTC"),
+        "sealed_at": pd.NaT,
         "prev_capsule_id": "",
         "next_capsule_id": "",
         "back_link_ids_json": "[]",
@@ -347,8 +359,16 @@ def _normalize_capsules(frame: pd.DataFrame) -> pd.DataFrame:
     out["first_origin_message_id"] = _fill_string(out["first_origin_message_id"])
     out["last_origin_message_id"] = _fill_string(out["last_origin_message_id"])
     out["source_message_ids_json"] = _fill_string(out["source_message_ids_json"], "[]")
+    out["source_session_ids_json"] = _fill_string(out["source_session_ids_json"], "[]")
+    out["source_topic_ids_json"] = _fill_string(out["source_topic_ids_json"], "[]")
+    out["active_message_count"] = _to_int(out["active_message_count"], 0)
+    out["edited_message_count"] = _to_int(out["edited_message_count"], 0)
+    out["topic_message_count"] = _to_int(out["topic_message_count"], 0)
+    out["topic_body_char_count"] = _to_int(out["topic_body_char_count"], 0)
     out["source_first_ts"] = _to_datetime_utc(out["source_first_ts"])
     out["source_last_ts"] = _to_datetime_utc(out["source_last_ts"])
+    out["opened_at"] = _to_datetime_utc(out["opened_at"])
+    out["sealed_at"] = pd.to_datetime(out["sealed_at"], utc=True, errors="coerce")
     out["prev_capsule_id"] = _fill_string(out["prev_capsule_id"])
     out["next_capsule_id"] = _fill_string(out["next_capsule_id"])
     out["back_link_ids_json"] = _fill_string(out["back_link_ids_json"], "[]")
@@ -361,6 +381,136 @@ def _normalize_capsules(frame: pd.DataFrame) -> pd.DataFrame:
     out["source_hash"] = _fill_string(out["source_hash"])
     out["updated_at"] = _to_datetime_utc(out["updated_at"])
     return out[CAPSULES_COLUMNS]
+
+
+def _normalize_beliefs(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "belief_id": "",
+        "tenant_id": "default",
+        "scope_type": "",
+        "scope_key": "",
+        "session_id": "",
+        "topic_id": "",
+        "group_id": "",
+        "projection_kind": "",
+        "projection_scope": "",
+        "first_ts": pd.Timestamp.now(tz="UTC"),
+        "last_ts": pd.Timestamp.now(tz="UTC"),
+        "raw_message_count": 0,
+        "first_origin_message_id": "",
+        "last_origin_message_id": "",
+        "source_message_ids_json": "[]",
+        "source_session_ids_json": "[]",
+        "topic_ids_json": "[]",
+        "summary": "",
+        "vector_text": "",
+        "vector_ref": "",
+        "vector_dim": 64,
+        "vector_json": "[]",
+        "source_hash": "",
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+    }
+    out = _ensure_columns(frame, BELIEFS_COLUMNS, defaults)
+    out["belief_id"] = _fill_string(out["belief_id"])
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["scope_type"] = _fill_string(out["scope_type"])
+    out["scope_key"] = _fill_string(out["scope_key"])
+    out["session_id"] = _fill_string(out["session_id"])
+    out["topic_id"] = _fill_string(out["topic_id"])
+    out["group_id"] = _fill_string(out["group_id"])
+    out["projection_kind"] = _fill_string(out["projection_kind"])
+    out["projection_scope"] = _fill_string(out["projection_scope"])
+    out["first_ts"] = _to_datetime_utc(out["first_ts"])
+    out["last_ts"] = _to_datetime_utc(out["last_ts"])
+    out["raw_message_count"] = _to_int(out["raw_message_count"], 0)
+    out["first_origin_message_id"] = _fill_string(out["first_origin_message_id"])
+    out["last_origin_message_id"] = _fill_string(out["last_origin_message_id"])
+    out["source_message_ids_json"] = _fill_string(out["source_message_ids_json"], "[]")
+    out["source_session_ids_json"] = _fill_string(out["source_session_ids_json"], "[]")
+    out["topic_ids_json"] = _fill_string(out["topic_ids_json"], "[]")
+    out["summary"] = _fill_string(out["summary"])
+    out["vector_text"] = _fill_string(out["vector_text"])
+    out["vector_ref"] = _fill_string(out["vector_ref"])
+    out["vector_dim"] = _to_int(out["vector_dim"], 64)
+    out["vector_json"] = _fill_string(out["vector_json"], "[]")
+    out["source_hash"] = _fill_string(out["source_hash"])
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    return out[BELIEFS_COLUMNS]
+
+
+def _normalize_projections(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "projection_id": "",
+        "tenant_id": "default",
+        "session_id": "",
+        "projection_kind": "",
+        "projection_scope": "",
+        "visibility": "",
+        "chat_type": "",
+        "native_session_id": "",
+        "native_session_ids_json": "[]",
+        "paired_projection_ids_json": "[]",
+        "paired_session_ids_json": "[]",
+        "paired_projection_scopes_json": "[]",
+        "account_id": "",
+        "account_key": "",
+        "group_id": "",
+        "group_chat_key": "",
+        "sender_id": "",
+        "sender_user_key": "",
+        "topic_ids_json": "[]",
+        "origin_message_count": 0,
+        "active_message_count": 0,
+        "deleted_message_count": 0,
+        "first_origin_message_id": "",
+        "last_origin_message_id": "",
+        "origin_message_ids_json": "[]",
+        "source_first_ts": pd.Timestamp.now(tz="UTC"),
+        "source_last_ts": pd.Timestamp.now(tz="UTC"),
+        "summary": "",
+        "vector_text": "",
+        "vector_ref": "",
+        "vector_dim": 64,
+        "vector_json": "[]",
+        "source_hash": "",
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+    }
+    out = _ensure_columns(frame, PROJECTIONS_COLUMNS, defaults)
+    out["projection_id"] = _fill_string(out["projection_id"])
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["session_id"] = _fill_string(out["session_id"])
+    out["projection_kind"] = _fill_string(out["projection_kind"])
+    out["projection_scope"] = _fill_string(out["projection_scope"])
+    out["visibility"] = _fill_string(out["visibility"])
+    out["chat_type"] = _fill_string(out["chat_type"])
+    out["native_session_id"] = _fill_string(out["native_session_id"])
+    out["native_session_ids_json"] = _fill_string(out["native_session_ids_json"], "[]")
+    out["paired_projection_ids_json"] = _fill_string(out["paired_projection_ids_json"], "[]")
+    out["paired_session_ids_json"] = _fill_string(out["paired_session_ids_json"], "[]")
+    out["paired_projection_scopes_json"] = _fill_string(out["paired_projection_scopes_json"], "[]")
+    out["account_id"] = _fill_string(out["account_id"])
+    out["account_key"] = _fill_string(out["account_key"])
+    out["group_id"] = _fill_string(out["group_id"])
+    out["group_chat_key"] = _fill_string(out["group_chat_key"])
+    out["sender_id"] = _fill_string(out["sender_id"])
+    out["sender_user_key"] = _fill_string(out["sender_user_key"])
+    out["topic_ids_json"] = _fill_string(out["topic_ids_json"], "[]")
+    out["origin_message_count"] = _to_int(out["origin_message_count"], 0)
+    out["active_message_count"] = _to_int(out["active_message_count"], 0)
+    out["deleted_message_count"] = _to_int(out["deleted_message_count"], 0)
+    out["first_origin_message_id"] = _fill_string(out["first_origin_message_id"])
+    out["last_origin_message_id"] = _fill_string(out["last_origin_message_id"])
+    out["origin_message_ids_json"] = _fill_string(out["origin_message_ids_json"], "[]")
+    out["source_first_ts"] = _to_datetime_utc(out["source_first_ts"])
+    out["source_last_ts"] = _to_datetime_utc(out["source_last_ts"])
+    out["summary"] = _fill_string(out["summary"])
+    out["vector_text"] = _fill_string(out["vector_text"])
+    out["vector_ref"] = _fill_string(out["vector_ref"])
+    out["vector_dim"] = _to_int(out["vector_dim"], 64)
+    out["vector_json"] = _fill_string(out["vector_json"], "[]")
+    out["source_hash"] = _fill_string(out["source_hash"])
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    return out[PROJECTIONS_COLUMNS]
 
 
 def _normalize_session_rollups(frame: pd.DataFrame) -> pd.DataFrame:
@@ -651,6 +801,8 @@ def _normalize_snapshots(frame: pd.DataFrame) -> pd.DataFrame:
 NORMALIZERS: Mapping[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
     "messages": _normalize_messages,
     "capsules": _normalize_capsules,
+    "beliefs": _normalize_beliefs,
+    "projections": _normalize_projections,
     "session_rollups": _normalize_session_rollups,
     "topics": _normalize_topics,
     "search_docs": _normalize_search_docs,
@@ -703,6 +855,8 @@ def _partition_value(frame: pd.DataFrame, table: str) -> pd.Series:
         return pd.to_datetime(frame["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
     if table in {
         "capsules",
+        "beliefs",
+        "projections",
         "session_rollups",
         "topics",
         "search_docs",
@@ -910,6 +1064,8 @@ async def migrate_schema(
         vector_dim=_rollup_vector_dim_from_env(),
     )
     normalized_tables["messages"] = rebuilt_storage["messages"]
+    normalized_tables["beliefs"] = rebuilt_storage["beliefs"]
+    normalized_tables["projections"] = rebuilt_storage["projections"]
     normalized_tables["sessions"] = rebuilt_storage["sessions"]
     normalized_tables["session_rollups"] = rebuilt_storage["session_rollups"]
     normalized_tables["topics"] = rebuilt_storage["topics"]

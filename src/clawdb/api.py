@@ -101,6 +101,40 @@ async def present_capsules(session_id: str, tenant_id: str = "default"):
     return await service.present_capsule_cards(tenant_id=tenant_id, session_id=session_id)
 
 
+@app.get("/v1/memory/projections")
+async def list_projection_state(
+    tenant_id: str = "default",
+    session_id: str | None = None,
+    projection_kind: str | None = None,
+    origin_message_id: str | None = None,
+    group_id: str | None = None,
+    include_deleted: bool = False,
+):
+    return await service.list_projection_state(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        projection_kind=projection_kind,
+        origin_message_id=origin_message_id,
+        group_id=group_id,
+        include_deleted=include_deleted,
+    )
+
+
+@app.get("/v1/memory/beliefs")
+async def list_belief_state(
+    tenant_id: str = "default",
+    scope_type: str | None = None,
+    session_id: str | None = None,
+    topic_id: str | None = None,
+):
+    return await service.list_belief_state(
+        tenant_id=tenant_id,
+        scope_type=scope_type,
+        session_id=session_id,
+        topic_id=topic_id,
+    )
+
+
 @app.get("/v1/memory/present/forum/{session_id}")
 async def present_forum(session_id: str, tenant_id: str = "default"):
     return await service.present_forum_style(tenant_id=tenant_id, session_id=session_id)

@@ -33,8 +33,16 @@ CAPSULES_COLUMNS = [
     "first_origin_message_id",
     "last_origin_message_id",
     "source_message_ids_json",
+    "source_session_ids_json",
+    "source_topic_ids_json",
+    "active_message_count",
+    "edited_message_count",
+    "topic_message_count",
+    "topic_body_char_count",
     "source_first_ts",
     "source_last_ts",
+    "opened_at",
+    "sealed_at",
     "prev_capsule_id",
     "next_capsule_id",
     "back_link_ids_json",
@@ -66,7 +74,15 @@ def capsule_body_char_count(value: object) -> int:
 
 
 def _json_list(values: Sequence[object]) -> str:
-    return json.dumps([str(item) for item in values], separators=(",", ":"))
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for item in values:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return json.dumps(ordered, separators=(",", ":"))
 
 
 def _serialize_vector(text: str, dim: int) -> str:
@@ -171,6 +187,11 @@ def materialize_capsule_lifecycle(
     scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
     scoped["topic_id"] = scoped["topic_id"].fillna("default").astype(str)
     scoped["origin_message_id"] = scoped["origin_message_id"].fillna(scoped["message_id"]).astype(str)
+    scoped["session_id"] = scoped["session_id"].fillna("").astype(str)
+    scoped["native_session_id"] = scoped["native_session_id"].fillna(scoped["session_id"]).astype(str)
+    if "source_topic_id" not in scoped.columns:
+        scoped["source_topic_id"] = scoped["topic_id"]
+    scoped["source_topic_id"] = scoped["source_topic_id"].fillna(scoped["topic_id"]).astype(str)
     scoped["message_state"] = scoped["message_state"].fillna("active").astype(str)
     scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
     scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
@@ -197,6 +218,8 @@ def materialize_capsule_lifecycle(
     for (tenant_id, canonical_topic_id), group in live_rows.groupby(["tenant_id", "canonical_topic_id"], sort=True):
         ordered = group.sort_values(["ts", "origin_message_id"], kind="stable").reset_index(drop=True)
         topic_path = topic_path_lookup.get((str(tenant_id), str(canonical_topic_id)), str(canonical_topic_id))
+        topic_message_count = int(ordered.shape[0])
+        topic_body_char_count = int(ordered["body_char_count"].astype(int).sum())
         capsule_sources: List[pd.Series] = []
         capsule_body_char_count_total = 0
         capsule_ordinal = 0
@@ -212,6 +235,20 @@ def materialize_capsule_lifecycle(
             last_row = source_rows[-1]
             capsule_id = f"capsule:{tenant_id}:{canonical_topic_id}:{capsule_ordinal:04d}"
             source_hash = _source_hash(source_rows)
+            source_session_ids = [
+                item.get("native_session_id") or item.get("session_id") or ""
+                for item in source_rows
+            ]
+            source_topic_ids = [
+                item.get("source_topic_id") or item.get("topic_id") or ""
+                for item in source_rows
+            ]
+            active_message_count = len(source_rows)
+            edited_message_count = sum(
+                1 for item in source_rows if str(item.get("message_state") or "") == "edited"
+            )
+            opened_at = _utc_timestamp(first_row.get("ts"))
+            sealed_at = _utc_timestamp(last_row.get("ts")) if capsule_state == CAPSULE_STATE_SEALED else pd.NaT
             summary = _render_capsule_summary(
                 capsule_id=capsule_id,
                 topic_id=str(canonical_topic_id),
@@ -247,8 +284,16 @@ def materialize_capsule_lifecycle(
                     "source_message_ids_json": _json_list(
                         [item.get("origin_message_id") or item.get("message_id") or "" for item in source_rows]
                     ),
+                    "source_session_ids_json": _json_list(source_session_ids),
+                    "source_topic_ids_json": _json_list(source_topic_ids),
+                    "active_message_count": active_message_count,
+                    "edited_message_count": edited_message_count,
+                    "topic_message_count": topic_message_count,
+                    "topic_body_char_count": topic_body_char_count,
                     "source_first_ts": _utc_timestamp(first_row.get("ts")),
                     "source_last_ts": _utc_timestamp(last_row.get("ts")),
+                    "opened_at": opened_at,
+                    "sealed_at": sealed_at,
                     "prev_capsule_id": "",
                     "next_capsule_id": "",
                     "back_link_ids_json": "[]",
@@ -302,6 +347,22 @@ def materialize_capsule_lifecycle(
                     "capsule_id": str(frame.at[row_idx, "capsule_id"]),
                     "capsule_ordinal": int(frame.at[row_idx, "capsule_ordinal"]),
                     "capsule_state": str(frame.at[row_idx, "capsule_state"]),
+                    "active_message_count": int(frame.at[row_idx, "active_message_count"]),
+                    "edited_message_count": int(frame.at[row_idx, "edited_message_count"]),
+                    "topic_message_count": int(frame.at[row_idx, "topic_message_count"]),
+                    "topic_body_char_count": int(frame.at[row_idx, "topic_body_char_count"]),
+                    "source_session_ids": json.loads(str(frame.at[row_idx, "source_session_ids_json"]) or "[]"),
+                    "source_topic_ids": json.loads(str(frame.at[row_idx, "source_topic_ids_json"]) or "[]"),
+                    "opened_at": (
+                        _utc_timestamp(frame.at[row_idx, "opened_at"]).isoformat()
+                        if pd.notna(frame.at[row_idx, "opened_at"])
+                        else None
+                    ),
+                    "sealed_at": (
+                        _utc_timestamp(frame.at[row_idx, "sealed_at"]).isoformat()
+                        if pd.notna(frame.at[row_idx, "sealed_at"])
+                        else None
+                    ),
                     "prev_capsule_id": prev_capsule_id or None,
                     "next_capsule_id": next_capsule_id or None,
                     "back_links": back_links,

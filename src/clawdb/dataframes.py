@@ -11,6 +11,7 @@ from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from .beliefs import BELIEFS_COLUMNS, materialize_l0_beliefs
 from .capsules import CAPSULES_COLUMNS, materialize_capsule_lifecycle
 from .embeddings import (
     DETERMINISTIC_EMBEDDING_MODEL,
@@ -28,6 +29,7 @@ from .lineage import (
     normalize_identity,
 )
 from .models import SearchResult, WalRecord
+from .projections import PROJECTIONS_COLUMNS, materialize_projection_state
 from .search_index import (
     LEXICAL_INDEX_COLUMNS,
     SEARCH_DOC_COLUMNS,
@@ -252,6 +254,8 @@ SEMANTIC_JOB_STATUS_RUNNING = "running"
 class DataFramesState:
     messages_df: pd.DataFrame
     capsules_df: pd.DataFrame
+    beliefs_df: pd.DataFrame
+    projections_df: pd.DataFrame
     session_rollups_df: pd.DataFrame
     topics_df: pd.DataFrame
     search_docs_df: pd.DataFrame
@@ -284,10 +288,12 @@ class MessageUpsertResult:
 class StorageRebuildResult:
     raw_message_count: int
     projection_message_count: int
+    projection_state_count: int
     session_count: int
     session_rollup_count: int
     topic_count: int
     capsule_count: int
+    belief_count: int
     embedding_metadata_count: int
 
 
@@ -862,15 +868,27 @@ def rebuild_materialized_storage_from_raw(
         topics_frame=rebuilt_topics,
         vector_dim=vector_dim,
     )
+    rebuilt_projection_state = materialize_projection_state(
+        rebuilt_messages,
+        vector_dim=vector_dim,
+    )
+    rebuilt_beliefs = materialize_l0_beliefs(
+        rebuilt_messages,
+        vector_dim=vector_dim,
+    )
     rebuilt_embedding_metadata = materialize_embedding_index_metadata(
         rebuilt_messages,
         rebuilt_rollups,
         rebuilt_topics,
         rebuilt_capsules,
+        rebuilt_beliefs,
+        rebuilt_projection_state,
     )
     return {
         "messages": rebuilt_messages,
         "projection_messages": projection_messages,
+        "projections": rebuilt_projection_state,
+        "beliefs": rebuilt_beliefs,
         "sessions": rebuilt_sessions,
         "session_rollups": rebuilt_rollups,
         "topics": rebuilt_topics,
@@ -884,6 +902,8 @@ def materialize_embedding_index_metadata(
     session_rollups_frame: pd.DataFrame,
     topics_frame: pd.DataFrame,
     capsules_frame: pd.DataFrame,
+    beliefs_frame: pd.DataFrame,
+    projections_frame: pd.DataFrame,
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
 
@@ -972,6 +992,20 @@ def materialize_embedding_index_metadata(
         text_col="vector_text",
         ref_col="vector_ref",
     )
+    _append_entity_rows(
+        beliefs_frame,
+        entity_type="l0_abstract",
+        entity_id_col="belief_id",
+        text_col="vector_text",
+        ref_col="vector_ref",
+    )
+    _append_entity_rows(
+        projections_frame,
+        entity_type="projection",
+        entity_id_col="projection_id",
+        text_col="vector_text",
+        ref_col="vector_ref",
+    )
     if not rows:
         return pd.DataFrame(columns=EMBEDDING_INDEX_METADATA_COLUMNS)
     frame = pd.DataFrame(rows, columns=EMBEDDING_INDEX_METADATA_COLUMNS)
@@ -1000,6 +1034,8 @@ class DataFrameStore:
         self._state = DataFramesState(
             messages_df=pd.DataFrame(columns=MESSAGES_COLUMNS),
             capsules_df=pd.DataFrame(columns=CAPSULES_COLUMNS),
+            beliefs_df=pd.DataFrame(columns=BELIEFS_COLUMNS),
+            projections_df=pd.DataFrame(columns=PROJECTIONS_COLUMNS),
             session_rollups_df=pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS),
             topics_df=pd.DataFrame(columns=TOPICS_COLUMNS),
             search_docs_df=pd.DataFrame(columns=SEARCH_DOC_COLUMNS),
@@ -1077,11 +1113,77 @@ class DataFrameStore:
                 "first_origin_message_id": "string",
                 "last_origin_message_id": "string",
                 "source_message_ids_json": "string",
+                "source_session_ids_json": "string",
+                "source_topic_ids_json": "string",
+                "active_message_count": "int64",
+                "edited_message_count": "int64",
+                "topic_message_count": "int64",
+                "topic_body_char_count": "int64",
                 "prev_capsule_id": "string",
                 "next_capsule_id": "string",
                 "back_link_ids_json": "string",
                 "forward_link_ids_json": "string",
                 "pointer_json": "string",
+                "vector_text": "string",
+                "vector_ref": "string",
+                "vector_dim": "int64",
+                "vector_json": "string",
+                "source_hash": "string",
+            }
+        )
+        self._state.beliefs_df = self._state.beliefs_df.astype(
+            {
+                "belief_id": "string",
+                "tenant_id": "string",
+                "scope_type": "string",
+                "scope_key": "string",
+                "session_id": "string",
+                "topic_id": "string",
+                "group_id": "string",
+                "projection_kind": "string",
+                "projection_scope": "string",
+                "raw_message_count": "int64",
+                "first_origin_message_id": "string",
+                "last_origin_message_id": "string",
+                "source_message_ids_json": "string",
+                "source_session_ids_json": "string",
+                "topic_ids_json": "string",
+                "summary": "string",
+                "vector_text": "string",
+                "vector_ref": "string",
+                "vector_dim": "int64",
+                "vector_json": "string",
+                "source_hash": "string",
+            }
+        )
+        self._state.projections_df = self._state.projections_df.astype(
+            {
+                "projection_id": "string",
+                "tenant_id": "string",
+                "session_id": "string",
+                "projection_kind": "string",
+                "projection_scope": "string",
+                "visibility": "string",
+                "chat_type": "string",
+                "native_session_id": "string",
+                "native_session_ids_json": "string",
+                "paired_projection_ids_json": "string",
+                "paired_session_ids_json": "string",
+                "paired_projection_scopes_json": "string",
+                "account_id": "string",
+                "account_key": "string",
+                "group_id": "string",
+                "group_chat_key": "string",
+                "sender_id": "string",
+                "sender_user_key": "string",
+                "topic_ids_json": "string",
+                "origin_message_count": "int64",
+                "active_message_count": "int64",
+                "deleted_message_count": "int64",
+                "first_origin_message_id": "string",
+                "last_origin_message_id": "string",
+                "origin_message_ids_json": "string",
+                "summary": "string",
                 "vector_text": "string",
                 "vector_ref": "string",
                 "vector_dim": "int64",
@@ -1868,6 +1970,68 @@ class DataFrameStore:
                     }
                 )
 
+        if not self._state.beliefs_df.empty:
+            beliefs = self._state.beliefs_df.copy().reset_index(drop=True)
+            beliefs["tenant_id"] = beliefs["tenant_id"].fillna("default").astype(str)
+            beliefs["belief_id"] = beliefs["belief_id"].fillna("").astype(str)
+            beliefs["scope_type"] = beliefs["scope_type"].fillna("").astype(str)
+            beliefs["scope_key"] = beliefs["scope_key"].fillna("").astype(str)
+            beliefs["session_id"] = beliefs["session_id"].fillna("").astype(str)
+            beliefs["topic_id"] = beliefs["topic_id"].fillna("").astype(str)
+            beliefs["group_id"] = beliefs["group_id"].fillna("").astype(str)
+            beliefs["projection_kind"] = beliefs["projection_kind"].fillna("").astype(str)
+            beliefs["projection_scope"] = beliefs["projection_scope"].fillna("").astype(str)
+            beliefs["summary"] = beliefs["summary"].fillna("").astype(str)
+            beliefs["updated_at"] = pd.to_datetime(beliefs["updated_at"], utc=True, errors="coerce")
+            beliefs["vector_ref"] = beliefs["vector_ref"].fillna("").astype(str)
+            beliefs["vector_json"] = beliefs["vector_json"].fillna("[]").astype(str)
+            beliefs["vector_dim"] = pd.to_numeric(beliefs["vector_dim"], errors="coerce").fillna(0).astype(int)
+            for _, row in beliefs.iterrows():
+                belief_id = str(row.get("belief_id") or "")
+                if not belief_id:
+                    continue
+                first_origin = str(row.get("first_origin_message_id") or "").strip()
+                last_origin = str(row.get("last_origin_message_id") or "").strip()
+                citations = [
+                    belief_id,
+                    *([f"origin:{first_origin}"] if first_origin else []),
+                    *([f"origin:{last_origin}"] if last_origin and last_origin != first_origin else []),
+                ]
+                scope_type = str(row.get("scope_type") or "")
+                scope_key = str(row.get("scope_key") or "")
+                rows.append(
+                    {
+                        "tenant_id": str(row.get("tenant_id") or "default"),
+                        "doc_id": belief_id,
+                        "entity_type": "l0_abstract",
+                        "entity_id": belief_id,
+                        "source_tier": "L0",
+                        "session_id": str(row.get("session_id") or ""),
+                        "updated_at": _utc_timestamp(row.get("updated_at")),
+                        "text": str(row.get("summary") or ""),
+                        "path": f"memory/l0/{scope_type}_{_safe_path_fragment(scope_key)}.md",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "snippet": _trim_text(row.get("summary") or "", 700),
+                        "citation": belief_id,
+                        "citations_json": _json_citations(citations),
+                        "channel": "",
+                        "chat_type": "",
+                        "account_id": "",
+                        "group_id": str(row.get("group_id") or ""),
+                        "topic_id": str(row.get("topic_id") or ""),
+                        "topic_path": str(row.get("topic_id") or ""),
+                        "message_thread_id": "",
+                        "sender_id": "",
+                        "origin_message_id": first_origin,
+                        "projection_kind": str(row.get("projection_kind") or ""),
+                        "projection_scope": str(row.get("projection_scope") or ""),
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "vector_dim": int(row.get("vector_dim") or 0),
+                        "vector_json": str(row.get("vector_json") or "[]"),
+                    }
+                )
+
         if not self._state.session_rollups_df.empty:
             rollups = self._state.session_rollups_df.copy().reset_index(drop=True)
             rollups["tenant_id"] = rollups["tenant_id"].fillna("default").astype(str)
@@ -2377,12 +2541,32 @@ class DataFrameStore:
     def state(self) -> DataFramesState:
         return self._state
 
+    def _rebuild_projection_state_locked(self, *, vector_dim: int) -> int:
+        self._state.projections_df = materialize_projection_state(
+            self._state.messages_df,
+            vector_dim=vector_dim,
+        )
+        return int(self._state.projections_df.shape[0])
+
+    def _rebuild_belief_state_locked(self, *, vector_dim: int) -> int:
+        self._state.beliefs_df = materialize_l0_beliefs(
+            self._state.messages_df,
+            vector_dim=vector_dim,
+        )
+        return int(self._state.beliefs_df.shape[0])
+
+    def _refresh_first_class_state_locked(self, *, vector_dim: int) -> None:
+        self._rebuild_projection_state_locked(vector_dim=vector_dim)
+        self._rebuild_belief_state_locked(vector_dim=vector_dim)
+
     def _rebuild_embedding_index_metadata_locked(self) -> int:
         self._state.embedding_index_metadata_df = materialize_embedding_index_metadata(
             self._state.messages_df,
             self._state.session_rollups_df,
             self._state.topics_df,
             self._state.capsules_df,
+            self._state.beliefs_df,
+            self._state.projections_df,
         )
         return int(self._state.embedding_index_metadata_df.shape[0])
 
@@ -2421,7 +2605,12 @@ class DataFrameStore:
     async def add_message(self, payload: Dict[str, object]) -> None:
         await self.apply_message_bundle(materialize_message_bundle(payload))
 
-    async def apply_message_bundle(self, bundle: Dict[str, object]) -> MessageUpsertResult:
+    async def apply_message_bundle(
+        self,
+        bundle: Dict[str, object],
+        *,
+        vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM,
+    ) -> MessageUpsertResult:
         tenant_id = str(bundle.get("tenant_id") or "default")
         projections = list(bundle.get("projections") or [])
         for row in projections:
@@ -2448,6 +2637,7 @@ class DataFrameStore:
                     ignore_index=True,
                 )
             self._invalidate_messages_index_locked()
+            self._refresh_first_class_state_locked(vector_dim=vector_dim)
             self._rebuild_embedding_index_metadata_locked()
             affected_sessions = sorted(
                 {
@@ -2521,6 +2711,7 @@ class DataFrameStore:
         origin_message_id: str,
         content: str,
         edited_at: datetime,
+        vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM,
     ) -> MessageMutationResult:
         async with self._lock:
             mask = (
@@ -2551,6 +2742,7 @@ class DataFrameStore:
             self._state.messages_df.loc[mask, "message_state"] = "edited"
             self._state.messages_df.loc[mask, "deleted_at"] = None
             self._invalidate_messages_index_locked()
+            self._refresh_first_class_state_locked(vector_dim=vector_dim)
             self._rebuild_embedding_index_metadata_locked()
             return MessageMutationResult(
                 origin_message_id=origin_message_id,
@@ -2571,6 +2763,7 @@ class DataFrameStore:
         tenant_id: str,
         origin_message_id: str,
         deleted_at: datetime,
+        vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM,
     ) -> MessageMutationResult:
         async with self._lock:
             mask = (
@@ -2594,6 +2787,7 @@ class DataFrameStore:
             self._state.messages_df.loc[mask, "updated_at"] = deleted_at_text
             self._state.messages_df.loc[mask, "deleted_at"] = deleted_at_text
             self._invalidate_messages_index_locked()
+            self._refresh_first_class_state_locked(vector_dim=vector_dim)
             self._rebuild_embedding_index_metadata_locked()
             return MessageMutationResult(
                 origin_message_id=origin_message_id,
@@ -2635,6 +2829,7 @@ class DataFrameStore:
                 vector_dim=vector_dim,
             )
             self._apply_materialized_topics_to_messages_locked()
+            self._refresh_first_class_state_locked(vector_dim=vector_dim)
             self._rebuild_embedding_index_metadata_locked()
             return int(self._state.topics_df.shape[0])
 
@@ -2661,21 +2856,27 @@ class DataFrameStore:
                 vector_dim=vector_dim,
             )
             self._state.messages_df = rebuilt["messages"]
+            self._state.projections_df = rebuilt["projections"]
+            self._state.beliefs_df = rebuilt["beliefs"]
             self._state.sessions_df = rebuilt["sessions"]
             self._state.session_rollups_df = rebuilt["session_rollups"]
             self._state.topics_df = rebuilt["topics"]
             self._apply_materialized_topics_to_messages_locked()
             self._state.capsules_df = rebuilt["capsules"]
+            self._refresh_first_class_state_locked(vector_dim=vector_dim)
             self._state.embedding_index_metadata_df = rebuilt["embedding_index_metadata"]
+            self._rebuild_embedding_index_metadata_locked()
             self._rebuild_search_indexes_locked(vector_dim=vector_dim)
             self._invalidate_all_indexes_locked()
             return StorageRebuildResult(
                 raw_message_count=int(authoritative_raw_messages(self._state.messages_df).shape[0]),
                 projection_message_count=int(rebuilt["projection_messages"].shape[0]),
+                projection_state_count=int(self._state.projections_df.shape[0]),
                 session_count=int(self._state.sessions_df.shape[0]),
                 session_rollup_count=int(self._state.session_rollups_df.shape[0]),
                 topic_count=int(self._state.topics_df.shape[0]),
                 capsule_count=int(self._state.capsules_df.shape[0]),
+                belief_count=int(self._state.beliefs_df.shape[0]),
                 embedding_metadata_count=int(self._state.embedding_index_metadata_df.shape[0]),
             )
 
@@ -2849,6 +3050,8 @@ class DataFrameStore:
                     ignore_index=True,
                 )
                 self._invalidate_session_rollups_index_locked()
+            self._refresh_first_class_state_locked(vector_dim=DEFAULT_TOPIC_VECTOR_DIM)
+            self._rebuild_embedding_index_metadata_locked()
 
     async def spawn_session(
         self,
@@ -3537,78 +3740,82 @@ class DataFrameStore:
                 return f"tenant_{_safe_path_fragment(tenant_id)}"
 
             if not raw_rows.empty:
-                l0_header = (
-                    f"l0 scope={_scope_id()} raw_messages={int(raw_rows.shape[0])} "
-                    f"rollups={int(rollup_rows.shape[0])} topics={int(topic_rows.shape[0])} "
-                    f"capsules={int(capsule_rows.shape[0])}"
-                )
-                l0_sections: List[str] = [l0_header]
-                lifetime_rollups = rollup_rows[rollup_rows["window_kind"].astype(str) == "lifetime"]
-                if not lifetime_rollups.empty:
-                    latest_lifetimes = lifetime_rollups.sort_values(
-                        ["source_last_ts", "session_id"],
-                        ascending=[False, True],
-                        kind="stable",
-                    ).head(3)
-                    for _, row in latest_lifetimes.iterrows():
-                        l0_sections.append(
-                            "session "
-                            f"{str(row.get('session_id') or '')} "
-                            f"{_trim_text(row.get('summary') or '', 900)}"
-                        )
-                if not topic_rows.empty:
-                    for _, row in topic_rows.head(3).iterrows():
-                        l0_sections.append(
-                            "topic "
-                            f"{str(row.get('canonical_topic_id') or row.get('topic_id') or 'default')} "
-                            f"{_trim_text(row.get('summary') or '', 700)}"
-                        )
-                if not capsule_rows.empty:
-                    recent_capsules = capsule_rows.sort_values(
-                        ["updated_at", "capsule_ordinal"],
-                        ascending=[False, False],
-                        kind="stable",
-                    ).head(2)
-                    for _, row in recent_capsules.iterrows():
-                        l0_sections.append(
-                            "capsule "
-                            f"{str(row.get('capsule_id') or '')} "
-                            f"{_trim_text(row.get('summary') or '', 700)}"
-                        )
-                raw_tail = raw_rows.tail(4)
-                for _, row in raw_tail.iterrows():
-                    l0_sections.append(_trim_text(row.get("content") or "", 350))
-                l0_text = _trim_text("\n".join(part for part in l0_sections if part), RETRIEVAL_ABSTRACT_MAX_CHARS)
                 l0_primary = f"l0:{tenant_id}:{_scope_id()}"
-                l0_citations = _dedupe_citations([l0_primary, *_origin_bounds(raw_rows)], limit=3)
-                docs.append(
-                    {
-                        "doc_id": l0_primary,
-                        "text": l0_text,
-                        "path": f"memory/l0/{_scope_id()}.md",
-                        "start_line": 1,
-                        "end_line": 1,
-                        "snippet": _trim_text(l0_text, 700),
-                        "source_tier": "L0",
-                        "entity_type": "l0_abstract",
-                        "entity_id": l0_primary,
-                        "citation": l0_primary,
-                        "citations": l0_citations,
-                        "channel": None,
-                        "chat_type": None,
-                        "account_id": None,
-                        "group_id": None,
-                        "topic_id": None,
-                        "topic_path": None,
-                        "message_thread_id": None,
-                        "sender_id": None,
-                        "origin_message_id": (
-                            l0_citations[1].split(":", 1)[1] if len(l0_citations) > 1 else None
-                        ),
-                        "projection_kind": None,
-                        "projection_scope": None,
-                    }
-                )
+                persisted = _persisted_doc(l0_primary)
+                if persisted is not None:
+                    docs.append(persisted)
+                else:
+                    l0_header = (
+                        f"l0 scope={_scope_id()} raw_messages={int(raw_rows.shape[0])} "
+                        f"rollups={int(rollup_rows.shape[0])} topics={int(topic_rows.shape[0])} "
+                        f"capsules={int(capsule_rows.shape[0])}"
+                    )
+                    l0_sections: List[str] = [l0_header]
+                    lifetime_rollups = rollup_rows[rollup_rows["window_kind"].astype(str) == "lifetime"]
+                    if not lifetime_rollups.empty:
+                        latest_lifetimes = lifetime_rollups.sort_values(
+                            ["source_last_ts", "session_id"],
+                            ascending=[False, True],
+                            kind="stable",
+                        ).head(3)
+                        for _, row in latest_lifetimes.iterrows():
+                            l0_sections.append(
+                                "session "
+                                f"{str(row.get('session_id') or '')} "
+                                f"{_trim_text(row.get('summary') or '', 900)}"
+                            )
+                    if not topic_rows.empty:
+                        for _, row in topic_rows.head(3).iterrows():
+                            l0_sections.append(
+                                "topic "
+                                f"{str(row.get('canonical_topic_id') or row.get('topic_id') or 'default')} "
+                                f"{_trim_text(row.get('summary') or '', 700)}"
+                            )
+                    if not capsule_rows.empty:
+                        recent_capsules = capsule_rows.sort_values(
+                            ["updated_at", "capsule_ordinal"],
+                            ascending=[False, False],
+                            kind="stable",
+                        ).head(2)
+                        for _, row in recent_capsules.iterrows():
+                            l0_sections.append(
+                                "capsule "
+                                f"{str(row.get('capsule_id') or '')} "
+                                f"{_trim_text(row.get('summary') or '', 700)}"
+                            )
+                    raw_tail = raw_rows.tail(4)
+                    for _, row in raw_tail.iterrows():
+                        l0_sections.append(_trim_text(row.get("content") or "", 350))
+                    l0_text = _trim_text("\n".join(part for part in l0_sections if part), RETRIEVAL_ABSTRACT_MAX_CHARS)
+                    l0_citations = _dedupe_citations([l0_primary, *_origin_bounds(raw_rows)], limit=3)
+                    docs.append(
+                        {
+                            "doc_id": l0_primary,
+                            "text": l0_text,
+                            "path": f"memory/l0/{_scope_id()}.md",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "snippet": _trim_text(l0_text, 700),
+                            "source_tier": "L0",
+                            "entity_type": "l0_abstract",
+                            "entity_id": l0_primary,
+                            "citation": l0_primary,
+                            "citations": l0_citations,
+                            "channel": None,
+                            "chat_type": None,
+                            "account_id": None,
+                            "group_id": None,
+                            "topic_id": None,
+                            "topic_path": None,
+                            "message_thread_id": None,
+                            "sender_id": None,
+                            "origin_message_id": (
+                                l0_citations[1].split(":", 1)[1] if len(l0_citations) > 1 else None
+                            ),
+                            "projection_kind": None,
+                            "projection_scope": None,
+                        }
+                    )
 
             if not rollup_rows.empty:
                 ordered_rollups = rollup_rows.sort_values(
@@ -3845,6 +4052,155 @@ class DataFrameStore:
         scored.sort(key=lambda item: item[0], reverse=True)
         return [item[1] for item in scored[: max(1, max_results)]]
 
+    async def list_projection_state(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str] = None,
+        projection_kind: Optional[str] = None,
+        origin_message_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        include_deleted: bool = False,
+    ) -> List[Dict[str, object]]:
+        def _json_contains(text: object, needle: str) -> bool:
+            try:
+                return str(needle) in {str(item) for item in json.loads(str(text or "[]"))}
+            except Exception:
+                return False
+
+        async with self._lock:
+            df = self._state.projections_df.copy().reset_index(drop=True)
+            if df.empty:
+                return []
+            df["tenant_id"] = df["tenant_id"].fillna("default").astype(str)
+            df["session_id"] = df["session_id"].fillna("").astype(str)
+            df["projection_kind"] = df["projection_kind"].fillna("").astype(str)
+            df["group_id"] = df["group_id"].fillna("").astype(str)
+            df["native_session_id"] = df["native_session_id"].fillna("").astype(str)
+            df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True, errors="coerce")
+            scoped = df[df["tenant_id"].astype(str) == str(tenant_id)].copy()
+            if session_id is not None:
+                resolved = self._resolve_session_ids_locked(str(tenant_id), str(session_id), include_mirrors=True)
+                session_candidates = sorted({str(session_id), *resolved})
+                scoped = scoped[
+                    scoped["session_id"].astype(str).isin(session_candidates)
+                    | scoped["native_session_id"].astype(str).isin(session_candidates)
+                    | scoped["native_session_ids_json"].apply(lambda value: any(_json_contains(value, item) for item in session_candidates))
+                ]
+            if projection_kind is not None:
+                scoped = scoped[scoped["projection_kind"].astype(str) == str(projection_kind)]
+            if group_id is not None:
+                scoped = scoped[scoped["group_id"].astype(str) == str(group_id)]
+            if origin_message_id is not None:
+                scoped = scoped[
+                    scoped["origin_message_ids_json"].apply(lambda value: _json_contains(value, str(origin_message_id)))
+                ]
+            if not include_deleted:
+                scoped = scoped[scoped["active_message_count"].astype(int) > 0]
+            scoped = scoped.sort_values(
+                ["updated_at", "projection_kind", "session_id"],
+                ascending=[False, True, True],
+                kind="stable",
+            )
+            out: List[Dict[str, object]] = []
+            for _, row in scoped.iterrows():
+                out.append(
+                    {
+                        "projection_id": str(row.get("projection_id") or ""),
+                        "tenant_id": str(row.get("tenant_id") or "default"),
+                        "session_id": str(row.get("session_id") or ""),
+                        "projection_kind": str(row.get("projection_kind") or ""),
+                        "projection_scope": str(row.get("projection_scope") or ""),
+                        "visibility": str(row.get("visibility") or ""),
+                        "chat_type": str(row.get("chat_type") or ""),
+                        "native_session_id": str(row.get("native_session_id") or ""),
+                        "native_session_ids": json.loads(str(row.get("native_session_ids_json") or "[]")),
+                        "paired_projection_ids": json.loads(str(row.get("paired_projection_ids_json") or "[]")),
+                        "paired_session_ids": json.loads(str(row.get("paired_session_ids_json") or "[]")),
+                        "paired_projection_scopes": json.loads(str(row.get("paired_projection_scopes_json") or "[]")),
+                        "account_id": str(row.get("account_id") or ""),
+                        "account_key": str(row.get("account_key") or ""),
+                        "group_id": str(row.get("group_id") or ""),
+                        "group_chat_key": str(row.get("group_chat_key") or ""),
+                        "sender_id": str(row.get("sender_id") or ""),
+                        "sender_user_key": str(row.get("sender_user_key") or ""),
+                        "topic_ids": json.loads(str(row.get("topic_ids_json") or "[]")),
+                        "origin_message_count": int(row.get("origin_message_count") or 0),
+                        "active_message_count": int(row.get("active_message_count") or 0),
+                        "deleted_message_count": int(row.get("deleted_message_count") or 0),
+                        "first_origin_message_id": str(row.get("first_origin_message_id") or ""),
+                        "last_origin_message_id": str(row.get("last_origin_message_id") or ""),
+                        "origin_message_ids": json.loads(str(row.get("origin_message_ids_json") or "[]")),
+                        "source_first_ts": pd.to_datetime(row.get("source_first_ts"), utc=True).isoformat(),
+                        "source_last_ts": pd.to_datetime(row.get("source_last_ts"), utc=True).isoformat(),
+                        "summary": str(row.get("summary") or ""),
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "updated_at": pd.to_datetime(row.get("updated_at"), utc=True).isoformat(),
+                    }
+                )
+            return out
+
+    async def list_belief_state(
+        self,
+        *,
+        tenant_id: str,
+        scope_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        async with self._lock:
+            df = self._state.beliefs_df.copy().reset_index(drop=True)
+            if df.empty:
+                return []
+            df["tenant_id"] = df["tenant_id"].fillna("default").astype(str)
+            df["scope_type"] = df["scope_type"].fillna("").astype(str)
+            df["session_id"] = df["session_id"].fillna("").astype(str)
+            df["topic_id"] = df["topic_id"].fillna("").astype(str)
+            df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True, errors="coerce")
+            scoped = df[df["tenant_id"].astype(str) == str(tenant_id)].copy()
+            if scope_type is not None:
+                scoped = scoped[scoped["scope_type"].astype(str) == str(scope_type)]
+            if session_id is not None:
+                resolved = self._resolve_session_ids_locked(str(tenant_id), str(session_id), include_mirrors=True)
+                session_candidates = sorted({str(session_id), *resolved})
+                scoped = scoped[scoped["session_id"].astype(str).isin(session_candidates)]
+            if topic_id is not None:
+                canonical_ids = self._canonical_topic_ids_locked(str(tenant_id), [str(topic_id)])
+                topic_candidates = sorted({str(topic_id), *canonical_ids})
+                scoped = scoped[scoped["topic_id"].astype(str).isin(topic_candidates)]
+            scoped = scoped.sort_values(
+                ["updated_at", "scope_type", "scope_key"],
+                ascending=[False, True, True],
+                kind="stable",
+            )
+            out: List[Dict[str, object]] = []
+            for _, row in scoped.iterrows():
+                out.append(
+                    {
+                        "belief_id": str(row.get("belief_id") or ""),
+                        "tenant_id": str(row.get("tenant_id") or "default"),
+                        "scope_type": str(row.get("scope_type") or ""),
+                        "scope_key": str(row.get("scope_key") or ""),
+                        "session_id": str(row.get("session_id") or ""),
+                        "topic_id": str(row.get("topic_id") or ""),
+                        "group_id": str(row.get("group_id") or ""),
+                        "projection_kind": str(row.get("projection_kind") or ""),
+                        "projection_scope": str(row.get("projection_scope") or ""),
+                        "first_ts": pd.to_datetime(row.get("first_ts"), utc=True).isoformat(),
+                        "last_ts": pd.to_datetime(row.get("last_ts"), utc=True).isoformat(),
+                        "raw_message_count": int(row.get("raw_message_count") or 0),
+                        "first_origin_message_id": str(row.get("first_origin_message_id") or ""),
+                        "last_origin_message_id": str(row.get("last_origin_message_id") or ""),
+                        "source_message_ids": json.loads(str(row.get("source_message_ids_json") or "[]")),
+                        "source_session_ids": json.loads(str(row.get("source_session_ids_json") or "[]")),
+                        "topic_ids": json.loads(str(row.get("topic_ids_json") or "[]")),
+                        "summary": str(row.get("summary") or ""),
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "updated_at": pd.to_datetime(row.get("updated_at"), utc=True).isoformat(),
+                    }
+                )
+            return out
+
     async def forum_view(self, tenant_id: str, session_id: str) -> List[Dict[str, object]]:
         async with self._lock:
             df = self._chronological_messages(
@@ -3894,6 +4250,22 @@ class DataFrameStore:
                         "source_message_count": int(row.get("source_message_count") or 0),
                         "source_body_char_count": int(row.get("source_body_char_count") or 0),
                         "threshold_body_char_count": int(row.get("threshold_body_char_count") or 0),
+                        "source_session_ids": json.loads(str(row.get("source_session_ids_json") or "[]")),
+                        "source_topic_ids": json.loads(str(row.get("source_topic_ids_json") or "[]")),
+                        "active_message_count": int(row.get("active_message_count") or 0),
+                        "edited_message_count": int(row.get("edited_message_count") or 0),
+                        "topic_message_count": int(row.get("topic_message_count") or 0),
+                        "topic_body_char_count": int(row.get("topic_body_char_count") or 0),
+                        "opened_at": (
+                            pd.to_datetime(row.get("opened_at"), utc=True).isoformat()
+                            if pd.notna(row.get("opened_at"))
+                            else None
+                        ),
+                        "sealed_at": (
+                            pd.to_datetime(row.get("sealed_at"), utc=True).isoformat()
+                            if pd.notna(row.get("sealed_at"))
+                            else None
+                        ),
                         "prev_capsule_id": str(row.get("prev_capsule_id") or ""),
                         "next_capsule_id": str(row.get("next_capsule_id") or ""),
                         "back_link_ids": json.loads(str(row.get("back_link_ids_json") or "[]")),
@@ -4003,6 +4375,8 @@ class DataFrameStore:
 
         _write_partitioned(state.messages_df, "messages")
         _write_partitioned(state.capsules_df, "capsules")
+        _write_partitioned(state.beliefs_df, "beliefs")
+        _write_partitioned(state.projections_df, "projections")
         _write_partitioned(state.session_rollups_df, "session_rollups")
         _write_partitioned(state.topics_df, "topics")
         _write_partitioned(state.search_docs_df, "search_docs")
@@ -4046,6 +4420,8 @@ class DataFrameStore:
         self._state = DataFramesState(
             messages_df=_read_all("messages", MESSAGES_COLUMNS),
             capsules_df=_read_all("capsules", CAPSULES_COLUMNS),
+            beliefs_df=_read_all("beliefs", BELIEFS_COLUMNS),
+            projections_df=_read_all("projections", PROJECTIONS_COLUMNS),
             session_rollups_df=_read_all("session_rollups", SESSION_ROLLUPS_COLUMNS),
             topics_df=_read_all("topics", TOPICS_COLUMNS),
             search_docs_df=_read_all("search_docs", SEARCH_DOC_COLUMNS),
