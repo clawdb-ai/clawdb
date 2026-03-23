@@ -129,14 +129,17 @@ def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec
     role = str(payload.get("role") or "").strip().lower()
 
     def _preferred_user_id() -> str:
+        explicit_target = normalize_identity(
+            platform,
+            str(payload.get("projection_target_user_key") or ""),
+            "user",
+        )
+        if explicit_target:
+            return explicit_target
         if role == "assistant":
             candidates = [
                 payload.get("to_user_key"),
-                payload.get("from_user_key"),
-                payload.get("sender_user_key"),
                 payload.get("to_id"),
-                payload.get("from_id"),
-                payload.get("sender_id"),
             ]
         else:
             candidates = [
@@ -182,19 +185,20 @@ def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec
             )
     else:
         user_key = _preferred_user_id()
-        if not user_key:
+        if not user_key and role != "assistant":
             fallback_user = incoming_session_id or str(payload.get("to_id") or payload.get("from_id") or "_")
             user_key = normalize_identity(platform, fallback_user, "user")
-        dm_scope = f"dm:{account_key}:{user_key}"
-        specs.append(
-            ProjectionSpec(
-                kind=PRIVATE_DM_PROJECTION_KIND,
-                scope=dm_scope,
-                session_id=dm_scope,
-                visibility="private",
-                native_session_id=incoming_session_id,
+        if user_key:
+            dm_scope = f"dm:{account_key}:{user_key}"
+            specs.append(
+                ProjectionSpec(
+                    kind=PRIVATE_DM_PROJECTION_KIND,
+                    scope=dm_scope,
+                    session_id=dm_scope,
+                    visibility="private",
+                    native_session_id=incoming_session_id,
+                )
             )
-        )
     deduped: Dict[tuple[str, str], ProjectionSpec] = {}
     for spec in specs:
         deduped[(spec.kind, spec.scope)] = spec
@@ -302,7 +306,11 @@ def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, objec
         "projection_scope": "global",
         "native_session_id": str(payload.get("session_id") or ""),
     }
-    projections = materialize_projection_rows(raw_row)
+    projection_source = dict(raw_row)
+    projection_target_user_key = str(payload.get("projection_target_user_key") or "").strip()
+    if projection_target_user_key:
+        projection_source["projection_target_user_key"] = projection_target_user_key
+    projections = materialize_projection_rows(projection_source)
     return {
         "tenant_id": str(payload.get("tenant_id") or "default"),
         "session_id": str(payload.get("session_id") or ""),

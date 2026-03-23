@@ -522,7 +522,26 @@ class ClawDBService:
                 "topic_confidence": topic_confidence,
             }
         )
-        payload = materialize_message_bundle(req_with_topic.model_dump(mode="json"))
+        payload_input = req_with_topic.model_dump(mode="json")
+        if (
+            str(req_with_topic.role or "").strip().lower() == "assistant"
+            and str(req_with_topic.to_id or "").strip() == ""
+            and str(req_with_topic.chat_type or "").strip().lower() in {"direct", "group"}
+        ):
+            projection_target_user_key = await self.df_store.infer_projection_target_user_key(
+                tenant_id=req_with_topic.tenant_id,
+                platform=normalized_platform,
+                account_id=req_with_topic.account_id,
+                chat_type=req_with_topic.chat_type,
+                session_id=req_with_topic.session_id,
+                group_id=req_with_topic.group_id,
+                reply_to_id=req_with_topic.reply_to_id,
+                thread_parent_id=req_with_topic.thread_parent_id,
+                message_thread_id=req_with_topic.message_thread_id,
+            )
+            if projection_target_user_key:
+                payload_input["projection_target_user_key"] = projection_target_user_key
+        payload = materialize_message_bundle(payload_input)
         origin_message_id = str(payload["origin_message_id"])
         lock_key = f"message:{req_with_topic.tenant_id}:{origin_message_id}"
         async with self.lock_manager.acquire(lock_key, LockRank.SESSION):

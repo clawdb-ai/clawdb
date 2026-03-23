@@ -1030,6 +1030,52 @@ def materialize_embedding_index_metadata(
     return frame[EMBEDDING_INDEX_METADATA_COLUMNS].reset_index(drop=True)
 
 
+def _infer_projection_target_user_key(rows: pd.DataFrame) -> Optional[str]:
+    if rows.empty:
+        return None
+    scoped = rows.copy()
+    scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
+    scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
+    scoped["origin_message_id"] = scoped["origin_message_id"].fillna(scoped["message_id"]).astype(str)
+    scoped = scoped.sort_values(
+        ["ts", "updated_at", "origin_message_id"],
+        ascending=[False, False, False],
+        kind="stable",
+    )
+
+    def _row_user_key(row: pd.Series) -> str:
+        role = str(row.get("role") or "").strip().lower()
+        if role == "assistant":
+            normalized_columns = ["to_user_key", "sender_user_key", "from_user_key"]
+            raw_columns = ["to_id", "sender_id", "from_id"]
+        else:
+            normalized_columns = ["sender_user_key", "from_user_key", "to_user_key"]
+            raw_columns = ["sender_id", "from_id", "to_id"]
+        for column in normalized_columns:
+            value = str(row.get(column) or "").strip()
+            if value:
+                return value
+        platform = normalize_platform(str(row.get("platform") or "") or None)
+        for column in raw_columns:
+            try:
+                value = normalize_identity(platform, str(row.get(column) or ""), "user")
+            except ValueError:
+                value = ""
+            if value:
+                return value
+        return ""
+
+    for include_assistant_rows in (False, True):
+        for _, row in scoped.iterrows():
+            role = str(row.get("role") or "").strip().lower()
+            if not include_assistant_rows and role == "assistant":
+                continue
+            user_key = _row_user_key(row)
+            if user_key:
+                return user_key
+    return None
+
+
 class DataFrameStore:
     def __init__(self) -> None:
         self._state = DataFramesState(
@@ -2713,6 +2759,103 @@ class DataFrameStore:
                     f"platform_message_id resolved to multiple origin_message_id values: {platform_message_id_text}"
                 )
             return str(matches[0])
+
+    async def infer_projection_target_user_key(
+        self,
+        *,
+        tenant_id: str,
+        platform: Optional[str] = None,
+        account_id: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        group_id: Optional[str] = None,
+        reply_to_id: Optional[str] = None,
+        thread_parent_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        resolved_platform = normalize_platform(str(platform)) if str(platform or "").strip() else None
+        resolved_chat_type = str(chat_type or "").strip().lower()
+        async with self._lock:
+            df = self._state.messages_df
+            if df.empty:
+                return None
+            scoped = df[
+                (df["tenant_id"].astype(str) == str(tenant_id))
+                & (df["projection_kind"].astype(str) == RAW_PROJECTION_KIND)
+                & (df["message_state"].astype(str) != MESSAGE_STATE_DELETED)
+            ].copy()
+            if scoped.empty:
+                return None
+            if resolved_platform is not None:
+                scoped = scoped[scoped["platform"].astype(str) == str(resolved_platform)]
+                if scoped.empty:
+                    return None
+            account_text = str(account_id or "").strip()
+            if account_text:
+                account_candidates = {account_text}
+                if resolved_platform is not None:
+                    try:
+                        account_candidates.add(
+                            normalize_identity(str(resolved_platform), account_text, "account")
+                        )
+                    except ValueError:
+                        pass
+                scoped = scoped[
+                    scoped["account_id"].astype(str).isin(account_candidates)
+                    | scoped["account_key"].astype(str).isin(account_candidates)
+                ]
+                if scoped.empty:
+                    return None
+            group_text = str(group_id or "").strip()
+            if group_text:
+                group_candidates = {group_text}
+                if resolved_platform is not None:
+                    try:
+                        group_candidates.add(
+                            normalize_identity(str(resolved_platform), group_text, "chat")
+                        )
+                    except ValueError:
+                        pass
+                scoped = scoped[
+                    scoped["group_id"].astype(str).isin(group_candidates)
+                    | scoped["group_chat_key"].astype(str).isin(group_candidates)
+                ]
+                if scoped.empty:
+                    return None
+            if resolved_chat_type:
+                scoped = scoped[scoped["chat_type"].astype(str) == resolved_chat_type]
+                if scoped.empty:
+                    return None
+
+            reference_frames: List[pd.DataFrame] = []
+            for reference_id in [reply_to_id, thread_parent_id]:
+                reference_text = str(reference_id or "").strip()
+                if not reference_text:
+                    continue
+                matched = scoped[
+                    (scoped["origin_message_id"].astype(str) == reference_text)
+                    | (scoped["platform_message_id"].astype(str) == reference_text)
+                ]
+                if not matched.empty:
+                    reference_frames.append(matched)
+
+            message_thread_text = str(message_thread_id or "").strip()
+            if message_thread_text:
+                matched = scoped[scoped["message_thread_id"].astype(str) == message_thread_text]
+                if not matched.empty:
+                    reference_frames.append(matched)
+
+            session_text = str(session_id or "").strip()
+            if session_text and resolved_chat_type == "direct":
+                matched = scoped[scoped["native_session_id"].astype(str) == session_text]
+                if not matched.empty:
+                    reference_frames.append(matched)
+
+            for frame in reference_frames:
+                user_key = _infer_projection_target_user_key(frame)
+                if user_key:
+                    return user_key
+            return None
 
     async def edit_message(
         self,
