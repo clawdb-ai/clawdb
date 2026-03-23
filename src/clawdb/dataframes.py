@@ -345,6 +345,13 @@ def _utc_timestamp(value: object) -> pd.Timestamp:
     return ts
 
 
+def _iso_timestamp_or_none(value: object) -> Optional[str]:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return ts.isoformat()
+
+
 def _rollup_period_start(
     ts: pd.Timestamp,
     window_kind: str,
@@ -2649,6 +2656,43 @@ class DataFrameStore:
                 )
             self._invalidate_sessions_index_locked()
 
+    def _ensure_projection_sessions_locked(
+        self,
+        *,
+        tenant_id: str,
+        session_ids: Sequence[str],
+        created_at: object,
+    ) -> None:
+        missing_session_ids = [
+            str(session_id)
+            for session_id in sorted({str(item) for item in session_ids if str(item)})
+            if not self._session_exists_locked(str(tenant_id), str(session_id))
+        ]
+        if not missing_session_ids:
+            return
+        created_at_ts = _utc_timestamp(created_at)
+        row_df = pd.DataFrame(
+            [
+                {
+                    "tenant_id": str(tenant_id),
+                    "session_id": session_id,
+                    "parent_session_id": "",
+                    "origin": "projection",
+                    "created_at": created_at_ts,
+                }
+                for session_id in missing_session_ids
+            ],
+            columns=SESSIONS_COLUMNS,
+        )
+        if self._state.sessions_df.empty:
+            self._state.sessions_df = row_df
+        else:
+            self._state.sessions_df = pd.concat(
+                [self._state.sessions_df, row_df],
+                ignore_index=True,
+            )
+        self._invalidate_sessions_index_locked()
+
     async def add_message(self, payload: Dict[str, object]) -> None:
         await self.apply_message_bundle(materialize_message_bundle(payload))
 
@@ -2671,6 +2715,19 @@ class DataFrameStore:
                 & (self._state.messages_df["origin_message_id"].astype(str) == origin_message_id)
             ]
             replaced_existing = not existing.empty
+            preserved_projection_messages = pd.DataFrame(columns=MESSAGES_COLUMNS)
+            if replaced_existing:
+                raw_row_df = pd.DataFrame([dict(bundle["raw_message"])], columns=MESSAGES_COLUMNS)
+                canonical_projection_df = pd.DataFrame(projections, columns=MESSAGES_COLUMNS)
+                preserved_projection_messages = _preserved_projection_messages(
+                    existing,
+                    raw_row_df,
+                    canonical_projection_df,
+                )
+                for column in ["ts", "updated_at", "deleted_at"]:
+                    preserved_projection_messages[column] = preserved_projection_messages[column].apply(
+                        _iso_timestamp_or_none
+                    )
             if replaced_existing:
                 self._state.messages_df = self._state.messages_df[
                     ~(
@@ -2679,6 +2736,8 @@ class DataFrameStore:
                     )
                 ]
             rows = [dict(bundle["raw_message"]), *[dict(item) for item in projections]]
+            if not preserved_projection_messages.empty:
+                rows.extend(preserved_projection_messages.to_dict("records"))
             row_df = pd.DataFrame(rows, columns=MESSAGES_COLUMNS)
             if self._state.messages_df.empty:
                 self._state.messages_df = row_df
@@ -2687,20 +2746,33 @@ class DataFrameStore:
                     [self._state.messages_df, row_df],
                     ignore_index=True,
                 )
+            projection_session_ids = [str(item.get("session_id") or "") for item in projections]
+            if not preserved_projection_messages.empty:
+                projection_session_ids.extend(
+                    preserved_projection_messages["session_id"].astype(str).tolist()
+                )
+            self._ensure_projection_sessions_locked(
+                tenant_id=tenant_id,
+                session_ids=projection_session_ids,
+                created_at=bundle["raw_message"].get("ts"),
+            )
             self._invalidate_messages_index_locked()
             self._refresh_first_class_state_locked(vector_dim=vector_dim)
             self._rebuild_embedding_index_metadata_locked()
             affected_sessions = sorted(
                 {
                     str(row.get("session_id") or "")
-                    for row in projections
-                    if str(row.get("session_id") or "")
+                    for row in row_df.to_dict("records")
+                    if str(row.get("projection_kind") or "") != RAW_PROJECTION_KIND
+                    and str(row.get("session_id") or "")
                 }
             )
             return MessageUpsertResult(
                 origin_message_id=origin_message_id,
                 affected_sessions=affected_sessions,
-                affected_projections=len(projections),
+                affected_projections=int(
+                    row_df[row_df["projection_kind"].astype(str) != RAW_PROJECTION_KIND].shape[0]
+                ),
                 replaced_existing=replaced_existing,
             )
 
