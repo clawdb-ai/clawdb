@@ -71,16 +71,23 @@ Observations:
 ## Quick Start
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-uvicorn clawdb.api:app --reload
+uv sync --extra dev
+uv run python -m uvicorn clawdb.api:app --reload
 ```
 
-Run tests:
+### Python Dependencies
+
+`pyproject.toml` is the source of truth for Python dependencies and is installable with `uv sync --extra dev`.
+
+- Runtime: `fastapi`, `uvicorn`, `pydantic`, `numpy`, `scipy`, `pandas`, `pyarrow`, `prometheus-client`, `httpx`, `pyzmq`, `typing-extensions`
+- Dev extra: `pytest`, `pytest-asyncio`
+
+Local validation note:
+- `.venv/` and `tests/` are local validation artifacts and stay gitignored.
+- If your local checkout includes `tests/`, run:
 
 ```bash
-python3 -m pytest -q tests
+uv run pytest -q tests
 ```
 
 Run OpenClaw integration smoke:

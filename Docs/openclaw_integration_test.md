@@ -18,13 +18,15 @@ This performs:
 ## 2) Start clawdb service
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[dev]'
-./scripts/run_local.sh
+uv sync --extra dev
+uv run ./scripts/run_local.sh
 ```
 
 Service default endpoint: `http://127.0.0.1:8080`
+
+Dependency note:
+- `pyproject.toml` is the Python dependency source of truth for `uv`.
+- `.venv/` and `tests/` remain local-only validation artifacts and are not expected in every Git checkout.
 
 ## 3) Validate clawdb health
 
