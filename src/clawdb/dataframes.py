@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +17,7 @@ from .lineage import (
     materialize_message_bundle,
 )
 from .models import SearchResult, WalRecord
+from .topics import _vectorize
 
 
 MESSAGES_COLUMNS = [
@@ -72,6 +75,26 @@ CAPSULES_COLUMNS = [
     "updated_at",
 ]
 
+SESSION_ROLLUPS_COLUMNS = [
+    "rollup_id",
+    "tenant_id",
+    "session_id",
+    "window_kind",
+    "window_key",
+    "bucket_start",
+    "bucket_end",
+    "source_first_ts",
+    "source_last_ts",
+    "message_count",
+    "content_char_count",
+    "summary",
+    "vector_text",
+    "vector_ref",
+    "vector_dim",
+    "vector_json",
+    "updated_at",
+]
+
 CACHE_INDEX_COLUMNS = [
     "key",
     "tenant_id",
@@ -121,6 +144,13 @@ CAPSULE_MULTIINDEX_LEVELS = [
     "capsule_id",
 ]
 
+SESSION_ROLLUP_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "session_id",
+    "window_kind",
+    "window_key",
+]
+
 SESSION_MULTIINDEX_LEVELS = [
     "tenant_id",
     "session_id",
@@ -145,6 +175,7 @@ CACHE_LOOKUP_MULTIINDEX_LEVELS = [
 class DataFramesState:
     messages_df: pd.DataFrame
     capsules_df: pd.DataFrame
+    session_rollups_df: pd.DataFrame
     cache_index_df: pd.DataFrame
     sessions_df: pd.DataFrame
     snapshots_df: pd.DataFrame
@@ -166,11 +197,224 @@ class MessageUpsertResult:
     replaced_existing: bool
 
 
+ROLLUP_WINDOW_KINDS = (
+    "daily",
+    "weekly",
+    "monthly",
+    "quarterly",
+    "yearly",
+    "lifetime",
+)
+ROLLUP_SUMMARY_MAX_CHARS = 4000
+DEFAULT_ROLLUP_VECTOR_DIM = 64
+
+
+def _utc_timestamp(value: object) -> pd.Timestamp:
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if pd.isna(ts):
+        return pd.Timestamp.now(tz="UTC")
+    return ts
+
+
+def _rollup_period_start(
+    ts: pd.Timestamp,
+    window_kind: str,
+    lifetime_start: pd.Timestamp,
+) -> pd.Timestamp:
+    normalized = _utc_timestamp(ts)
+    if window_kind == "daily":
+        return normalized.floor("D")
+    if window_kind == "weekly":
+        day_start = normalized.floor("D")
+        return day_start - pd.Timedelta(days=int(day_start.weekday()))
+    if window_kind == "monthly":
+        return pd.Timestamp(year=normalized.year, month=normalized.month, day=1, tz="UTC")
+    if window_kind == "quarterly":
+        month = ((int(normalized.month) - 1) // 3) * 3 + 1
+        return pd.Timestamp(year=normalized.year, month=month, day=1, tz="UTC")
+    if window_kind == "yearly":
+        return pd.Timestamp(year=normalized.year, month=1, day=1, tz="UTC")
+    return _utc_timestamp(lifetime_start)
+
+
+def _rollup_period_end(
+    bucket_start: pd.Timestamp,
+    window_kind: str,
+    source_last_ts: pd.Timestamp,
+) -> pd.Timestamp:
+    start = _utc_timestamp(bucket_start)
+    if window_kind == "daily":
+        return start + pd.Timedelta(days=1)
+    if window_kind == "weekly":
+        return start + pd.Timedelta(days=7)
+    if window_kind == "monthly":
+        if start.month == 12:
+            return pd.Timestamp(year=start.year + 1, month=1, day=1, tz="UTC")
+        return pd.Timestamp(year=start.year, month=start.month + 1, day=1, tz="UTC")
+    if window_kind == "quarterly":
+        month = start.month + 3
+        year = start.year
+        if month > 12:
+            month -= 12
+            year += 1
+        return pd.Timestamp(year=year, month=month, day=1, tz="UTC")
+    if window_kind == "yearly":
+        return pd.Timestamp(year=start.year + 1, month=1, day=1, tz="UTC")
+    return _utc_timestamp(source_last_ts)
+
+
+def _rollup_window_key(bucket_start: pd.Timestamp, window_kind: str) -> str:
+    start = _utc_timestamp(bucket_start)
+    if window_kind == "daily":
+        return start.strftime("%Y-%m-%d")
+    if window_kind == "weekly":
+        iso = start.isocalendar()
+        return f"{int(iso.year):04d}-W{int(iso.week):02d}"
+    if window_kind == "monthly":
+        return start.strftime("%Y-%m")
+    if window_kind == "quarterly":
+        quarter = ((int(start.month) - 1) // 3) + 1
+        return f"{int(start.year):04d}-Q{quarter}"
+    if window_kind == "yearly":
+        return start.strftime("%Y")
+    return "lifetime"
+
+
+def _render_rollup_summary(
+    *,
+    window_kind: str,
+    window_key: str,
+    ordered: pd.DataFrame,
+    source_first_ts: pd.Timestamp,
+    source_last_ts: pd.Timestamp,
+    message_count: int,
+    content_char_count: int,
+) -> str:
+    header = (
+        f"{window_kind}:{window_key} "
+        f"messages={message_count} "
+        f"chars={content_char_count} "
+        f"coverage={_utc_timestamp(source_first_ts).isoformat()}..{_utc_timestamp(source_last_ts).isoformat()}"
+    )
+    lines: List[str] = []
+    for _, row in ordered.iterrows():
+        content = str(row.get("content") or "")
+        if not content:
+            continue
+        lines.append(f"[{str(row.get('role') or 'user')}] {content}")
+    if not lines:
+        return header
+    body = "\n".join(lines)
+    summary = f"{header}\n{body}"
+    if len(summary) <= ROLLUP_SUMMARY_MAX_CHARS:
+        return summary
+    ellipsis = "\n...\n"
+    budget = max(0, ROLLUP_SUMMARY_MAX_CHARS - len(header) - len(ellipsis))
+    if budget <= 0:
+        return header[:ROLLUP_SUMMARY_MAX_CHARS]
+    return f"{header}{ellipsis}{body[-budget:]}"
+
+
+def _serialize_vector(text: str, dim: int) -> str:
+    vec = [round(float(item), 8) for item in _vectorize(text, max(8, int(dim)))]
+    return json.dumps(vec, separators=(",", ":"))
+
+
+def materialize_session_rollups(
+    messages_frame: pd.DataFrame,
+    *,
+    vector_dim: int = DEFAULT_ROLLUP_VECTOR_DIM,
+) -> pd.DataFrame:
+    if messages_frame.empty:
+        return pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS)
+    scoped = messages_frame.copy().reset_index(drop=True)
+    if "projection_kind" not in scoped.columns or "message_state" not in scoped.columns:
+        return pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS)
+    scoped = scoped[scoped["projection_kind"].astype(str) != RAW_PROJECTION_KIND]
+    scoped = scoped[scoped["message_state"].astype(str) != MESSAGE_STATE_DELETED]
+    scoped = scoped[scoped["session_id"].astype(str) != ""]
+    if scoped.empty:
+        return pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS)
+    scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+    scoped["session_id"] = scoped["session_id"].fillna("").astype(str)
+    scoped["role"] = scoped["role"].fillna("user").astype(str)
+    scoped["content"] = scoped["content"].fillna("").astype(str)
+    scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
+    scoped = scoped[scoped["ts"].notna()]
+    if scoped.empty:
+        return pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS)
+
+    rows: List[Dict[str, object]] = []
+    materialized_at = pd.Timestamp.utcnow()
+    resolved_vector_dim = max(8, int(vector_dim))
+    for (tenant_id, session_id), session_subset in scoped.groupby(["tenant_id", "session_id"], sort=True):
+        ordered = session_subset.sort_values("ts", kind="stable").reset_index(drop=True)
+        lifetime_start = _utc_timestamp(ordered["ts"].min())
+        for window_kind in ROLLUP_WINDOW_KINDS:
+            bucketed = ordered.copy()
+            bucketed["_bucket_start"] = bucketed["ts"].apply(
+                lambda value: _rollup_period_start(
+                    _utc_timestamp(value),
+                    window_kind,
+                    lifetime_start,
+                )
+            )
+            for bucket_start, bucket in bucketed.groupby("_bucket_start", sort=True):
+                bucket_start_ts = _utc_timestamp(bucket_start)
+                bucket_ordered = bucket.sort_values("ts", kind="stable").reset_index(drop=True)
+                source_first_ts = _utc_timestamp(bucket_ordered["ts"].min())
+                source_last_ts = _utc_timestamp(bucket_ordered["ts"].max())
+                window_key = _rollup_window_key(bucket_start_ts, window_kind)
+                summary = _render_rollup_summary(
+                    window_kind=window_kind,
+                    window_key=window_key,
+                    ordered=bucket_ordered,
+                    source_first_ts=source_first_ts,
+                    source_last_ts=source_last_ts,
+                    message_count=int(bucket_ordered.shape[0]),
+                    content_char_count=int(bucket_ordered["content"].astype(str).map(len).sum()),
+                )
+                vector_text = summary
+                rows.append(
+                    {
+                        "rollup_id": f"rollup:{tenant_id}:{session_id}:{window_kind}:{window_key}",
+                        "tenant_id": str(tenant_id),
+                        "session_id": str(session_id),
+                        "window_kind": window_kind,
+                        "window_key": window_key,
+                        "bucket_start": bucket_start_ts,
+                        "bucket_end": _rollup_period_end(bucket_start_ts, window_kind, source_last_ts),
+                        "source_first_ts": source_first_ts,
+                        "source_last_ts": source_last_ts,
+                        "message_count": int(bucket_ordered.shape[0]),
+                        "content_char_count": int(bucket_ordered["content"].astype(str).map(len).sum()),
+                        "summary": summary,
+                        "vector_text": vector_text,
+                        "vector_ref": (
+                            "session_rollup:"
+                            f"{hashlib.sha256(vector_text.encode('utf-8')).hexdigest()}"
+                        ),
+                        "vector_dim": resolved_vector_dim,
+                        "vector_json": _serialize_vector(vector_text, resolved_vector_dim),
+                        "updated_at": materialized_at,
+                    }
+                )
+    if not rows:
+        return pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS)
+    frame = pd.DataFrame(rows, columns=SESSION_ROLLUPS_COLUMNS)
+    for col in ["bucket_start", "bucket_end", "source_first_ts", "source_last_ts", "updated_at"]:
+        frame[col] = pd.to_datetime(frame[col], utc=True, errors="coerce")
+    for col in ["message_count", "content_char_count", "vector_dim"]:
+        frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0).astype(int)
+    return frame[SESSION_ROLLUPS_COLUMNS]
+
+
 class DataFrameStore:
     def __init__(self) -> None:
         self._state = DataFramesState(
             messages_df=pd.DataFrame(columns=MESSAGES_COLUMNS),
             capsules_df=pd.DataFrame(columns=CAPSULES_COLUMNS),
+            session_rollups_df=pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS),
             cache_index_df=pd.DataFrame(columns=CACHE_INDEX_COLUMNS),
             sessions_df=pd.DataFrame(columns=SESSIONS_COLUMNS),
             snapshots_df=pd.DataFrame(columns=SNAPSHOTS_COLUMNS),
@@ -216,6 +460,22 @@ class DataFrameStore:
                 "message_state": "string",
             }
         )
+        self._state.session_rollups_df = self._state.session_rollups_df.astype(
+            {
+                "rollup_id": "string",
+                "tenant_id": "string",
+                "session_id": "string",
+                "window_kind": "string",
+                "window_key": "string",
+                "summary": "string",
+                "vector_text": "string",
+                "vector_ref": "string",
+                "vector_dim": "int64",
+                "vector_json": "string",
+                "message_count": "int64",
+                "content_char_count": "int64",
+            }
+        )
         self._state.sessions_df = self._state.sessions_df.astype(
             {
                 "tenant_id": "string",
@@ -238,6 +498,8 @@ class DataFrameStore:
         self._messages_index_dirty = True
         self._capsules_indexed_df: Optional[pd.DataFrame] = None
         self._capsules_index_dirty = True
+        self._session_rollups_indexed_df: Optional[pd.DataFrame] = None
+        self._session_rollups_index_dirty = True
         self._sessions_indexed_df: Optional[pd.DataFrame] = None
         self._sessions_index_dirty = True
         self._snapshots_indexed_df: Optional[pd.DataFrame] = None
@@ -252,6 +514,10 @@ class DataFrameStore:
     def _invalidate_capsules_index_locked(self) -> None:
         self._capsules_indexed_df = None
         self._capsules_index_dirty = True
+
+    def _invalidate_session_rollups_index_locked(self) -> None:
+        self._session_rollups_indexed_df = None
+        self._session_rollups_index_dirty = True
 
     def _invalidate_sessions_index_locked(self) -> None:
         self._sessions_indexed_df = None
@@ -268,6 +534,7 @@ class DataFrameStore:
     def _invalidate_all_indexes_locked(self) -> None:
         self._invalidate_messages_index_locked()
         self._invalidate_capsules_index_locked()
+        self._invalidate_session_rollups_index_locked()
         self._invalidate_sessions_index_locked()
         self._invalidate_snapshots_index_locked()
         self._invalidate_cache_lookup_index_locked()
@@ -426,6 +693,53 @@ class DataFrameStore:
             (indexed["tenant_id"].astype(str) == str(tenant_id))
             & (indexed["session_id"].astype(str).isin(session_ids))
         ]
+        if scoped.empty:
+            return indexed.iloc[0:0].copy()
+        return scoped
+
+    def _build_session_rollups_index_locked(self) -> pd.DataFrame:
+        df = self._state.session_rollups_df
+        if df.empty:
+            empty = df.copy()
+            self._session_rollups_indexed_df = empty.set_index(
+                SESSION_ROLLUP_MULTIINDEX_LEVELS,
+                drop=False,
+            )
+            self._session_rollups_index_dirty = False
+            return self._session_rollups_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["session_id"] = indexed["session_id"].fillna("default").astype(str)
+        indexed["window_kind"] = indexed["window_kind"].fillna("").astype(str)
+        indexed["window_key"] = indexed["window_key"].fillna("").astype(str)
+        indexed["bucket_start"] = pd.to_datetime(indexed["bucket_start"], utc=True, errors="coerce")
+        indexed["updated_at"] = pd.to_datetime(indexed["updated_at"], utc=True, errors="coerce")
+        indexed = indexed.set_index(SESSION_ROLLUP_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._session_rollups_indexed_df = indexed
+        self._session_rollups_index_dirty = False
+        return indexed
+
+    def _session_rollups_for_query_locked(
+        self,
+        tenant_id: str,
+        session_id: str,
+        window_kind: Optional[str] = None,
+    ) -> pd.DataFrame:
+        if self._session_rollups_index_dirty or self._session_rollups_indexed_df is None:
+            indexed = self._build_session_rollups_index_locked()
+        else:
+            indexed = self._session_rollups_indexed_df
+        if indexed.empty:
+            return indexed
+        session_ids = self._resolve_session_ids_locked(tenant_id, str(session_id))
+        if not session_ids:
+            session_ids = [str(session_id)]
+        scoped = indexed[
+            (indexed["tenant_id"].astype(str) == str(tenant_id))
+            & (indexed["session_id"].astype(str).isin(session_ids))
+        ]
+        if window_kind is not None:
+            scoped = scoped[scoped["window_kind"].astype(str) == str(window_kind)]
         if scoped.empty:
             return indexed.iloc[0:0].copy()
         return scoped
@@ -756,6 +1070,48 @@ class DataFrameStore:
             )
             return int(scoped.shape[0])
 
+    async def rebuild_all_session_rollups(self, *, vector_dim: int = DEFAULT_ROLLUP_VECTOR_DIM) -> int:
+        async with self._lock:
+            self._state.session_rollups_df = materialize_session_rollups(
+                self._state.messages_df,
+                vector_dim=vector_dim,
+            )
+            self._invalidate_session_rollups_index_locked()
+            return int(self._state.session_rollups_df.shape[0])
+
+    async def refresh_session_rollups(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        vector_dim: int = DEFAULT_ROLLUP_VECTOR_DIM,
+    ) -> int:
+        async with self._lock:
+            session_ids = self._resolve_session_ids_locked(tenant_id, str(session_id))
+            if not session_ids:
+                session_ids = [str(session_id)]
+            self._state.session_rollups_df = self._state.session_rollups_df[
+                ~(
+                    (self._state.session_rollups_df["tenant_id"].astype(str) == str(tenant_id))
+                    & (self._state.session_rollups_df["session_id"].astype(str).isin(session_ids))
+                )
+            ]
+            subset = self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                row_mode="projection",
+            )
+            materialized = materialize_session_rollups(subset, vector_dim=vector_dim)
+            if materialized.empty:
+                self._invalidate_session_rollups_index_locked()
+                return 0
+            self._state.session_rollups_df = pd.concat(
+                [self._state.session_rollups_df, materialized[SESSION_ROLLUPS_COLUMNS]],
+                ignore_index=True,
+            )
+            self._invalidate_session_rollups_index_locked()
+            return int(materialized.shape[0])
+
     async def refresh_capsules(self, tenant_id: str, session_id: str) -> int:
         async with self._lock:
             session_ids = self._resolve_session_ids_locked(tenant_id, str(session_id))
@@ -778,8 +1134,17 @@ class DataFrameStore:
             rows: List[Dict[str, object]] = []
             for resolved_session_id in sorted(subset["session_id"].astype(str).unique().tolist()):
                 session_subset = subset[subset["session_id"].astype(str) == resolved_session_id]
-                ordered = self._chronological_messages(session_subset)
-                summary = " ".join(ordered["content"].astype(str).tail(20).tolist())[:2000]
+                lifetime_rollups = self._session_rollups_for_query_locked(
+                    tenant_id=tenant_id,
+                    session_id=resolved_session_id,
+                    window_kind="lifetime",
+                )
+                if lifetime_rollups.empty:
+                    ordered = self._chronological_messages(session_subset)
+                    summary = " ".join(ordered["content"].astype(str).tail(20).tolist())[:2000]
+                else:
+                    latest = lifetime_rollups.sort_values("updated_at", kind="stable").iloc[-1]
+                    summary = str(latest.get("summary") or "")
                 rows.append(
                     {
                         "capsule_id": f"caps-{tenant_id}-{resolved_session_id}",
@@ -865,6 +1230,25 @@ class DataFrameStore:
                     ignore_index=True,
                 )
                 self._invalidate_capsules_index_locked()
+            src_rollups = self._state.session_rollups_df[
+                (self._state.session_rollups_df["tenant_id"].astype(str) == tenant_id)
+                & (self._state.session_rollups_df["session_id"].astype(str) == source_session_id)
+            ]
+            if not src_rollups.empty:
+                copied_rollups = src_rollups.copy()
+                copied_rollups["session_id"] = target_session_id
+                copied_rollups["rollup_id"] = copied_rollups.apply(
+                    lambda row: (
+                        f"rollup:{tenant_id}:{target_session_id}:"
+                        f"{str(row.get('window_kind') or '')}:{str(row.get('window_key') or '')}"
+                    ),
+                    axis=1,
+                )
+                self._state.session_rollups_df = pd.concat(
+                    [self._state.session_rollups_df, copied_rollups[SESSION_ROLLUPS_COLUMNS]],
+                    ignore_index=True,
+                )
+                self._invalidate_session_rollups_index_locked()
 
     async def spawn_session(
         self,
@@ -1227,6 +1611,36 @@ class DataFrameStore:
                 )
             return out
 
+    async def session_rollup_cards(self, tenant_id: str, session_id: str) -> List[Dict[str, object]]:
+        async with self._lock:
+            df = self._session_rollups_for_query_locked(tenant_id, session_id)
+            if df.empty:
+                return []
+            df = df.reset_index(drop=True).sort_values(
+                ["bucket_start", "window_kind"],
+                kind="stable",
+                ascending=[True, True],
+            )
+            out: List[Dict[str, object]] = []
+            for _, row in df.iterrows():
+                out.append(
+                    {
+                        "rollup_id": str(row["rollup_id"]),
+                        "window_kind": str(row["window_kind"]),
+                        "window_key": str(row["window_key"]),
+                        "bucket_start": _utc_timestamp(row["bucket_start"]).isoformat(),
+                        "bucket_end": _utc_timestamp(row["bucket_end"]).isoformat(),
+                        "source_first_ts": _utc_timestamp(row["source_first_ts"]).isoformat(),
+                        "source_last_ts": _utc_timestamp(row["source_last_ts"]).isoformat(),
+                        "message_count": int(row.get("message_count") or 0),
+                        "content_char_count": int(row.get("content_char_count") or 0),
+                        "summary": str(row.get("summary") or ""),
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "vector_dim": int(row.get("vector_dim") or 0),
+                    }
+                )
+            return out
+
     async def virtual_memory_file(self, rel_path: str) -> Tuple[str, str]:
         normalized = rel_path.replace("\\", "/").lstrip("/")
         if not normalized.startswith("memory/") or not normalized.endswith(".md"):
@@ -1291,6 +1705,7 @@ class DataFrameStore:
 
         _write_partitioned(state.messages_df, "messages")
         _write_partitioned(state.capsules_df, "capsules")
+        _write_partitioned(state.session_rollups_df, "session_rollups")
         _write_partitioned(state.cache_index_df, "cache_index")
         _write_partitioned(state.sessions_df, "sessions")
         _write_partitioned(state.snapshots_df, "snapshots")
@@ -1324,6 +1739,7 @@ class DataFrameStore:
         self._state = DataFramesState(
             messages_df=_read_all("messages", MESSAGES_COLUMNS),
             capsules_df=_read_all("capsules", CAPSULES_COLUMNS),
+            session_rollups_df=_read_all("session_rollups", SESSION_ROLLUPS_COLUMNS),
             cache_index_df=_read_all("cache_index", CACHE_INDEX_COLUMNS),
             sessions_df=_read_all("sessions", SESSIONS_COLUMNS),
             snapshots_df=_read_all("snapshots", SNAPSHOTS_COLUMNS),

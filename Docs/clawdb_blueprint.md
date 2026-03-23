@@ -337,13 +337,20 @@ The following points were not fully specified yet and must be defined before imp
 
 ### Summary lifecycle
 
-- [ ] Recompute triggers for daily summaries
-- [ ] Recompute triggers for weekly summaries
-- [ ] Recompute triggers for monthly summaries
-- [ ] Recompute triggers for quarterly summaries
-- [ ] Recompute triggers for yearly summaries
-- [ ] Recompute triggers for lifetime summaries
-- [ ] Exact summary storage and vectorization contract
+- [x] Recompute triggers for daily summaries
+  Any message upsert, edit, or delete touching an L1 projection session rebuilds that session's daily rollup rows from the current live projection rows.
+- [x] Recompute triggers for weekly summaries
+  The same projection-session mutation path also rebuilds the affected session's ISO-week rollup rows on Monday-based UTC boundaries.
+- [x] Recompute triggers for monthly summaries
+  Monthly rollups rebuild from the same mutation trigger using UTC calendar-month boundaries per L1 session.
+- [x] Recompute triggers for quarterly summaries
+  Quarterly rollups rebuild from the same mutation trigger using UTC calendar-quarter boundaries per L1 session.
+- [x] Recompute triggers for yearly summaries
+  Yearly rollups rebuild from the same mutation trigger using UTC calendar-year boundaries per L1 session.
+- [x] Recompute triggers for lifetime summaries
+  Lifetime rollups rebuild from the same mutation trigger over the full live projection history of the affected L1 session.
+- [x] Exact summary storage and vectorization contract
+  L1 rollups are materialized as `session_rollups` rows keyed by `(tenant_id, session_id, window_kind, window_key)` with UTC bucket bounds, source coverage timestamps, message and character counts, deterministic summary text, and independent vector payload fields `vector_text`, `vector_ref`, `vector_dim`, and `vector_json`.
 
 ### Topic lifecycle
 

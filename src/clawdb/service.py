@@ -192,6 +192,7 @@ class ClawDBService:
                         affected_projections=len(list(record.payload.get("projections") or [])),
                     )
         await self._rebuild_topic_state_from_store()
+        await self.df_store.rebuild_all_session_rollups(vector_dim=self.config.topic_gep_dim)
 
     async def flush_now(self) -> None:
         await self.df_store.save_parquet(self.config.parquet_dir)
@@ -237,6 +238,11 @@ class ClawDBService:
 
     async def _refresh_impacted_sessions(self, tenant_id: str, session_ids: Sequence[str]) -> None:
         for session_id in sorted({str(item) for item in session_ids if str(item)}):
+            await self.df_store.refresh_session_rollups(
+                tenant_id,
+                session_id,
+                vector_dim=self.config.topic_gep_dim,
+            )
             await self.df_store.refresh_capsules(tenant_id, session_id)
 
     async def _rebuild_topic_state_from_store(self) -> None:

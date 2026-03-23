@@ -16,8 +16,10 @@ from .dataframes import (
     CACHE_INDEX_COLUMNS,
     CAPSULES_COLUMNS,
     MESSAGES_COLUMNS,
+    SESSION_ROLLUPS_COLUMNS,
     SESSIONS_COLUMNS,
     SNAPSHOTS_COLUMNS,
+    materialize_session_rollups,
 )
 from .lineage import (
     MESSAGE_STATE_ACTIVE,
@@ -27,7 +29,7 @@ from .lineage import (
 from .metadata import DataFrameMetadataStore
 
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -61,6 +63,7 @@ class SchemaMigrationResult:
 TABLE_COLUMNS: Mapping[str, List[str]] = {
     "messages": MESSAGES_COLUMNS,
     "capsules": CAPSULES_COLUMNS,
+    "session_rollups": SESSION_ROLLUPS_COLUMNS,
     "cache_index": CACHE_INDEX_COLUMNS,
     "sessions": SESSIONS_COLUMNS,
     "snapshots": SNAPSHOTS_COLUMNS,
@@ -277,6 +280,47 @@ def _normalize_capsules(frame: pd.DataFrame) -> pd.DataFrame:
     return out[CAPSULES_COLUMNS]
 
 
+def _normalize_session_rollups(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "rollup_id": "",
+        "tenant_id": "default",
+        "session_id": "default",
+        "window_kind": "daily",
+        "window_key": "",
+        "bucket_start": pd.Timestamp.now(tz="UTC"),
+        "bucket_end": pd.Timestamp.now(tz="UTC"),
+        "source_first_ts": pd.Timestamp.now(tz="UTC"),
+        "source_last_ts": pd.Timestamp.now(tz="UTC"),
+        "message_count": 0,
+        "content_char_count": 0,
+        "summary": "",
+        "vector_text": "",
+        "vector_ref": "",
+        "vector_dim": 64,
+        "vector_json": "[]",
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+    }
+    out = _ensure_columns(frame, SESSION_ROLLUPS_COLUMNS, defaults)
+    out["rollup_id"] = _fill_string(out["rollup_id"])
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["session_id"] = _fill_string(out["session_id"], "default")
+    out["window_kind"] = _fill_string(out["window_kind"], "daily")
+    out["window_key"] = _fill_string(out["window_key"])
+    out["bucket_start"] = _to_datetime_utc(out["bucket_start"])
+    out["bucket_end"] = _to_datetime_utc(out["bucket_end"])
+    out["source_first_ts"] = _to_datetime_utc(out["source_first_ts"])
+    out["source_last_ts"] = _to_datetime_utc(out["source_last_ts"])
+    out["message_count"] = _to_int(out["message_count"], 0)
+    out["content_char_count"] = _to_int(out["content_char_count"], 0)
+    out["summary"] = _fill_string(out["summary"])
+    out["vector_text"] = _fill_string(out["vector_text"])
+    out["vector_ref"] = _fill_string(out["vector_ref"])
+    out["vector_dim"] = _to_int(out["vector_dim"], 64)
+    out["vector_json"] = _fill_string(out["vector_json"], "[]")
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    return out[SESSION_ROLLUPS_COLUMNS]
+
+
 def _normalize_cache_index(frame: pd.DataFrame) -> pd.DataFrame:
     defaults: Dict[str, object] = {
         "key": "",
@@ -343,6 +387,7 @@ def _normalize_snapshots(frame: pd.DataFrame) -> pd.DataFrame:
 NORMALIZERS: Mapping[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
     "messages": _normalize_messages,
     "capsules": _normalize_capsules,
+    "session_rollups": _normalize_session_rollups,
     "cache_index": _normalize_cache_index,
     "sessions": _normalize_sessions,
     "snapshots": _normalize_snapshots,
@@ -384,7 +429,7 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
 def _partition_value(frame: pd.DataFrame, table: str) -> pd.Series:
     if table == "messages":
         return pd.to_datetime(frame["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-    if table == "capsules":
+    if table in {"capsules", "session_rollups"}:
         return pd.to_datetime(frame["updated_at"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
     if table in {"sessions", "snapshots"}:
         ts_col = "created_at"
@@ -422,6 +467,14 @@ def _resolve_backup_dir(data_root: Path, explicit_backup_dir: Optional[Path]) ->
 def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name, "true" if default else "false").strip().lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _rollup_vector_dim_from_env() -> int:
+    raw = os.getenv("CLAWDB_TOPIC_GEP_DIM", "64").strip()
+    try:
+        return max(8, int(raw))
+    except Exception:
+        return 64
 
 
 def _build_plan_sync(
@@ -570,6 +623,11 @@ async def migrate_schema(
         frame, _ = await asyncio.to_thread(_read_table, parquet_dir, table)
         normalizer = NORMALIZERS[table]
         normalized_tables[table] = await asyncio.to_thread(normalizer, frame)
+    normalized_tables["session_rollups"] = await asyncio.to_thread(
+        materialize_session_rollups,
+        normalized_tables["messages"],
+        vector_dim=_rollup_vector_dim_from_env(),
+    )
 
     tmp_parquet = parquet_dir.parent / f"{parquet_dir.name}.tmp-schema-{timestamp}"
     if tmp_parquet.exists():
