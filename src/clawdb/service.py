@@ -100,6 +100,9 @@ class ClawDBService:
         self._watchdog_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._checkpoint_seq = 0
+        self._semantic_pipeline_async_enabled = (
+            str(self.config.semantic_pipeline_mode or "inline").strip().lower() == "async"
+        )
 
     class BackpressureRejectedError(RuntimeError):
         pass
@@ -111,17 +114,19 @@ class ClawDBService:
             metadata_parquet_path=self.config.metadata_parquet_path,
         )
         await self._load_checkpoint_and_replay()
+        await self.df_store.clear_semantic_jobs()
         self._stop.clear()
         self._flush_task = asyncio.create_task(self._periodic_flush_loop(), name="clawdb-flush")
         self._queue_tasks = []
-        consumers = max(1, int(self.config.queue_consumer_count))
-        for idx in range(consumers):
-            self._queue_tasks.append(
-                asyncio.create_task(
-                    self._queue_consumer_loop(idx),
-                    name=f"clawdb-queue-{idx}",
+        if self._semantic_pipeline_async_enabled:
+            consumers = max(1, int(self.config.queue_consumer_count))
+            for idx in range(consumers):
+                self._queue_tasks.append(
+                    asyncio.create_task(
+                        self._queue_consumer_loop(idx),
+                        name=f"clawdb-queue-{idx}",
+                    )
                 )
-            )
         self._watchdog_task = asyncio.create_task(self._watchdog_loop(), name="clawdb-watchdog")
 
     async def shutdown(self) -> None:
@@ -227,17 +232,12 @@ class ClawDBService:
         async for event in self.queue.consume():
             if self._stop.is_set():
                 break
-            if event.event_type in {
-                "message_upsert",
-                "message_edit",
-                "message_delete",
-                "capsule_refresh",
-                "session_snapshot",
-                "session_fork",
-                "session_spawn",
-            }:
-                # Consumers can add async downstream work here (vector build, cache warm, etc.)
-                _ = worker_id
+            if event.event_type != "semantic_refresh":
+                continue
+            await self._drain_semantic_pipeline_worker(
+                worker_id=f"queue-{worker_id}",
+                raise_on_error=False,
+            )
 
     async def _watchdog_loop(self) -> None:
         while not self._stop.is_set():
@@ -246,6 +246,137 @@ class ClawDBService:
             for alert in alerts:
                 # Keep logging lightweight and structured.
                 print(alert)
+            if not self._semantic_pipeline_async_enabled:
+                continue
+            stats = await self.df_store.semantic_job_stats()
+            if stats.pending <= 0 or stats.running > 0:
+                continue
+            await self._wake_semantic_pipeline(
+                wal_seq=stats.max_wal_seq,
+                tenant_id="*",
+                session_ids=[],
+                cause="watchdog",
+                fallback_inline=True,
+            )
+
+    async def _wake_semantic_pipeline(
+        self,
+        *,
+        wal_seq: int,
+        tenant_id: str,
+        session_ids: Sequence[str],
+        cause: str,
+        fallback_inline: bool = True,
+    ) -> None:
+        if not self._semantic_pipeline_async_enabled:
+            await self._drain_semantic_pipeline_worker(
+                worker_id="inline",
+                raise_on_error=True,
+            )
+            return
+        payload = {
+            "tenant_id": str(tenant_id or "default"),
+            "session_ids": [str(item) for item in session_ids if str(item)],
+            "cause": str(cause or ""),
+        }
+        try:
+            await self.queue.publish(build_event(int(wal_seq), "semantic_refresh", payload))
+        except Exception:
+            if fallback_inline:
+                await self._drain_semantic_pipeline_worker(
+                    worker_id="fallback",
+                    raise_on_error=True,
+                )
+            else:
+                raise
+
+    async def _run_semantic_job(
+        self,
+        *,
+        worker_id: str,
+        claim,
+        raise_on_error: bool,
+    ) -> None:
+        try:
+            async with self.lock_manager.acquire("semantic:index", LockRank.INDEX):
+                await self.df_store.rebuild_all_topics(vector_dim=self.config.topic_gep_dim)
+                await self._rebuild_topic_state_from_store(rebuild_materialized_topics=False)
+            await self._refresh_impacted_sessions(claim.tenant_id, claim.impacted_sessions)
+            async with self.lock_manager.acquire("semantic:index", LockRank.INDEX):
+                await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
+                self._invalidate_query_state()
+            await self.df_store.complete_semantic_job(
+                job_id=claim.job_id,
+                worker_id=worker_id,
+                claimed_wal_seq=claim.claimed_wal_seq,
+                retry_delay_seconds=self.config.semantic_retry_delay_seconds,
+            )
+        except Exception as exc:
+            await self.df_store.complete_semantic_job(
+                job_id=claim.job_id,
+                worker_id=worker_id,
+                claimed_wal_seq=claim.claimed_wal_seq,
+                retry_delay_seconds=self.config.semantic_retry_delay_seconds,
+                error=str(exc),
+            )
+            if raise_on_error:
+                raise
+            print(
+                json.dumps(
+                    {
+                        "event": "semantic.pipeline.error",
+                        "worker_id": worker_id,
+                        "tenant_id": claim.tenant_id,
+                        "job_id": claim.job_id,
+                        "error": str(exc),
+                    }
+                )
+            )
+
+    async def _drain_semantic_pipeline_worker(
+        self,
+        *,
+        worker_id: str,
+        raise_on_error: bool,
+        timeout_seconds: Optional[float] = None,
+    ) -> int:
+        processed = 0
+        deadline = (
+            monotonic() + max(0.1, float(timeout_seconds))
+            if timeout_seconds is not None
+            else None
+        )
+        while True:
+            claim = await self.df_store.claim_next_semantic_job(
+                worker_id=worker_id,
+                lease_seconds=self.config.semantic_job_lease_seconds,
+            )
+            if claim is None:
+                stats = await self.df_store.semantic_job_stats()
+                if stats.running == 0:
+                    return processed
+                if deadline is not None and monotonic() >= deadline:
+                    raise TimeoutError("semantic pipeline drain timed out while jobs were still running")
+                await asyncio.sleep(0.01)
+                continue
+            await self._run_semantic_job(
+                worker_id=worker_id,
+                claim=claim,
+                raise_on_error=raise_on_error,
+            )
+            processed += 1
+            if deadline is not None and monotonic() >= deadline:
+                stats = await self.df_store.semantic_job_stats()
+                if stats.total > 0:
+                    raise TimeoutError("semantic pipeline drain timed out before backlog reached zero")
+                return processed
+
+    async def drain_semantic_pipeline(self, timeout_seconds: float = 15.0) -> int:
+        return await self._drain_semantic_pipeline_worker(
+            worker_id=f"drain-{uuid4().hex[:8]}",
+            raise_on_error=True,
+            timeout_seconds=timeout_seconds,
+        )
 
     def _invalidate_query_state(self) -> None:
         self._search_cache.clear()
@@ -323,13 +454,15 @@ class ClawDBService:
         poll_interval_ms = max(1, int(self.config.ingest_backpressure_poll_interval_ms))
         started = monotonic()
         while True:
-            lag = await self.queue.lag()
-            if lag <= threshold:
+            queue_lag = await self.queue.lag()
+            semantic_stats = await self.df_store.semantic_job_stats()
+            backlog = max(queue_lag, semantic_stats.pending + semantic_stats.running)
+            if backlog <= threshold:
                 return
             elapsed_ms = (monotonic() - started) * 1000.0
             if elapsed_ms >= max_wait_ms:
                 raise ClawDBService.BackpressureRejectedError(
-                    f"ingest backpressure: queue lag {lag} exceeds threshold {threshold}"
+                    f"ingest backpressure: semantic backlog {backlog} exceeds threshold {threshold}"
                 )
             await asyncio.sleep(poll_interval_ms / 1000.0)
 
@@ -380,11 +513,12 @@ class ClawDBService:
                     return cached_ack
             record = await self.wal.append("message_upsert", payload)
             upsert_result = await self.df_store.apply_message_bundle(payload)
-            self._invalidate_query_state()
-            await self.queue.publish(build_event(record.seq, "message_upsert", payload))
-            await self._rebuild_topic_state_from_store()
-            await self._refresh_impacted_sessions(req_with_topic.tenant_id, upsert_result.affected_sessions)
-            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
+            await self.df_store.enqueue_semantic_refresh(
+                tenant_id=req_with_topic.tenant_id,
+                wal_seq=record.seq,
+                session_ids=upsert_result.affected_sessions,
+                cause="message_upsert",
+            )
             ack = MessageAck(
                 wal_seq=record.seq,
                 message_id=req_with_topic.message_id,
@@ -395,6 +529,13 @@ class ClawDBService:
                 self._idempotency_index[scope] = ack
                 if len(self._idempotency_index) > self._cache_cap:
                     self._idempotency_index.pop(next(iter(self._idempotency_index)))
+        self._invalidate_query_state()
+        await self._wake_semantic_pipeline(
+            wal_seq=record.seq,
+            tenant_id=req_with_topic.tenant_id,
+            session_ids=upsert_result.affected_sessions,
+            cause="message_upsert",
+        )
         return ack
 
     async def edit_message(self, req: MessageEditRequest) -> MessageAck:
@@ -425,11 +566,19 @@ class ClawDBService:
             )
             if not result.found:
                 raise KeyError("message origin not found")
-            self._invalidate_query_state()
-            await self._rebuild_topic_state_from_store()
-            await self._refresh_impacted_sessions(req.tenant_id, result.affected_sessions)
-            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
-            await self.queue.publish(build_event(record.seq, "message_edit", payload))
+            await self.df_store.enqueue_semantic_refresh(
+                tenant_id=req.tenant_id,
+                wal_seq=record.seq,
+                session_ids=result.affected_sessions,
+                cause="message_edit",
+            )
+        self._invalidate_query_state()
+        await self._wake_semantic_pipeline(
+            wal_seq=record.seq,
+            tenant_id=req.tenant_id,
+            session_ids=result.affected_sessions,
+            cause="message_edit",
+        )
         return MessageAck(
             wal_seq=record.seq,
             message_id=resolved_origin,
@@ -463,11 +612,19 @@ class ClawDBService:
             )
             if not result.found:
                 raise KeyError("message origin not found")
-            self._invalidate_query_state()
-            await self._rebuild_topic_state_from_store()
-            await self._refresh_impacted_sessions(req.tenant_id, result.affected_sessions)
-            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
-            await self.queue.publish(build_event(record.seq, "message_delete", payload))
+            await self.df_store.enqueue_semantic_refresh(
+                tenant_id=req.tenant_id,
+                wal_seq=record.seq,
+                session_ids=result.affected_sessions,
+                cause="message_delete",
+            )
+        self._invalidate_query_state()
+        await self._wake_semantic_pipeline(
+            wal_seq=record.seq,
+            tenant_id=req.tenant_id,
+            session_ids=result.affected_sessions,
+            cause="message_delete",
+        )
         return MessageAck(
             wal_seq=record.seq,
             message_id=resolved_origin,
@@ -793,7 +950,6 @@ class ClawDBService:
                 wal_seq=record.seq,
                 note=req.note or "",
             )
-            await self.queue.publish(build_event(record.seq, "session_snapshot", payload))
         return SessionSnapshotResponse(snapshot_id=snapshot_id, wal_seq=record.seq)
 
     async def fork_session(self, req: SessionForkRequest) -> SessionForkResponse:
@@ -818,7 +974,6 @@ class ClawDBService:
                 wal_seq=record.seq,
                 note=req.note or "fork",
             )
-            await self.queue.publish(build_event(record.seq, "session_fork", payload))
         return SessionForkResponse(
             source_session_id=req.source_session_id,
             target_session_id=target,
@@ -838,7 +993,6 @@ class ClawDBService:
                 session_id=target,
                 parent_session_id=req.seed_session_id,
             )
-            await self.queue.publish(build_event(record.seq, "session_spawn", payload))
         return SessionSpawnResponse(
             session_id=target,
             parent_session_id=req.seed_session_id,
@@ -865,19 +1019,25 @@ class ClawDBService:
     async def index_status(self) -> IndexStatusResponse:
         sessions = await self.df_store.session_count()
         snapshots = await self.df_store.snapshot_count()
+        semantic_stats = await self.df_store.semantic_job_stats()
         return IndexStatusResponse(
             trie_topics=self.topic_trie.topic_count,
             session_count=sessions,
             snapshot_count=snapshots,
             wal_seq=self.wal.last_seq,
+            semantic_job_backlog=semantic_stats.pending,
+            semantic_jobs_running=semantic_stats.running,
         )
 
     async def rebuild_indexes(self) -> IndexRebuildResponse:
-        self._invalidate_query_state()
-        rebuild = await self.df_store.rebuild_storage_from_authoritative_raw(
-            vector_dim=self.config.topic_gep_dim
-        )
-        await self._rebuild_topic_state_from_store(rebuild_materialized_topics=False)
+        await self.drain_semantic_pipeline()
+        async with self.lock_manager.acquire("semantic:index", LockRank.INDEX):
+            await self.df_store.clear_semantic_jobs()
+            self._invalidate_query_state()
+            rebuild = await self.df_store.rebuild_storage_from_authoritative_raw(
+                vector_dim=self.config.topic_gep_dim
+            )
+            await self._rebuild_topic_state_from_store(rebuild_materialized_topics=False)
         return IndexRebuildResponse(
             wal_seq=self.wal.last_seq,
             rebuilt_topics=rebuild.topic_count,
@@ -900,16 +1060,18 @@ class ClawDBService:
                 vector_dim=self.config.topic_gep_dim,
             )
             await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
-            await self.queue.publish(build_event(record.seq, "capsule_refresh", payload))
         return CapsuleRefreshResponse(wal_seq=record.seq, capsule_count=count)
 
     async def health(self) -> HealthResponse:
         lag = await self.queue.lag()
         ratio = self.telemetry.hit_ratio(300)
+        semantic_stats = await self.df_store.semantic_job_stats()
         status = "ok"
         if lag > self.config.ingest_backpressure_lag_threshold:
             status = "degraded"
         if ratio < self.config.cache_hit_ratio_alert_threshold and (self.telemetry.hits_total + self.telemetry.misses_total) > 20:
+            status = "degraded"
+        if semantic_stats.pending > max(1, self.config.queue_consumer_count * 4):
             status = "degraded"
         return HealthResponse(
             status=status,
@@ -918,6 +1080,9 @@ class ClawDBService:
             cache_hit_ratio_5m=ratio,
             queue_backend=self.config.queue_backend,
             queue_lag=lag,
+            semantic_mode="async" if self._semantic_pipeline_async_enabled else "inline",
+            semantic_job_backlog=semantic_stats.pending,
+            semantic_jobs_running=semantic_stats.running,
         )
 
     async def cache_hit_report(self) -> CacheHitReportResponse:
@@ -936,6 +1101,7 @@ class ClawDBService:
     ) -> AcceptanceBenchmarkResponse:
         if not req.cases:
             raise ValueError("at least one acceptance case is required")
+        await self.drain_semantic_pipeline()
 
         hit_targets = {max(1, int(k)): float(v) for k, v in req.targets.hit_at.items()}
         ndcg_targets = {max(1, int(k)): float(v) for k, v in req.targets.ndcg_at.items()}

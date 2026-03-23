@@ -150,6 +150,25 @@ SNAPSHOTS_COLUMNS = [
     "created_at",
 ]
 
+SEMANTIC_JOBS_COLUMNS = [
+    "job_id",
+    "tenant_id",
+    "status",
+    "latest_wal_seq",
+    "claimed_wal_seq",
+    "impacted_sessions_json",
+    "claimed_sessions_json",
+    "cause",
+    "attempt_count",
+    "last_error",
+    "enqueued_at",
+    "started_at",
+    "updated_at",
+    "lease_owner",
+    "lease_expires_at",
+    "available_at",
+]
+
 EMBEDDING_INDEX_METADATA_COLUMNS = [
     "tenant_id",
     "entity_type",
@@ -223,6 +242,9 @@ CACHE_LOOKUP_MULTIINDEX_LEVELS = [
     "capsule_level",
 ]
 
+SEMANTIC_JOB_STATUS_PENDING = "pending"
+SEMANTIC_JOB_STATUS_RUNNING = "running"
+
 
 @dataclass
 class DataFramesState:
@@ -237,6 +259,7 @@ class DataFramesState:
     cache_index_df: pd.DataFrame
     sessions_df: pd.DataFrame
     snapshots_df: pd.DataFrame
+    semantic_jobs_df: pd.DataFrame
 
 
 @dataclass(frozen=True)
@@ -264,6 +287,25 @@ class StorageRebuildResult:
     topic_count: int
     capsule_count: int
     embedding_metadata_count: int
+
+
+@dataclass(frozen=True)
+class SemanticJobClaim:
+    job_id: str
+    tenant_id: str
+    claimed_wal_seq: int
+    latest_wal_seq: int
+    impacted_sessions: List[str]
+    attempt_count: int
+    cause: str
+
+
+@dataclass(frozen=True)
+class SemanticJobStats:
+    pending: int
+    running: int
+    total: int
+    max_wal_seq: int
 
 
 ROLLUP_WINDOW_KINDS = (
@@ -427,6 +469,26 @@ def _dedupe_citations(values: List[str], limit: int = 3) -> List[str]:
         seen.add(citation)
         if len(out) >= max(1, int(limit)):
             break
+    return out
+
+
+def _json_string_list(value: object) -> List[str]:
+    if value is None or value == "" or value == "[]":
+        return []
+    try:
+        raw = json.loads(str(value))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(raw, list):
+        return []
+    out: List[str] = []
+    seen = set()
+    for item in raw:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        out.append(text)
+        seen.add(text)
     return out
 
 
@@ -945,6 +1007,7 @@ class DataFrameStore:
             cache_index_df=pd.DataFrame(columns=CACHE_INDEX_COLUMNS),
             sessions_df=pd.DataFrame(columns=SESSIONS_COLUMNS),
             snapshots_df=pd.DataFrame(columns=SNAPSHOTS_COLUMNS),
+            semantic_jobs_df=pd.DataFrame(columns=SEMANTIC_JOBS_COLUMNS),
         )
         self._state.messages_df = self._state.messages_df.astype(
             {
@@ -1115,6 +1178,21 @@ class DataFrameStore:
                 "session_id": "string",
                 "wal_seq": "int64",
                 "note": "string",
+            }
+        )
+        self._state.semantic_jobs_df = self._state.semantic_jobs_df.astype(
+            {
+                "job_id": "string",
+                "tenant_id": "string",
+                "status": "string",
+                "latest_wal_seq": "int64",
+                "claimed_wal_seq": "int64",
+                "impacted_sessions_json": "string",
+                "claimed_sessions_json": "string",
+                "cause": "string",
+                "attempt_count": "int64",
+                "last_error": "string",
+                "lease_owner": "string",
             }
         )
         self._lock = asyncio.Lock()
@@ -2470,6 +2548,264 @@ class DataFrameStore:
         async with self._lock:
             return int(self._state.snapshots_df.shape[0])
 
+    def _normalize_semantic_jobs_locked(self) -> pd.DataFrame:
+        df = self._state.semantic_jobs_df
+        if df.empty:
+            self._state.semantic_jobs_df = pd.DataFrame(columns=SEMANTIC_JOBS_COLUMNS)
+            return self._state.semantic_jobs_df
+        normalized = df.copy().reset_index(drop=True)
+        for column in SEMANTIC_JOBS_COLUMNS:
+            if column not in normalized.columns:
+                normalized[column] = None
+        normalized = normalized[SEMANTIC_JOBS_COLUMNS]
+        for column in [
+            "job_id",
+            "tenant_id",
+            "status",
+            "impacted_sessions_json",
+            "claimed_sessions_json",
+            "cause",
+            "last_error",
+            "lease_owner",
+        ]:
+            normalized[column] = normalized[column].fillna("").astype(str)
+        for column in ["latest_wal_seq", "claimed_wal_seq", "attempt_count"]:
+            normalized[column] = pd.to_numeric(normalized[column], errors="coerce").fillna(0).astype(int)
+        for column in [
+            "enqueued_at",
+            "started_at",
+            "updated_at",
+            "lease_expires_at",
+            "available_at",
+        ]:
+            normalized[column] = (
+                pd.to_datetime(normalized[column], utc=True, errors="coerce")
+                .astype("datetime64[ns, UTC]")
+            )
+        self._state.semantic_jobs_df = normalized
+        return self._state.semantic_jobs_df
+
+    async def clear_semantic_jobs(self) -> None:
+        async with self._lock:
+            self._state.semantic_jobs_df = pd.DataFrame(columns=SEMANTIC_JOBS_COLUMNS)
+
+    async def enqueue_semantic_refresh(
+        self,
+        *,
+        tenant_id: str,
+        wal_seq: int,
+        session_ids: Sequence[str],
+        cause: str,
+    ) -> SemanticJobStats:
+        normalized_sessions = sorted({str(item) for item in session_ids if str(item)})
+        now = pd.Timestamp.now(tz="UTC")
+        job_id = f"semantic:{tenant_id}"
+        async with self._lock:
+            jobs = self._normalize_semantic_jobs_locked()
+            if jobs.empty:
+                row_id = None
+            else:
+                matches = jobs.index[jobs["job_id"].astype(str) == job_id]
+                row_id = int(matches[-1]) if len(matches) else None
+            if row_id is None:
+                row = {
+                    "job_id": job_id,
+                    "tenant_id": str(tenant_id),
+                    "status": SEMANTIC_JOB_STATUS_PENDING,
+                    "latest_wal_seq": int(wal_seq),
+                    "claimed_wal_seq": 0,
+                    "impacted_sessions_json": json.dumps(normalized_sessions, separators=(",", ":")),
+                    "claimed_sessions_json": "[]",
+                    "cause": str(cause or ""),
+                    "attempt_count": 0,
+                    "last_error": "",
+                    "enqueued_at": now,
+                    "started_at": pd.NaT,
+                    "updated_at": now,
+                    "lease_owner": "",
+                    "lease_expires_at": pd.NaT,
+                    "available_at": now,
+                }
+                if jobs.empty:
+                    self._state.semantic_jobs_df = pd.DataFrame([row], columns=SEMANTIC_JOBS_COLUMNS)
+                else:
+                    self._state.semantic_jobs_df = pd.concat(
+                        [jobs, pd.DataFrame([row], columns=SEMANTIC_JOBS_COLUMNS)],
+                        ignore_index=True,
+                    )
+            else:
+                existing_sessions = _json_string_list(jobs.at[row_id, "impacted_sessions_json"])
+                merged_sessions = sorted({*existing_sessions, *normalized_sessions})
+                latest_wal_seq = max(int(jobs.at[row_id, "latest_wal_seq"] or 0), int(wal_seq))
+                status = str(jobs.at[row_id, "status"] or SEMANTIC_JOB_STATUS_PENDING)
+                if status != SEMANTIC_JOB_STATUS_RUNNING:
+                    self._state.semantic_jobs_df.at[row_id, "status"] = SEMANTIC_JOB_STATUS_PENDING
+                    self._state.semantic_jobs_df.at[row_id, "available_at"] = now
+                    self._state.semantic_jobs_df.at[row_id, "lease_owner"] = ""
+                    self._state.semantic_jobs_df.at[row_id, "lease_expires_at"] = pd.NaT
+                self._state.semantic_jobs_df.at[row_id, "latest_wal_seq"] = latest_wal_seq
+                self._state.semantic_jobs_df.at[row_id, "impacted_sessions_json"] = json.dumps(
+                    merged_sessions,
+                    separators=(",", ":"),
+                )
+                self._state.semantic_jobs_df.at[row_id, "cause"] = str(cause or "")
+                self._state.semantic_jobs_df.at[row_id, "last_error"] = ""
+                self._state.semantic_jobs_df.at[row_id, "updated_at"] = now
+            jobs = self._normalize_semantic_jobs_locked()
+            pending = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_PENDING).sum())
+            running = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_RUNNING).sum())
+            total = int(jobs.shape[0])
+            max_wal_seq = int(pd.to_numeric(jobs["latest_wal_seq"], errors="coerce").fillna(0).max())
+            return SemanticJobStats(
+                pending=pending,
+                running=running,
+                total=total,
+                max_wal_seq=max_wal_seq,
+            )
+
+    async def semantic_job_stats(self) -> SemanticJobStats:
+        async with self._lock:
+            jobs = self._normalize_semantic_jobs_locked()
+            if jobs.empty:
+                return SemanticJobStats(pending=0, running=0, total=0, max_wal_seq=0)
+            pending = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_PENDING).sum())
+            running = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_RUNNING).sum())
+            max_wal_seq = int(pd.to_numeric(jobs["latest_wal_seq"], errors="coerce").fillna(0).max())
+            return SemanticJobStats(
+                pending=pending,
+                running=running,
+                total=int(jobs.shape[0]),
+                max_wal_seq=max_wal_seq,
+            )
+
+    async def claim_next_semantic_job(
+        self,
+        *,
+        worker_id: str,
+        lease_seconds: float,
+    ) -> Optional[SemanticJobClaim]:
+        async with self._lock:
+            jobs = self._normalize_semantic_jobs_locked()
+            if jobs.empty:
+                return None
+            now = pd.Timestamp.now(tz="UTC")
+            available_at = pd.to_datetime(jobs["available_at"], utc=True, errors="coerce")
+            lease_expires = pd.to_datetime(jobs["lease_expires_at"], utc=True, errors="coerce")
+            pending_mask = (
+                (jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_PENDING)
+                & (available_at.isna() | (available_at <= now))
+            )
+            expired_running_mask = (
+                (jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_RUNNING)
+                & lease_expires.notna()
+                & (lease_expires <= now)
+            )
+            candidates = jobs[pending_mask | expired_running_mask].copy()
+            if candidates.empty:
+                return None
+            candidates["sort_seq"] = pd.to_numeric(
+                candidates["latest_wal_seq"], errors="coerce"
+            ).fillna(0).astype(int)
+            candidates["sort_time"] = pd.to_datetime(
+                candidates["updated_at"], utc=True, errors="coerce"
+            ).fillna(now)
+            row_id = int(
+                candidates.sort_values(
+                    ["sort_seq", "sort_time", "tenant_id"],
+                    ascending=[True, True, True],
+                    kind="stable",
+                ).index[0]
+            )
+            claimed_wal_seq = int(jobs.at[row_id, "latest_wal_seq"] or 0)
+            impacted_sessions = _json_string_list(jobs.at[row_id, "impacted_sessions_json"])
+            self._state.semantic_jobs_df.at[row_id, "status"] = SEMANTIC_JOB_STATUS_RUNNING
+            self._state.semantic_jobs_df.at[row_id, "claimed_wal_seq"] = claimed_wal_seq
+            self._state.semantic_jobs_df.at[row_id, "claimed_sessions_json"] = json.dumps(
+                impacted_sessions,
+                separators=(",", ":"),
+            )
+            self._state.semantic_jobs_df.at[row_id, "attempt_count"] = (
+                int(jobs.at[row_id, "attempt_count"] or 0) + 1
+            )
+            self._state.semantic_jobs_df.at[row_id, "started_at"] = now
+            self._state.semantic_jobs_df.at[row_id, "updated_at"] = now
+            self._state.semantic_jobs_df.at[row_id, "lease_owner"] = str(worker_id)
+            self._state.semantic_jobs_df.at[row_id, "lease_expires_at"] = now + pd.Timedelta(
+                seconds=max(1.0, float(lease_seconds))
+            )
+            self._state.semantic_jobs_df.at[row_id, "last_error"] = ""
+            return SemanticJobClaim(
+                job_id=str(jobs.at[row_id, "job_id"] or ""),
+                tenant_id=str(jobs.at[row_id, "tenant_id"] or "default"),
+                claimed_wal_seq=claimed_wal_seq,
+                latest_wal_seq=claimed_wal_seq,
+                impacted_sessions=impacted_sessions,
+                attempt_count=int(self._state.semantic_jobs_df.at[row_id, "attempt_count"] or 0),
+                cause=str(jobs.at[row_id, "cause"] or ""),
+            )
+
+    async def complete_semantic_job(
+        self,
+        *,
+        job_id: str,
+        worker_id: str,
+        claimed_wal_seq: int,
+        retry_delay_seconds: float,
+        error: Optional[str] = None,
+    ) -> SemanticJobStats:
+        async with self._lock:
+            def _stats(frame: pd.DataFrame) -> SemanticJobStats:
+                if frame.empty:
+                    return SemanticJobStats(pending=0, running=0, total=0, max_wal_seq=0)
+                pending = int((frame["status"].astype(str) == SEMANTIC_JOB_STATUS_PENDING).sum())
+                running = int((frame["status"].astype(str) == SEMANTIC_JOB_STATUS_RUNNING).sum())
+                max_wal_seq = int(
+                    pd.to_numeric(frame["latest_wal_seq"], errors="coerce").fillna(0).max()
+                )
+                return SemanticJobStats(
+                    pending=pending,
+                    running=running,
+                    total=int(frame.shape[0]),
+                    max_wal_seq=max_wal_seq,
+                )
+
+            jobs = self._normalize_semantic_jobs_locked()
+            if jobs.empty:
+                return _stats(jobs)
+            matches = jobs.index[jobs["job_id"].astype(str) == str(job_id)]
+            if not len(matches):
+                return _stats(jobs)
+            row_id = int(matches[-1])
+            now = pd.Timestamp.now(tz="UTC")
+            owner = str(jobs.at[row_id, "lease_owner"] or "")
+            if owner and owner != str(worker_id):
+                return _stats(jobs)
+            latest_wal_seq = int(jobs.at[row_id, "latest_wal_seq"] or 0)
+            if error:
+                self._state.semantic_jobs_df.at[row_id, "status"] = SEMANTIC_JOB_STATUS_PENDING
+                self._state.semantic_jobs_df.at[row_id, "last_error"] = str(error)[:1000]
+                self._state.semantic_jobs_df.at[row_id, "updated_at"] = now
+                self._state.semantic_jobs_df.at[row_id, "lease_owner"] = ""
+                self._state.semantic_jobs_df.at[row_id, "lease_expires_at"] = pd.NaT
+                self._state.semantic_jobs_df.at[row_id, "available_at"] = now + pd.Timedelta(
+                    seconds=max(0.0, float(retry_delay_seconds))
+                )
+                self._state.semantic_jobs_df.at[row_id, "claimed_sessions_json"] = "[]"
+            elif latest_wal_seq > int(claimed_wal_seq):
+                self._state.semantic_jobs_df.at[row_id, "status"] = SEMANTIC_JOB_STATUS_PENDING
+                self._state.semantic_jobs_df.at[row_id, "updated_at"] = now
+                self._state.semantic_jobs_df.at[row_id, "lease_owner"] = ""
+                self._state.semantic_jobs_df.at[row_id, "lease_expires_at"] = pd.NaT
+                self._state.semantic_jobs_df.at[row_id, "available_at"] = now
+                self._state.semantic_jobs_df.at[row_id, "claimed_sessions_json"] = "[]"
+                self._state.semantic_jobs_df.at[row_id, "last_error"] = ""
+            else:
+                self._state.semantic_jobs_df = jobs[
+                    jobs["job_id"].astype(str) != str(job_id)
+                ].reset_index(drop=True)
+            jobs = self._normalize_semantic_jobs_locked()
+            return _stats(jobs)
+
     async def apply_wal_record(self, record: WalRecord) -> None:
         if record.event_type == "message_upsert":
             payload = record.payload
@@ -3270,6 +3606,7 @@ class DataFrameStore:
         _write_partitioned(state.cache_index_df, "cache_index")
         _write_partitioned(state.sessions_df, "sessions")
         _write_partitioned(state.snapshots_df, "snapshots")
+        _write_partitioned(state.semantic_jobs_df, "semantic_jobs")
         if parquet_dir.exists():
             shutil.rmtree(parquet_dir)
         tmp_parquet.rename(parquet_dir)
@@ -3315,5 +3652,6 @@ class DataFrameStore:
             cache_index_df=_read_all("cache_index", CACHE_INDEX_COLUMNS),
             sessions_df=_read_all("sessions", SESSIONS_COLUMNS),
             snapshots_df=_read_all("snapshots", SNAPSHOTS_COLUMNS),
+            semantic_jobs_df=_read_all("semantic_jobs", SEMANTIC_JOBS_COLUMNS),
         )
         self._invalidate_all_indexes_locked()

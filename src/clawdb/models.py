@@ -150,6 +150,9 @@ class HealthResponse(BaseModel):
     cache_hit_ratio_5m: float
     queue_backend: str
     queue_lag: int
+    semantic_mode: Literal["inline", "async"] = "async"
+    semantic_job_backlog: int = 0
+    semantic_jobs_running: int = 0
 
 
 class OpenClawMemorySearchRequest(BaseModel):
@@ -218,6 +221,8 @@ class IndexStatusResponse(BaseModel):
     session_count: int
     snapshot_count: int
     wal_seq: int
+    semantic_job_backlog: int = 0
+    semantic_jobs_running: int = 0
 
 
 class IndexRebuildResponse(BaseModel):

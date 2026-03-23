@@ -33,6 +33,9 @@ class ClawDBConfig:
     lock_watchdog_seconds: float
     cache_hit_ratio_alert_threshold: float
     search_log_enabled: bool
+    semantic_pipeline_mode: str = "inline"
+    semantic_job_lease_seconds: float = 30.0
+    semantic_retry_delay_seconds: float = 1.0
 
     @classmethod
     def from_env(cls) -> "ClawDBConfig":
@@ -83,6 +86,15 @@ class ClawDBConfig:
                 os.getenv("CLAWDB_CACHE_HIT_RATIO_ALERT_THRESHOLD", "0.80")
             ),
             search_log_enabled=_env_bool("CLAWDB_SEARCH_LOG_ENABLED", "true"),
+            semantic_pipeline_mode=os.getenv("CLAWDB_SEMANTIC_PIPELINE_MODE", "async")
+            .strip()
+            .lower(),
+            semantic_job_lease_seconds=float(
+                os.getenv("CLAWDB_SEMANTIC_JOB_LEASE_SECONDS", "30")
+            ),
+            semantic_retry_delay_seconds=float(
+                os.getenv("CLAWDB_SEMANTIC_RETRY_DELAY_SECONDS", "1")
+            ),
         )
 
     def ensure_dirs(self) -> None:
