@@ -49,10 +49,7 @@ OpenClaw / API clients
 
 Workload: `6000` ingests, `1200` cold searches, `1200` hot searches, `120` sessions, `8` tenants, concurrency `96`.
 
-Reports:
-- `Docs/benchmark_report_latest.json`
-- `Docs/benchmark_report_inmemory.json`
-- `Docs/benchmark_summary_2026-03-15.md`
+Reports are generated locally under gitignored `Docs/`.
 
 | Stack | Ingest P50 | Ingest P95 | Throughput (ops/s) | Cold Search P50 | Cold Search P95 | Hot Search P50 | Hot Search P95 | Replay Startup |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -83,7 +80,7 @@ uv run python -m uvicorn clawdb.api:app --reload
 - Dev extra: `pytest`, `pytest-asyncio`
 
 Local validation note:
-- `.venv/` and `tests/` are local validation artifacts and stay gitignored.
+- `Docs/`, `.venv/`, and `tests/` are local development artifacts and stay gitignored.
 - If your local checkout includes `tests/`, run:
 
 ```bash
@@ -121,7 +118,7 @@ python3 scripts/benchmark_features.py \
 - Install helper: `scripts/install_openclaw_integration.sh`
 - Bootstrap helper: `scripts/bootstrap_openclaw.sh`
 - Smoke test: `scripts/smoke_test_integration.sh`
-- Integration guide: `Docs/openclaw_integration_test.md`
+- Local integration guide: `Docs/openclaw_integration_test.md` (gitignored local doc)
 
 ### Signed Adapter Routes
 

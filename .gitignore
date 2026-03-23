@@ -12,8 +12,9 @@ Icon?
 .pytest_cache/
 data/
 external/
+.cron/
+.ops/
 Docs/
-scripts/
 .venv/
 tests/
 __pycache__/
