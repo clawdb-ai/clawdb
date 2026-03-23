@@ -411,10 +411,14 @@ Final results cite the returned entity itself. Derived results additionally carr
 
 ### Storage and rebuild contract
 
-- [ ] One authoritative raw source of truth
-- [ ] Which layers are derived only
-- [ ] Full rebuild procedure from raw source
-- [ ] Compaction and retention rules
+- [x] One authoritative raw source of truth
+  Authoritative state lives only in `messages` rows where `projection_kind == raw_global`; each raw row also retains the original `native_session_id` so projection aliases can be rebuilt without consulting any derived table.
+- [x] Which layers are derived only
+  `projection_messages`, `session_rollups`, `topics`, and `capsules` are derived layers; they may be persisted for speed, but they are always rebuildable from authoritative raw rows and are never treated as source-of-truth state.
+- [x] Full rebuild procedure from raw source
+  Startup, explicit index rebuild, and schema migration all run the same raw-first rebuild path: extract authoritative raw rows, backfill missing raw `native_session_id` values from surviving projections when available, rebuild canonical projections, preserve only non-canonical extra projection copies, and then rematerialize session rollups, topics, and capsules from that rebuilt state.
+- [x] Compaction and retention rules
+  Each flush rewrites the parquet tree as one compacted snapshot with one retained `part-*.parquet` per table/date partition; stale derived parquet parts are discarded, while authoritative raw rows and their tombstones are retained in the compacted snapshot until superseded by newer raw state or WAL replay.
 
 ### Metrics and acceptance
 

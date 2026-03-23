@@ -216,6 +216,10 @@ class IndexRebuildResponse(BaseModel):
     wal_seq: int
     rebuilt_topics: int
     rebuilt_messages: int
+    authoritative_raw_messages: int = 0
+    rebuilt_projection_messages: int = 0
+    rebuilt_session_rollups: int = 0
+    rebuilt_capsules: int = 0
 
 
 class CacheHitReportResponse(BaseModel):

@@ -191,9 +191,10 @@ class ClawDBService:
                         origin_message_id=origin_message_id,
                         affected_projections=len(list(record.payload.get("projections") or [])),
                     )
-        await self._rebuild_topic_state_from_store()
-        await self.df_store.rebuild_all_session_rollups(vector_dim=self.config.topic_gep_dim)
-        await self.df_store.rebuild_all_capsules(vector_dim=self.config.topic_gep_dim)
+        await self.df_store.rebuild_storage_from_authoritative_raw(
+            vector_dim=self.config.topic_gep_dim
+        )
+        await self._rebuild_topic_state_from_store(rebuild_materialized_topics=False)
 
     async def flush_now(self) -> None:
         await self.df_store.save_parquet(self.config.parquet_dir)
@@ -250,8 +251,9 @@ class ClawDBService:
                 vector_dim=self.config.topic_gep_dim,
             )
 
-    async def _rebuild_topic_state_from_store(self) -> None:
-        await self.df_store.rebuild_all_topics(vector_dim=self.config.topic_gep_dim)
+    async def _rebuild_topic_state_from_store(self, *, rebuild_materialized_topics: bool = True) -> None:
+        if rebuild_materialized_topics:
+            await self.df_store.rebuild_all_topics(vector_dim=self.config.topic_gep_dim)
         self.topic_trie = TopicTrie()
         self.topic_model = GaussianEwensTopicModel(
             dim=self.config.topic_gep_dim,
@@ -752,14 +754,19 @@ class ClawDBService:
         )
 
     async def rebuild_indexes(self) -> IndexRebuildResponse:
-        await self._rebuild_topic_state_from_store()
-        await self.df_store.rebuild_all_capsules(vector_dim=self.config.topic_gep_dim)
-        docs = await self.df_store.message_documents(tenant_id="*", session_id=None, row_mode="raw")
-        rebuilt = len([item for item in docs if str(item.get("content") or "")])
+        self._invalidate_query_state()
+        rebuild = await self.df_store.rebuild_storage_from_authoritative_raw(
+            vector_dim=self.config.topic_gep_dim
+        )
+        await self._rebuild_topic_state_from_store(rebuild_materialized_topics=False)
         return IndexRebuildResponse(
             wal_seq=self.wal.last_seq,
-            rebuilt_topics=self.topic_trie.topic_count,
-            rebuilt_messages=rebuilt,
+            rebuilt_topics=rebuild.topic_count,
+            rebuilt_messages=rebuild.raw_message_count + rebuild.projection_message_count,
+            authoritative_raw_messages=rebuild.raw_message_count,
+            rebuilt_projection_messages=rebuild.projection_message_count,
+            rebuilt_session_rollups=rebuild.session_rollup_count,
+            rebuilt_capsules=rebuild.capsule_count,
         )
 
     async def refresh_capsules(self, req: CapsuleRefreshRequest) -> CapsuleRefreshResponse:

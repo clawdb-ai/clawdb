@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +17,7 @@ from .lineage import (
     MESSAGE_STATE_DELETED,
     RAW_PROJECTION_KIND,
     materialize_message_bundle,
+    materialize_projection_rows,
 )
 from .models import SearchResult, WalRecord
 from .topics import (
@@ -198,6 +200,16 @@ class MessageUpsertResult:
     replaced_existing: bool
 
 
+@dataclass(frozen=True)
+class StorageRebuildResult:
+    raw_message_count: int
+    projection_message_count: int
+    session_count: int
+    session_rollup_count: int
+    topic_count: int
+    capsule_count: int
+
+
 ROLLUP_WINDOW_KINDS = (
     "daily",
     "weekly",
@@ -209,6 +221,14 @@ ROLLUP_WINDOW_KINDS = (
 ROLLUP_SUMMARY_MAX_CHARS = 4000
 DEFAULT_ROLLUP_VECTOR_DIM = 64
 RETRIEVAL_ABSTRACT_MAX_CHARS = 4000
+AUTHORITATIVE_RAW_MESSAGE_SOURCE = "messages.raw_global"
+DERIVED_ONLY_LAYERS = (
+    "projection_messages",
+    "session_rollups",
+    "topics",
+    "capsules",
+)
+FULL_REBUILD_SEQUENCE = DERIVED_ONLY_LAYERS
 
 
 def _utc_timestamp(value: object) -> pd.Timestamp:
@@ -441,6 +461,295 @@ def materialize_session_rollups(
     for col in ["message_count", "content_char_count", "vector_dim"]:
         frame[col] = pd.to_numeric(frame[col], errors="coerce").fillna(0).astype(int)
     return frame[SESSION_ROLLUPS_COLUMNS]
+
+
+def authoritative_raw_messages(messages_frame: pd.DataFrame) -> pd.DataFrame:
+    if messages_frame.empty:
+        return pd.DataFrame(columns=MESSAGES_COLUMNS)
+    scoped = messages_frame.copy().reset_index(drop=True)
+    for col in MESSAGES_COLUMNS:
+        if col not in scoped.columns:
+            scoped[col] = None
+    scoped = scoped[MESSAGES_COLUMNS]
+    scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+    scoped["message_id"] = scoped["message_id"].fillna("").astype(str)
+    scoped["origin_message_id"] = scoped["origin_message_id"].fillna(scoped["message_id"]).astype(str)
+    scoped["session_id"] = scoped["session_id"].fillna("").astype(str)
+    scoped["projection_kind"] = scoped["projection_kind"].fillna("").astype(str)
+    scoped["projection_scope"] = scoped["projection_scope"].fillna("").astype(str)
+    scoped["visibility"] = scoped["visibility"].fillna("").astype(str)
+    scoped["native_session_id"] = scoped["native_session_id"].fillna("").astype(str)
+    scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
+    scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
+    scoped["updated_at"] = scoped["updated_at"].fillna(scoped["ts"])
+    raw_rows = scoped[scoped["projection_kind"].astype(str) == RAW_PROJECTION_KIND].copy()
+    if raw_rows.empty:
+        return pd.DataFrame(columns=MESSAGES_COLUMNS)
+    projection_rows = scoped[
+        (scoped["projection_kind"].astype(str) != RAW_PROJECTION_KIND)
+        & (scoped["native_session_id"].astype(str) != "")
+    ].copy()
+    if not projection_rows.empty:
+        projection_rows = projection_rows.sort_values(
+            ["ts", "session_id", "message_id"],
+            ascending=[True, True, True],
+            kind="stable",
+        )
+        native_session_lookup = (
+            projection_rows.groupby(["tenant_id", "origin_message_id"], sort=False)["native_session_id"].first()
+        )
+        blank_mask = raw_rows["native_session_id"].astype(str) == ""
+        for row_id, row in raw_rows[blank_mask].iterrows():
+            native_session_id = native_session_lookup.get(
+                (str(row["tenant_id"]), str(row["origin_message_id"])),
+                "",
+            )
+            if native_session_id:
+                raw_rows.at[row_id, "native_session_id"] = str(native_session_id)
+    raw_rows.loc[raw_rows["projection_scope"].astype(str) == "", "projection_scope"] = "global"
+    raw_rows.loc[raw_rows["visibility"].astype(str) == "", "visibility"] = "raw"
+    raw_rows = raw_rows.sort_values(
+        ["ts", "updated_at", "origin_message_id", "message_id"],
+        ascending=[True, True, True, True],
+        kind="stable",
+    )
+    raw_rows = raw_rows.drop_duplicates(
+        subset=["tenant_id", "origin_message_id"],
+        keep="last",
+    )
+    return raw_rows[MESSAGES_COLUMNS].reset_index(drop=True)
+
+
+def materialize_projection_messages_from_raw(raw_messages_frame: pd.DataFrame) -> pd.DataFrame:
+    if raw_messages_frame.empty:
+        return pd.DataFrame(columns=MESSAGES_COLUMNS)
+    ordered = raw_messages_frame.copy().reset_index(drop=True)
+    for col in MESSAGES_COLUMNS:
+        if col not in ordered.columns:
+            ordered[col] = None
+    ordered = ordered[MESSAGES_COLUMNS]
+    ordered["tenant_id"] = ordered["tenant_id"].fillna("default").astype(str)
+    ordered["message_id"] = ordered["message_id"].fillna("").astype(str)
+    ordered["origin_message_id"] = ordered["origin_message_id"].fillna(ordered["message_id"]).astype(str)
+    ordered["ts"] = pd.to_datetime(ordered["ts"], utc=True, errors="coerce")
+    ordered = ordered.sort_values(
+        ["ts", "origin_message_id", "message_id"],
+        ascending=[True, True, True],
+        kind="stable",
+    )
+    rows: List[Dict[str, object]] = []
+    for _, row in ordered.iterrows():
+        rows.extend(materialize_projection_rows(row.to_dict()))
+    if not rows:
+        return pd.DataFrame(columns=MESSAGES_COLUMNS)
+    materialized = pd.DataFrame(rows, columns=MESSAGES_COLUMNS)
+    materialized["tenant_id"] = materialized["tenant_id"].fillna("default").astype(str)
+    materialized["message_id"] = materialized["message_id"].fillna("").astype(str)
+    materialized["origin_message_id"] = materialized["origin_message_id"].fillna(
+        materialized["message_id"]
+    ).astype(str)
+    materialized["session_id"] = materialized["session_id"].fillna("").astype(str)
+    materialized["ts"] = pd.to_datetime(materialized["ts"], utc=True, errors="coerce")
+    materialized = materialized.sort_values(
+        ["ts", "session_id", "message_id"],
+        ascending=[True, True, True],
+        kind="stable",
+    )
+    materialized = materialized.drop_duplicates(
+        subset=["tenant_id", "origin_message_id", "message_id", "session_id"],
+        keep="last",
+    )
+    return materialized[MESSAGES_COLUMNS].reset_index(drop=True)
+
+
+def _preserved_projection_messages(
+    messages_frame: pd.DataFrame,
+    raw_messages_frame: pd.DataFrame,
+    canonical_projection_messages: pd.DataFrame,
+) -> pd.DataFrame:
+    if messages_frame.empty or raw_messages_frame.empty:
+        return pd.DataFrame(columns=MESSAGES_COLUMNS)
+    existing = messages_frame.copy().reset_index(drop=True)
+    for col in MESSAGES_COLUMNS:
+        if col not in existing.columns:
+            existing[col] = None
+    existing = existing[MESSAGES_COLUMNS]
+    existing["tenant_id"] = existing["tenant_id"].fillna("default").astype(str)
+    existing["message_id"] = existing["message_id"].fillna("").astype(str)
+    existing["origin_message_id"] = existing["origin_message_id"].fillna(existing["message_id"]).astype(str)
+    existing["session_id"] = existing["session_id"].fillna("").astype(str)
+    existing["projection_kind"] = existing["projection_kind"].fillna("").astype(str)
+    existing["projection_scope"] = existing["projection_scope"].fillna("").astype(str)
+    existing["visibility"] = existing["visibility"].fillna("").astype(str)
+    existing["native_session_id"] = existing["native_session_id"].fillna("").astype(str)
+    existing = existing[existing["projection_kind"].astype(str) != RAW_PROJECTION_KIND]
+    if existing.empty:
+        return pd.DataFrame(columns=MESSAGES_COLUMNS)
+    raw_lookup = {
+        (str(row["tenant_id"]), str(row["origin_message_id"])): row.to_dict()
+        for _, row in raw_messages_frame.iterrows()
+    }
+    canonical_keys = {
+        (
+            str(row["tenant_id"]),
+            str(row["origin_message_id"]),
+            str(row["message_id"]),
+            str(row["session_id"]),
+        )
+        for _, row in canonical_projection_messages.iterrows()
+    }
+    rows: List[Dict[str, object]] = []
+    for _, row in existing.iterrows():
+        key = (
+            str(row["tenant_id"]),
+            str(row["origin_message_id"]),
+            str(row["message_id"]),
+            str(row["session_id"]),
+        )
+        if key in canonical_keys:
+            continue
+        raw_row = raw_lookup.get((str(row["tenant_id"]), str(row["origin_message_id"])))
+        if raw_row is None:
+            continue
+        rebuilt = dict(raw_row)
+        rebuilt.update(
+            {
+                "message_id": str(row["message_id"]),
+                "session_id": str(row["session_id"]),
+                "projection_kind": str(row["projection_kind"]),
+                "projection_scope": str(row["projection_scope"]),
+                "visibility": str(row["visibility"] or raw_row.get("visibility") or ""),
+                "native_session_id": str(row["native_session_id"]),
+            }
+        )
+        rows.append(rebuilt)
+    if not rows:
+        return pd.DataFrame(columns=MESSAGES_COLUMNS)
+    preserved = pd.DataFrame(rows, columns=MESSAGES_COLUMNS)
+    preserved["tenant_id"] = preserved["tenant_id"].fillna("default").astype(str)
+    preserved["message_id"] = preserved["message_id"].fillna("").astype(str)
+    preserved["origin_message_id"] = preserved["origin_message_id"].fillna(preserved["message_id"]).astype(str)
+    preserved["session_id"] = preserved["session_id"].fillna("").astype(str)
+    preserved["ts"] = pd.to_datetime(preserved["ts"], utc=True, errors="coerce")
+    preserved = preserved.sort_values(
+        ["ts", "session_id", "message_id"],
+        ascending=[True, True, True],
+        kind="stable",
+    )
+    preserved = preserved.drop_duplicates(
+        subset=["tenant_id", "origin_message_id", "message_id", "session_id"],
+        keep="last",
+    )
+    return preserved[MESSAGES_COLUMNS].reset_index(drop=True)
+
+
+def materialize_projection_sessions(projection_messages_frame: pd.DataFrame) -> pd.DataFrame:
+    if projection_messages_frame.empty:
+        return pd.DataFrame(columns=SESSIONS_COLUMNS)
+    scoped = projection_messages_frame.copy().reset_index(drop=True)
+    for col in SESSIONS_COLUMNS:
+        if col not in scoped.columns:
+            scoped[col] = None
+    scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+    scoped["session_id"] = scoped["session_id"].fillna("").astype(str)
+    scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
+    scoped = scoped[scoped["session_id"].astype(str) != ""].copy()
+    if scoped.empty:
+        return pd.DataFrame(columns=SESSIONS_COLUMNS)
+    rows: List[Dict[str, object]] = []
+    for (tenant_id, session_id), group in scoped.groupby(["tenant_id", "session_id"], sort=True):
+        created_at = pd.to_datetime(group["ts"], utc=True, errors="coerce").min()
+        rows.append(
+            {
+                "tenant_id": str(tenant_id),
+                "session_id": str(session_id),
+                "parent_session_id": "",
+                "origin": "projection",
+                "created_at": _utc_timestamp(created_at),
+            }
+        )
+    return pd.DataFrame(rows, columns=SESSIONS_COLUMNS)
+
+
+def _merge_session_rows(existing_sessions: pd.DataFrame, derived_sessions: pd.DataFrame) -> pd.DataFrame:
+    if existing_sessions.empty:
+        return derived_sessions.reset_index(drop=True)
+    existing = existing_sessions.copy().reset_index(drop=True)
+    for col in SESSIONS_COLUMNS:
+        if col not in existing.columns:
+            existing[col] = None
+    existing = existing[SESSIONS_COLUMNS]
+    existing["tenant_id"] = existing["tenant_id"].fillna("default").astype(str)
+    existing["session_id"] = existing["session_id"].fillna("").astype(str)
+    existing = existing[existing["session_id"].astype(str) != ""].copy()
+    if derived_sessions.empty:
+        return existing.reset_index(drop=True)
+    derived = derived_sessions.copy().reset_index(drop=True)
+    derived["tenant_id"] = derived["tenant_id"].fillna("default").astype(str)
+    derived["session_id"] = derived["session_id"].fillna("").astype(str)
+    existing_keys = {
+        (str(row["tenant_id"]), str(row["session_id"]))
+        for _, row in existing.iterrows()
+    }
+    derived = derived[
+        ~derived.apply(
+            lambda row: (str(row["tenant_id"]), str(row["session_id"])) in existing_keys,
+            axis=1,
+        )
+    ].reset_index(drop=True)
+    if derived.empty:
+        return existing.reset_index(drop=True)
+    return pd.concat([existing, derived[SESSIONS_COLUMNS]], ignore_index=True)
+
+
+def rebuild_materialized_storage_from_raw(
+    messages_frame: pd.DataFrame,
+    sessions_frame: pd.DataFrame,
+    *,
+    vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM,
+) -> Dict[str, pd.DataFrame]:
+    raw_messages = authoritative_raw_messages(messages_frame)
+    canonical_projection_messages = materialize_projection_messages_from_raw(raw_messages)
+    preserved_projection_messages = _preserved_projection_messages(
+        messages_frame,
+        raw_messages,
+        canonical_projection_messages,
+    )
+    projection_parts = [
+        frame
+        for frame in (canonical_projection_messages, preserved_projection_messages)
+        if not frame.empty
+    ]
+    projection_messages = (
+        pd.concat(projection_parts, ignore_index=True)[MESSAGES_COLUMNS]
+        if projection_parts
+        else pd.DataFrame(columns=MESSAGES_COLUMNS)
+    )
+    message_parts = [raw_messages]
+    if not projection_messages.empty:
+        message_parts.append(projection_messages)
+    rebuilt_messages = (
+        pd.concat(message_parts, ignore_index=True)[MESSAGES_COLUMNS]
+        if message_parts and any(not frame.empty for frame in message_parts)
+        else pd.DataFrame(columns=MESSAGES_COLUMNS)
+    )
+    derived_sessions = materialize_projection_sessions(projection_messages)
+    rebuilt_sessions = _merge_session_rows(sessions_frame, derived_sessions)
+    rebuilt_rollups = materialize_session_rollups(rebuilt_messages, vector_dim=vector_dim)
+    rebuilt_topics = materialize_topic_lifecycle(raw_messages, vector_dim=vector_dim)
+    rebuilt_capsules = materialize_capsule_lifecycle(
+        raw_messages,
+        topics_frame=rebuilt_topics,
+        vector_dim=vector_dim,
+    )
+    return {
+        "messages": rebuilt_messages,
+        "projection_messages": projection_messages,
+        "sessions": rebuilt_sessions,
+        "session_rollups": rebuilt_rollups,
+        "topics": rebuilt_topics,
+        "capsules": rebuilt_capsules,
+    }
 
 
 class DataFrameStore:
@@ -1405,6 +1714,32 @@ class DataFrameStore:
             )
             self._invalidate_capsules_index_locked()
             return int(self._state.capsules_df.shape[0])
+
+    async def rebuild_storage_from_authoritative_raw(
+        self,
+        *,
+        vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM,
+    ) -> StorageRebuildResult:
+        async with self._lock:
+            rebuilt = rebuild_materialized_storage_from_raw(
+                self._state.messages_df,
+                self._state.sessions_df,
+                vector_dim=vector_dim,
+            )
+            self._state.messages_df = rebuilt["messages"]
+            self._state.sessions_df = rebuilt["sessions"]
+            self._state.session_rollups_df = rebuilt["session_rollups"]
+            self._state.topics_df = rebuilt["topics"]
+            self._state.capsules_df = rebuilt["capsules"]
+            self._invalidate_all_indexes_locked()
+            return StorageRebuildResult(
+                raw_message_count=int(authoritative_raw_messages(self._state.messages_df).shape[0]),
+                projection_message_count=int(rebuilt["projection_messages"].shape[0]),
+                session_count=int(self._state.sessions_df.shape[0]),
+                session_rollup_count=int(self._state.session_rollups_df.shape[0]),
+                topic_count=int(self._state.topics_df.shape[0]),
+                capsule_count=int(self._state.capsules_df.shape[0]),
+            )
 
     async def refresh_session_rollups(
         self,
@@ -2374,10 +2709,14 @@ class DataFrameStore:
     def _save_parquet_sync(self, parquet_dir: Path, state: DataFramesState) -> None:
         parquet_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        tmp_parquet = parquet_dir.parent / f"{parquet_dir.name}.tmp-save-{timestamp}"
+        if tmp_parquet.exists():
+            shutil.rmtree(tmp_parquet)
+        tmp_parquet.mkdir(parents=True, exist_ok=True)
 
         def _write_partitioned(df: pd.DataFrame, name: str) -> None:
             if df.empty:
-                target = parquet_dir / name / "dt=empty"
+                target = tmp_parquet / name / "dt=empty"
                 target.mkdir(parents=True, exist_ok=True)
                 (target / f"part-{timestamp}.parquet").touch(exist_ok=True)
                 return
@@ -2391,7 +2730,7 @@ class DataFrameStore:
             else:
                 write_df["dt"] = datetime.utcnow().strftime("%Y-%m-%d")
             for dt, part in write_df.groupby("dt"):
-                target = parquet_dir / name / f"dt={dt}"
+                target = tmp_parquet / name / f"dt={dt}"
                 target.mkdir(parents=True, exist_ok=True)
                 part.drop(columns=["dt"]).to_parquet(target / f"part-{timestamp}.parquet", index=False)
 
@@ -2402,6 +2741,9 @@ class DataFrameStore:
         _write_partitioned(state.cache_index_df, "cache_index")
         _write_partitioned(state.sessions_df, "sessions")
         _write_partitioned(state.snapshots_df, "snapshots")
+        if parquet_dir.exists():
+            shutil.rmtree(parquet_dir)
+        tmp_parquet.rename(parquet_dir)
 
     async def load_parquet(self, parquet_dir: Path) -> None:
         async with self._lock:

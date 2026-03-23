@@ -74,7 +74,7 @@ def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec
         f"{platform}_account:_"
     )
     chat_type = str(payload.get("chat_type") or "").strip().lower()
-    incoming_session_id = str(payload.get("session_id") or "").strip()
+    incoming_session_id = str(payload.get("session_id") or payload.get("native_session_id") or "").strip()
     role = str(payload.get("role") or "").strip().lower()
 
     def _preferred_user_id() -> str:
@@ -149,6 +149,31 @@ def projection_message_id(origin_message_id: str, kind: str, scope: str) -> str:
     return f"{origin_message_id}::proj::{digest}"
 
 
+def materialize_projection_rows(raw_message: Mapping[str, object]) -> List[Dict[str, object]]:
+    source = dict(raw_message)
+    origin_message_id = str(source.get("origin_message_id") or source.get("message_id") or "").strip()
+    source["origin_message_id"] = origin_message_id
+    source["platform"] = normalize_platform(
+        str(source.get("platform") or "") or None,
+        str(source.get("channel") or "") or None,
+    )
+    source["native_session_id"] = str(source.get("native_session_id") or "")
+    projections: List[Dict[str, object]] = []
+    for spec in build_projection_specs(source):
+        projections.append(
+            {
+                **source,
+                "message_id": projection_message_id(origin_message_id, spec.kind, spec.scope),
+                "session_id": spec.session_id,
+                "projection_kind": spec.kind,
+                "projection_scope": spec.scope,
+                "visibility": spec.visibility,
+                "native_session_id": spec.native_session_id,
+            }
+        )
+    return projections
+
+
 def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, object]:
     platform = normalize_platform(
         str(payload.get("platform") or "") or None,
@@ -210,20 +235,9 @@ def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, objec
         "session_id": "",
         "projection_kind": RAW_PROJECTION_KIND,
         "projection_scope": "global",
+        "native_session_id": str(payload.get("session_id") or ""),
     }
-    projections: List[Dict[str, object]] = []
-    for spec in build_projection_specs(payload):
-        projections.append(
-            {
-                **base,
-                "message_id": projection_message_id(origin_message_id, spec.kind, spec.scope),
-                "session_id": spec.session_id,
-                "projection_kind": spec.kind,
-                "projection_scope": spec.scope,
-                "visibility": spec.visibility,
-                "native_session_id": spec.native_session_id,
-            }
-        )
+    projections = materialize_projection_rows(raw_row)
     return {
         "tenant_id": str(payload.get("tenant_id") or "default"),
         "session_id": str(payload.get("session_id") or ""),

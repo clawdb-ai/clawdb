@@ -12,14 +12,14 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
-from .capsules import CAPSULES_COLUMNS, materialize_capsule_lifecycle
+from .capsules import CAPSULES_COLUMNS
 from .dataframes import (
     CACHE_INDEX_COLUMNS,
     MESSAGES_COLUMNS,
     SESSION_ROLLUPS_COLUMNS,
     SESSIONS_COLUMNS,
     SNAPSHOTS_COLUMNS,
-    materialize_session_rollups,
+    rebuild_materialized_storage_from_raw,
 )
 from .lineage import (
     MESSAGE_STATE_ACTIVE,
@@ -27,7 +27,7 @@ from .lineage import (
     materialize_message_bundle,
 )
 from .metadata import DataFrameMetadataStore
-from .topics import TOPICS_COLUMNS, materialize_topic_lifecycle
+from .topics import TOPICS_COLUMNS
 
 
 CURRENT_SCHEMA_VERSION = 7
@@ -723,22 +723,17 @@ async def migrate_schema(
         frame, _ = await asyncio.to_thread(_read_table, parquet_dir, table)
         normalizer = NORMALIZERS[table]
         normalized_tables[table] = await asyncio.to_thread(normalizer, frame)
-    normalized_tables["session_rollups"] = await asyncio.to_thread(
-        materialize_session_rollups,
+    rebuilt_storage = await asyncio.to_thread(
+        rebuild_materialized_storage_from_raw,
         normalized_tables["messages"],
+        normalized_tables["sessions"],
         vector_dim=_rollup_vector_dim_from_env(),
     )
-    normalized_tables["topics"] = await asyncio.to_thread(
-        materialize_topic_lifecycle,
-        normalized_tables["messages"],
-        vector_dim=_rollup_vector_dim_from_env(),
-    )
-    normalized_tables["capsules"] = await asyncio.to_thread(
-        materialize_capsule_lifecycle,
-        normalized_tables["messages"],
-        topics_frame=normalized_tables["topics"],
-        vector_dim=_rollup_vector_dim_from_env(),
-    )
+    normalized_tables["messages"] = rebuilt_storage["messages"]
+    normalized_tables["sessions"] = rebuilt_storage["sessions"]
+    normalized_tables["session_rollups"] = rebuilt_storage["session_rollups"]
+    normalized_tables["topics"] = rebuilt_storage["topics"]
+    normalized_tables["capsules"] = rebuilt_storage["capsules"]
 
     tmp_parquet = parquet_dir.parent / f"{parquet_dir.name}.tmp-schema-{timestamp}"
     if tmp_parquet.exists():
