@@ -13,6 +13,7 @@ from .models import (
     MessageIn,
     MessageEditRequest,
     MessageDeleteRequest,
+    ResearchBenchmarkRequest,
     SessionForkRequest,
     SessionSnapshotRequest,
     SessionSpawnRequest,
@@ -149,6 +150,14 @@ async def cache_hit_report():
 async def acceptance_report(req: AcceptanceBenchmarkRequest):
     try:
         return await service.evaluate_acceptance(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/memory/metrics/research-benchmark")
+async def research_benchmark_report(req: ResearchBenchmarkRequest):
+    try:
+        return await service.evaluate_research_benchmark(req)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

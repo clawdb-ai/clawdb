@@ -288,6 +288,7 @@ class AcceptanceCaseReport(BaseModel):
     ndcg_at: Dict[int, float]
     top_match_keys: List[str] = Field(default_factory=list)
     matched_relevance: List[float] = Field(default_factory=list)
+    result_entity_types: List[str] = Field(default_factory=list)
 
 
 class AcceptanceBenchmarkResponse(BaseModel):
@@ -315,6 +316,39 @@ class AcceptanceBenchmarkResponse(BaseModel):
     rebuilt_capsules: int = 0
     checks: List[AcceptanceCheck] = Field(default_factory=list)
     cases: List[AcceptanceCaseReport] = Field(default_factory=list)
+
+
+class ResearchBenchmarkRequest(BaseModel):
+    corpus_name: str = "local-default"
+    tenant_id: str = "research-benchmark"
+    latency_repetitions: int = 2
+    targets: Optional[AcceptanceTargets] = None
+
+
+class ResearchCorpusCoverage(BaseModel):
+    message_count: int
+    edit_count: int
+    delete_count: int
+    session_count: int
+    topic_count: int
+    group_count: int
+    thread_count: int
+    case_count: int
+    scoped_case_count: int
+    chat_types: List[str] = Field(default_factory=list)
+    retrieval_modes: List[str] = Field(default_factory=list)
+    filter_dimensions: List[str] = Field(default_factory=list)
+    entity_types_seen: List[str] = Field(default_factory=list)
+
+
+class ResearchBenchmarkResponse(AcceptanceBenchmarkResponse):
+    corpus_name: str
+    corpus_version: str
+    corpus_description: str
+    seeded_messages: int
+    seeded_edits: int
+    seeded_deletes: int
+    coverage: ResearchCorpusCoverage
 
 
 class WalRecord(BaseModel):

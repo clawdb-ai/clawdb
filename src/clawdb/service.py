@@ -43,6 +43,9 @@ from .models import (
     IndexStatusResponse,
     OpenClawMemoryReadResponse,
     OpenClawMemorySearchRequest,
+    ResearchBenchmarkRequest,
+    ResearchBenchmarkResponse,
+    ResearchCorpusCoverage,
     SearchResult,
     SessionForkRequest,
     SessionForkResponse,
@@ -54,6 +57,7 @@ from .models import (
     SearchResponse,
 )
 from .mq import AsyncMessageQueue, build_event, create_queue
+from .research import get_research_corpus
 from .retrieval import HybridRetrievalEngine, RetrievalDoc, resolve_retrieval_weights
 from .trie import TopicTrie
 from .topics import GaussianEwensTopicModel
@@ -1095,6 +1099,60 @@ class ClawDBService:
             memory_cache_lookup_latency_ms_p50=self.telemetry.p50_lookup_latency_ms(),
         )
 
+    async def evaluate_research_benchmark(
+        self,
+        req: ResearchBenchmarkRequest,
+    ) -> ResearchBenchmarkResponse:
+        corpus = get_research_corpus(req.corpus_name)
+        tenant_id = str(req.tenant_id or "research-benchmark")
+        for message in corpus.messages:
+            await self.ingest_message(
+                message.model_copy(
+                    deep=True,
+                    update={"tenant_id": tenant_id},
+                )
+            )
+        for edit in corpus.edits:
+            await self.edit_message(
+                edit.model_copy(
+                    deep=True,
+                    update={"tenant_id": tenant_id},
+                )
+            )
+        for delete in corpus.deletes:
+            await self.delete_message(
+                delete.model_copy(
+                    deep=True,
+                    update={"tenant_id": tenant_id},
+                )
+            )
+        benchmark = await self.evaluate_acceptance(
+            corpus.build_acceptance_request(
+                tenant_id=tenant_id,
+                latency_repetitions=req.latency_repetitions,
+                targets=req.targets,
+            )
+        )
+        coverage_payload = corpus.coverage()
+        coverage_payload["entity_types_seen"] = sorted(
+            {
+                str(entity_type)
+                for case in benchmark.cases
+                for entity_type in case.result_entity_types
+                if str(entity_type)
+            }
+        )
+        return ResearchBenchmarkResponse(
+            **benchmark.model_dump(),
+            corpus_name=corpus.name,
+            corpus_version=corpus.version,
+            corpus_description=corpus.description,
+            seeded_messages=len(corpus.messages),
+            seeded_edits=len(corpus.edits),
+            seeded_deletes=len(corpus.deletes),
+            coverage=ResearchCorpusCoverage(**coverage_payload),
+        )
+
     async def evaluate_acceptance(
         self,
         req: AcceptanceBenchmarkRequest,
@@ -1148,6 +1206,7 @@ class ClawDBService:
                     ndcg_at=case_ndcg,
                     top_match_keys=top_match_keys,
                     matched_relevance=ranked_relevance,
+                    result_entity_types=[str(item.entity_type) for item in result.results],
                 )
             )
 
