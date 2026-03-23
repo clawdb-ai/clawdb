@@ -2621,12 +2621,16 @@ class DataFrameStore:
         async with self._lock:
             origin_message_id = str(bundle.get("origin_message_id") or "")
             existing = self._state.messages_df[
-                self._state.messages_df["origin_message_id"].astype(str) == origin_message_id
+                (self._state.messages_df["tenant_id"].astype(str) == tenant_id)
+                & (self._state.messages_df["origin_message_id"].astype(str) == origin_message_id)
             ]
             replaced_existing = not existing.empty
             if replaced_existing:
                 self._state.messages_df = self._state.messages_df[
-                    self._state.messages_df["origin_message_id"].astype(str) != origin_message_id
+                    ~(
+                        (self._state.messages_df["tenant_id"].astype(str) == tenant_id)
+                        & (self._state.messages_df["origin_message_id"].astype(str) == origin_message_id)
+                    )
                 ]
             rows = [dict(bundle["raw_message"]), *[dict(item) for item in projections]]
             row_df = pd.DataFrame(rows, columns=MESSAGES_COLUMNS)
