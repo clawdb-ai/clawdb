@@ -12,9 +12,9 @@ from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import pandas as pd
 
+from .capsules import CAPSULES_COLUMNS, materialize_capsule_lifecycle
 from .dataframes import (
     CACHE_INDEX_COLUMNS,
-    CAPSULES_COLUMNS,
     MESSAGES_COLUMNS,
     SESSION_ROLLUPS_COLUMNS,
     SESSIONS_COLUMNS,
@@ -30,7 +30,7 @@ from .metadata import DataFrameMetadataStore
 from .topics import TOPICS_COLUMNS, materialize_topic_lifecycle
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -263,21 +263,63 @@ def _normalize_capsules(frame: pd.DataFrame) -> pd.DataFrame:
     defaults: Dict[str, object] = {
         "capsule_id": "",
         "tenant_id": "default",
-        "session_id": "default",
+        "session_id": "topic:default",
         "topic_id": "default",
+        "topic_path": "default",
+        "capsule_ordinal": 0,
+        "capsule_state": "open",
         "summary": "",
-        "level": "L1",
+        "level": "L2",
         "score": 0.0,
+        "source_message_count": 0,
+        "source_body_char_count": 0,
+        "threshold_body_char_count": 100000,
+        "first_origin_message_id": "",
+        "last_origin_message_id": "",
+        "source_message_ids_json": "[]",
+        "source_first_ts": pd.Timestamp.now(tz="UTC"),
+        "source_last_ts": pd.Timestamp.now(tz="UTC"),
+        "prev_capsule_id": "",
+        "next_capsule_id": "",
+        "back_link_ids_json": "[]",
+        "forward_link_ids_json": "[]",
+        "pointer_json": "{}",
+        "vector_text": "",
+        "vector_ref": "",
+        "vector_dim": 64,
+        "vector_json": "[]",
+        "source_hash": "",
         "updated_at": pd.Timestamp.now(tz="UTC"),
     }
     out = _ensure_columns(frame, CAPSULES_COLUMNS, defaults)
     out["capsule_id"] = _fill_string(out["capsule_id"])
     out["tenant_id"] = _fill_string(out["tenant_id"], "default")
-    out["session_id"] = _fill_string(out["session_id"], "default")
+    out["session_id"] = _fill_string(out["session_id"], "topic:default")
     out["topic_id"] = _fill_string(out["topic_id"], "default")
+    out["topic_path"] = _fill_string(out["topic_path"], "default")
+    out["capsule_ordinal"] = _to_int(out["capsule_ordinal"], 0)
+    out["capsule_state"] = _fill_string(out["capsule_state"], "open")
     out["summary"] = _fill_string(out["summary"])
-    out["level"] = _fill_string(out["level"], "L1")
+    out["level"] = _fill_string(out["level"], "L2")
     out["score"] = _to_float(out["score"], 0.0)
+    out["source_message_count"] = _to_int(out["source_message_count"], 0)
+    out["source_body_char_count"] = _to_int(out["source_body_char_count"], 0)
+    out["threshold_body_char_count"] = _to_int(out["threshold_body_char_count"], 100000)
+    out["first_origin_message_id"] = _fill_string(out["first_origin_message_id"])
+    out["last_origin_message_id"] = _fill_string(out["last_origin_message_id"])
+    out["source_message_ids_json"] = _fill_string(out["source_message_ids_json"], "[]")
+    out["source_first_ts"] = _to_datetime_utc(out["source_first_ts"])
+    out["source_last_ts"] = _to_datetime_utc(out["source_last_ts"])
+    out["prev_capsule_id"] = _fill_string(out["prev_capsule_id"])
+    out["next_capsule_id"] = _fill_string(out["next_capsule_id"])
+    out["back_link_ids_json"] = _fill_string(out["back_link_ids_json"], "[]")
+    out["forward_link_ids_json"] = _fill_string(out["forward_link_ids_json"], "[]")
+    out["pointer_json"] = _fill_string(out["pointer_json"], "{}")
+    out["vector_text"] = _fill_string(out["vector_text"])
+    out["vector_ref"] = _fill_string(out["vector_ref"])
+    out["vector_dim"] = _to_int(out["vector_dim"], 64)
+    out["vector_json"] = _fill_string(out["vector_json"], "[]")
+    out["source_hash"] = _fill_string(out["source_hash"])
     out["updated_at"] = _to_datetime_utc(out["updated_at"])
     return out[CAPSULES_COLUMNS]
 
@@ -689,6 +731,12 @@ async def migrate_schema(
     normalized_tables["topics"] = await asyncio.to_thread(
         materialize_topic_lifecycle,
         normalized_tables["messages"],
+        vector_dim=_rollup_vector_dim_from_env(),
+    )
+    normalized_tables["capsules"] = await asyncio.to_thread(
+        materialize_capsule_lifecycle,
+        normalized_tables["messages"],
+        topics_frame=normalized_tables["topics"],
         vector_dim=_rollup_vector_dim_from_env(),
     )
 

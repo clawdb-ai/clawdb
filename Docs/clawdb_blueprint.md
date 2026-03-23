@@ -363,12 +363,18 @@ The following points were not fully specified yet and must be defined before imp
 
 ### Capsule lifecycle
 
-- [ ] Exact 100K threshold accounting rule
-- [ ] Capsule rollover behavior
-- [ ] Capsule pointer structure
-- [ ] Capsule back-links and forward-links
-- [ ] Capsule vector refresh policy
-- [ ] Capsule rebuild contract from source raw messages
+- [x] Exact 100K threshold accounting rule
+  Capsule accounting uses only normalized raw `content` characters from authoritative `raw_global` rows; metadata columns, IDs, vectors, summaries, and separator text do not count toward the `100000` threshold, and raw messages are never split across capsules.
+- [x] Capsule rollover behavior
+  Each canonical topic maintains one chronological open capsule tail; the tail seals as soon as its cumulative raw-body count reaches or exceeds `100000`, and the next raw message starts the next capsule. Topics below threshold still expose one open tail capsule.
+- [x] Capsule pointer structure
+  Every capsule row is keyed by stable `(tenant_id, canonical topic_id, capsule_ordinal)` and stores `capsule_id`, `topic_path`, first/last origin IDs, source coverage timestamps, ordered source message IDs, and a structured `pointer_json`.
+- [x] Capsule back-links and forward-links
+  Capsule lineage is explicit: `prev_capsule_id` and `next_capsule_id` link adjacent capsules, while `back_link_ids_json` and `forward_link_ids_json` carry the full ordered topic-local lineage.
+- [x] Capsule vector refresh policy
+  Capsule vectors are derived from deterministic capsule summary text; any edit, delete, or boundary change that alters the ordered source raw rows regenerates `source_hash`, `vector_ref`, `vector_json`, and `updated_at`.
+- [x] Capsule rebuild contract from source raw messages
+  `capsules` are a derived table rebuilt only from authoritative raw rows plus the current canonical topic mapping; deleting or backfilling the capsule parquet must reproduce the same capsule boundaries, lineage links, summaries, and vector references from raw source.
 
 ### Retrieval contract
 

@@ -10,6 +10,7 @@ from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
 
+from .capsules import CAPSULES_COLUMNS, materialize_capsule_lifecycle
 from .lineage import (
     DM_MIRROR_PUBLIC_PROJECTION_KIND,
     MESSAGE_STATE_DELETED,
@@ -67,17 +68,6 @@ MESSAGES_COLUMNS = [
     "message_state",
     "updated_at",
     "deleted_at",
-]
-
-CAPSULES_COLUMNS = [
-    "capsule_id",
-    "tenant_id",
-    "session_id",
-    "topic_id",
-    "summary",
-    "level",
-    "score",
-    "updated_at",
 ]
 
 SESSION_ROLLUPS_COLUMNS = [
@@ -472,6 +462,36 @@ class DataFrameStore:
                 "message_state": "string",
             }
         )
+        self._state.capsules_df = self._state.capsules_df.astype(
+            {
+                "capsule_id": "string",
+                "tenant_id": "string",
+                "session_id": "string",
+                "topic_id": "string",
+                "topic_path": "string",
+                "capsule_ordinal": "int64",
+                "capsule_state": "string",
+                "summary": "string",
+                "level": "string",
+                "score": "float64",
+                "source_message_count": "int64",
+                "source_body_char_count": "int64",
+                "threshold_body_char_count": "int64",
+                "first_origin_message_id": "string",
+                "last_origin_message_id": "string",
+                "source_message_ids_json": "string",
+                "prev_capsule_id": "string",
+                "next_capsule_id": "string",
+                "back_link_ids_json": "string",
+                "forward_link_ids_json": "string",
+                "pointer_json": "string",
+                "vector_text": "string",
+                "vector_ref": "string",
+                "vector_dim": "int64",
+                "vector_json": "string",
+                "source_hash": "string",
+            }
+        )
         self._state.session_rollups_df = self._state.session_rollups_df.astype(
             {
                 "rollup_id": "string",
@@ -710,10 +730,60 @@ class DataFrameStore:
         indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
         indexed["session_id"] = indexed["session_id"].fillna("default").astype(str)
         indexed["capsule_id"] = indexed["capsule_id"].fillna("").astype(str)
+        indexed["topic_id"] = indexed["topic_id"].fillna("default").astype(str)
+        indexed["capsule_ordinal"] = pd.to_numeric(indexed["capsule_ordinal"], errors="coerce").fillna(0).astype(int)
+        indexed["capsule_state"] = indexed["capsule_state"].fillna("").astype(str)
+        indexed["updated_at"] = pd.to_datetime(indexed["updated_at"], utc=True, errors="coerce")
         indexed = indexed.set_index(CAPSULE_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
         self._capsules_indexed_df = indexed
         self._capsules_index_dirty = False
         return indexed
+
+    def _canonical_topic_ids_locked(
+        self,
+        tenant_id: str,
+        topic_ids: List[str],
+    ) -> List[str]:
+        if not topic_ids:
+            return []
+        if self._state.topics_df.empty:
+            return sorted({str(item) for item in topic_ids if str(item)})
+        topics = self._state.topics_df.copy()
+        topics["tenant_id"] = topics["tenant_id"].fillna("default").astype(str)
+        topics["topic_id"] = topics["topic_id"].fillna("default").astype(str)
+        topics["canonical_topic_id"] = topics["canonical_topic_id"].fillna(topics["topic_id"]).astype(str)
+        scoped = topics[topics["tenant_id"].astype(str) == str(tenant_id)]
+        canonical_lookup = {
+            (str(row["tenant_id"]), str(row["topic_id"])): str(row["canonical_topic_id"] or row["topic_id"])
+            for _, row in scoped.iterrows()
+        }
+        return sorted(
+            {
+                canonical_lookup.get((str(tenant_id), str(topic_id)), str(topic_id))
+                for topic_id in topic_ids
+                if str(topic_id)
+            }
+        )
+
+    def _topic_ids_for_session_locked(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        include_deleted: bool,
+    ) -> List[str]:
+        rows = self._messages_for_query_locked(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            row_mode="all",
+            include_deleted=include_deleted,
+        )
+        topic_ids = sorted({str(item) for item in rows["topic_id"].astype(str).tolist() if str(item)}) if not rows.empty else []
+        if not topic_ids and str(session_id).startswith("topic:"):
+            fallback_topic_id = str(session_id).split(":", 1)[1].strip()
+            if fallback_topic_id:
+                topic_ids = [fallback_topic_id]
+        return self._canonical_topic_ids_locked(tenant_id, topic_ids)
 
     def _capsules_for_query_locked(self, tenant_id: str, session_id: str) -> pd.DataFrame:
         if self._capsules_index_dirty or self._capsules_indexed_df is None:
@@ -722,12 +792,12 @@ class DataFrameStore:
             indexed = self._capsules_indexed_df
         if indexed.empty:
             return indexed
-        session_ids = self._resolve_session_ids_locked(tenant_id, str(session_id))
-        if not session_ids:
-            session_ids = [str(session_id)]
+        topic_ids = self._topic_ids_for_session_locked(tenant_id, str(session_id), include_deleted=False)
+        if not topic_ids:
+            return indexed.iloc[0:0].copy()
         scoped = indexed[
             (indexed["tenant_id"].astype(str) == str(tenant_id))
-            & (indexed["session_id"].astype(str).isin(session_ids))
+            & (indexed["topic_id"].astype(str).isin(topic_ids))
         ]
         if scoped.empty:
             return indexed.iloc[0:0].copy()
@@ -1123,6 +1193,16 @@ class DataFrameStore:
             )
             return int(self._state.topics_df.shape[0])
 
+    async def rebuild_all_capsules(self, *, vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM) -> int:
+        async with self._lock:
+            self._state.capsules_df = materialize_capsule_lifecycle(
+                self._state.messages_df,
+                topics_frame=self._state.topics_df,
+                vector_dim=vector_dim,
+            )
+            self._invalidate_capsules_index_locked()
+            return int(self._state.capsules_df.shape[0])
+
     async def refresh_session_rollups(
         self,
         tenant_id: str,
@@ -1156,57 +1236,51 @@ class DataFrameStore:
             self._invalidate_session_rollups_index_locked()
             return int(materialized.shape[0])
 
-    async def refresh_capsules(self, tenant_id: str, session_id: str) -> int:
+    async def refresh_capsules(
+        self,
+        tenant_id: str,
+        session_id: str,
+        *,
+        vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM,
+    ) -> int:
         async with self._lock:
-            session_ids = self._resolve_session_ids_locked(tenant_id, str(session_id))
-            if not session_ids:
-                session_ids = [str(session_id)]
-            self._state.capsules_df = self._state.capsules_df[
-                ~(
-                    (self._state.capsules_df["tenant_id"].astype(str) == str(tenant_id))
-                    & (self._state.capsules_df["session_id"].astype(str).isin(session_ids))
-                )
-            ]
+            impacted_topic_ids = self._topic_ids_for_session_locked(tenant_id, str(session_id), include_deleted=True)
+            if impacted_topic_ids:
+                self._state.capsules_df = self._state.capsules_df[
+                    ~(
+                        (self._state.capsules_df["tenant_id"].astype(str) == str(tenant_id))
+                        & (self._state.capsules_df["topic_id"].astype(str).isin(impacted_topic_ids))
+                    )
+                ]
             self._invalidate_capsules_index_locked()
-            subset = self._messages_for_query_locked(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                row_mode="projection",
-            )
-            if subset.empty:
+            if not impacted_topic_ids:
                 return 0
-            rows: List[Dict[str, object]] = []
-            for resolved_session_id in sorted(subset["session_id"].astype(str).unique().tolist()):
-                session_subset = subset[subset["session_id"].astype(str) == resolved_session_id]
-                lifetime_rollups = self._session_rollups_for_query_locked(
-                    tenant_id=tenant_id,
-                    session_id=resolved_session_id,
-                    window_kind="lifetime",
-                )
-                if lifetime_rollups.empty:
-                    ordered = self._chronological_messages(session_subset)
-                    summary = " ".join(ordered["content"].astype(str).tail(20).tolist())[:2000]
-                else:
-                    latest = lifetime_rollups.sort_values("updated_at", kind="stable").iloc[-1]
-                    summary = str(latest.get("summary") or "")
-                rows.append(
-                    {
-                        "capsule_id": f"caps-{tenant_id}-{resolved_session_id}",
-                        "tenant_id": tenant_id,
-                        "session_id": resolved_session_id,
-                        "topic_id": "default",
-                        "summary": summary,
-                        "level": "L1",
-                        "score": 1.0,
-                        "updated_at": pd.Timestamp.utcnow(),
-                    }
-                )
+            tenant_messages = self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=None,
+                row_mode="raw",
+                include_deleted=True,
+            )
+            materialized = materialize_capsule_lifecycle(
+                tenant_messages,
+                topics_frame=self._state.topics_df[
+                    self._state.topics_df["tenant_id"].astype(str) == str(tenant_id)
+                ],
+                vector_dim=vector_dim,
+            )
+            if materialized.empty:
+                return 0
+            materialized = materialized[
+                materialized["topic_id"].astype(str).isin(impacted_topic_ids)
+            ].reset_index(drop=True)
+            if materialized.empty:
+                return 0
             self._state.capsules_df = pd.concat(
-                [self._state.capsules_df, pd.DataFrame(rows, columns=CAPSULES_COLUMNS)],
+                [self._state.capsules_df, materialized[CAPSULES_COLUMNS]],
                 ignore_index=True,
             )
             self._invalidate_capsules_index_locked()
-            return len(rows)
+            return int(materialized.shape[0])
 
     async def create_snapshot(
         self,
@@ -1640,16 +1714,34 @@ class DataFrameStore:
     async def capsule_cards(self, tenant_id: str, session_id: str) -> List[Dict[str, object]]:
         async with self._lock:
             df = self._capsules_for_query_locked(tenant_id, session_id)
-            df = df.reset_index(drop=True).sort_values("updated_at", kind="stable", ascending=False)
+            if df.empty:
+                return []
+            df = df.reset_index(drop=True).sort_values(
+                ["updated_at", "capsule_ordinal"],
+                kind="stable",
+                ascending=[False, False],
+            )
             out: List[Dict[str, object]] = []
             for _, row in df.iterrows():
                 out.append(
                     {
                         "capsule_id": str(row["capsule_id"]),
                         "topic_id": str(row.get("topic_id") or "default"),
+                        "topic_path": str(row.get("topic_path") or row.get("topic_id") or "default"),
+                        "capsule_ordinal": int(row.get("capsule_ordinal") or 0),
+                        "capsule_state": str(row.get("capsule_state") or ""),
                         "summary": str(row.get("summary") or ""),
-                        "level": str(row.get("level") or "L1"),
+                        "level": str(row.get("level") or "L2"),
                         "score": float(row.get("score") or 0.0),
+                        "source_message_count": int(row.get("source_message_count") or 0),
+                        "source_body_char_count": int(row.get("source_body_char_count") or 0),
+                        "threshold_body_char_count": int(row.get("threshold_body_char_count") or 0),
+                        "prev_capsule_id": str(row.get("prev_capsule_id") or ""),
+                        "next_capsule_id": str(row.get("next_capsule_id") or ""),
+                        "back_link_ids": json.loads(str(row.get("back_link_ids_json") or "[]")),
+                        "forward_link_ids": json.loads(str(row.get("forward_link_ids_json") or "[]")),
+                        "vector_ref": str(row.get("vector_ref") or ""),
+                        "pointer": json.loads(str(row.get("pointer_json") or "{}")),
                         "updated_at": pd.to_datetime(row["updated_at"], utc=True).isoformat(),
                     }
                 )

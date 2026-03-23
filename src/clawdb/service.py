@@ -193,6 +193,7 @@ class ClawDBService:
                     )
         await self._rebuild_topic_state_from_store()
         await self.df_store.rebuild_all_session_rollups(vector_dim=self.config.topic_gep_dim)
+        await self.df_store.rebuild_all_capsules(vector_dim=self.config.topic_gep_dim)
 
     async def flush_now(self) -> None:
         await self.df_store.save_parquet(self.config.parquet_dir)
@@ -243,7 +244,11 @@ class ClawDBService:
                 session_id,
                 vector_dim=self.config.topic_gep_dim,
             )
-            await self.df_store.refresh_capsules(tenant_id, session_id)
+            await self.df_store.refresh_capsules(
+                tenant_id,
+                session_id,
+                vector_dim=self.config.topic_gep_dim,
+            )
 
     async def _rebuild_topic_state_from_store(self) -> None:
         await self.df_store.rebuild_all_topics(vector_dim=self.config.topic_gep_dim)
@@ -739,6 +744,7 @@ class ClawDBService:
 
     async def rebuild_indexes(self) -> IndexRebuildResponse:
         await self._rebuild_topic_state_from_store()
+        await self.df_store.rebuild_all_capsules(vector_dim=self.config.topic_gep_dim)
         docs = await self.df_store.message_documents(tenant_id="*", session_id=None, row_mode="raw")
         rebuilt = len([item for item in docs if str(item.get("content") or "")])
         return IndexRebuildResponse(
@@ -752,7 +758,11 @@ class ClawDBService:
         lock_key = f"session:{req.tenant_id}:{req.session_id}"
         async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
             record = await self.wal.append("capsule_refresh", payload)
-            count = await self.df_store.refresh_capsules(req.tenant_id, req.session_id)
+            count = await self.df_store.refresh_capsules(
+                req.tenant_id,
+                req.session_id,
+                vector_dim=self.config.topic_gep_dim,
+            )
             await self.queue.publish(build_event(record.seq, "capsule_refresh", payload))
         return CapsuleRefreshResponse(wal_seq=record.seq, capsule_count=count)
 

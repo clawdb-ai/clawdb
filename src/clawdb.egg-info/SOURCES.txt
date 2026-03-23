@@ -3,6 +3,7 @@ pyproject.toml
 src/clawdb/__init__.py
 src/clawdb/api.py
 src/clawdb/auth.py
+src/clawdb/capsules.py
 src/clawdb/config.py
 src/clawdb/dataframes.py
 src/clawdb/embeddings.py
@@ -24,4 +25,7 @@ src/clawdb.egg-info/SOURCES.txt
 src/clawdb.egg-info/dependency_links.txt
 src/clawdb.egg-info/requires.txt
 src/clawdb.egg-info/top_level.txt
+tests/test_capsule_lifecycle.py
 tests/test_lineage_projections.py
+tests/test_session_rollups.py
+tests/test_topic_lifecycle.py
