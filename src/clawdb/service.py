@@ -384,6 +384,7 @@ class ClawDBService:
             await self.queue.publish(build_event(record.seq, "message_upsert", payload))
             await self._rebuild_topic_state_from_store()
             await self._refresh_impacted_sessions(req_with_topic.tenant_id, upsert_result.affected_sessions)
+            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
             ack = MessageAck(
                 wal_seq=record.seq,
                 message_id=req_with_topic.message_id,
@@ -427,6 +428,7 @@ class ClawDBService:
             self._invalidate_query_state()
             await self._rebuild_topic_state_from_store()
             await self._refresh_impacted_sessions(req.tenant_id, result.affected_sessions)
+            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
             await self.queue.publish(build_event(record.seq, "message_edit", payload))
         return MessageAck(
             wal_seq=record.seq,
@@ -464,6 +466,7 @@ class ClawDBService:
             self._invalidate_query_state()
             await self._rebuild_topic_state_from_store()
             await self._refresh_impacted_sessions(req.tenant_id, result.affected_sessions)
+            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
             await self.queue.publish(build_event(record.seq, "message_delete", payload))
         return MessageAck(
             wal_seq=record.seq,
@@ -589,6 +592,9 @@ class ClawDBService:
                 state.capsules_df,
                 state.session_rollups_df,
                 state.topics_df,
+                state.search_docs_df,
+                state.lexical_index_df,
+                state.vector_index_df,
                 state.cache_index_df,
                 state.sessions_df,
                 state.snapshots_df,
@@ -661,11 +667,17 @@ class ClawDBService:
                 for item in docs_raw
             ]
             doc_map = {str(item["doc_id"]): item for item in docs_raw}
+            lexical_postings, vector_entries = await self.df_store.search_index_entries(
+                tenant_id=req.tenant_id,
+                doc_ids=list(doc_map.keys()),
+            )
             retrieval = self.retrieval_engine.search(
                 query=req.query,
                 docs=docs,
                 top_k=max(req.max_results * 5, req.max_results),
                 retrieval_mode=req.retrieval_mode,
+                lexical_postings=lexical_postings,
+                vector_entries=vector_entries,
             )
             raw_results: List[SearchResult] = []
             for score in retrieval:
@@ -798,6 +810,7 @@ class ClawDBService:
                 source_session_id=req.source_session_id,
                 target_session_id=target,
             )
+            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
             await self.df_store.create_snapshot(
                 tenant_id=req.tenant_id,
                 session_id=req.source_session_id,
@@ -886,6 +899,7 @@ class ClawDBService:
                 req.session_id,
                 vector_dim=self.config.topic_gep_dim,
             )
+            await self.df_store.rebuild_search_indexes(vector_dim=self.config.topic_gep_dim)
             await self.queue.publish(build_event(record.seq, "capsule_refresh", payload))
         return CapsuleRefreshResponse(wal_seq=record.seq, capsule_count=count)
 

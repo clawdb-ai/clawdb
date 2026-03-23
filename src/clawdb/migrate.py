@@ -30,10 +30,11 @@ from .lineage import (
     normalize_platform_identities,
 )
 from .metadata import DataFrameMetadataStore
+from .search_index import LEXICAL_INDEX_COLUMNS, SEARCH_DOC_COLUMNS, VECTOR_INDEX_COLUMNS
 from .topics import TOPICS_COLUMNS
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -69,6 +70,9 @@ TABLE_COLUMNS: Mapping[str, List[str]] = {
     "capsules": CAPSULES_COLUMNS,
     "session_rollups": SESSION_ROLLUPS_COLUMNS,
     "topics": TOPICS_COLUMNS,
+    "search_docs": SEARCH_DOC_COLUMNS,
+    "lexical_index": LEXICAL_INDEX_COLUMNS,
+    "vector_index": VECTOR_INDEX_COLUMNS,
     "embedding_index_metadata": EMBEDDING_INDEX_METADATA_COLUMNS,
     "cache_index": CACHE_INDEX_COLUMNS,
     "sessions": SESSIONS_COLUMNS,
@@ -465,6 +469,61 @@ def _normalize_embedding_index_metadata(frame: pd.DataFrame) -> pd.DataFrame:
     return out[EMBEDDING_INDEX_METADATA_COLUMNS]
 
 
+def _normalize_search_docs(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "tenant_id": "default",
+        "doc_id": "",
+        "entity_type": "",
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+        "text": "",
+    }
+    out = _ensure_columns(frame, SEARCH_DOC_COLUMNS, defaults)
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["doc_id"] = _fill_string(out["doc_id"])
+    out["entity_type"] = _fill_string(out["entity_type"])
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    out["text"] = _fill_string(out["text"])
+    return out[SEARCH_DOC_COLUMNS]
+
+
+def _normalize_lexical_index(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "tenant_id": "default",
+        "doc_id": "",
+        "token": "",
+        "term_freq": 0,
+        "doc_len": 0,
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+    }
+    out = _ensure_columns(frame, LEXICAL_INDEX_COLUMNS, defaults)
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["doc_id"] = _fill_string(out["doc_id"])
+    out["token"] = _fill_string(out["token"])
+    out["term_freq"] = _to_int(out["term_freq"], 0)
+    out["doc_len"] = _to_int(out["doc_len"], 0)
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    return out[LEXICAL_INDEX_COLUMNS]
+
+
+def _normalize_vector_index(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "tenant_id": "default",
+        "doc_id": "",
+        "vector_dim": 0,
+        "vector_json": "[]",
+        "vector_norm": 0.0,
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+    }
+    out = _ensure_columns(frame, VECTOR_INDEX_COLUMNS, defaults)
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["doc_id"] = _fill_string(out["doc_id"])
+    out["vector_dim"] = _to_int(out["vector_dim"], 0)
+    out["vector_json"] = _fill_string(out["vector_json"], "[]")
+    out["vector_norm"] = _to_float(out["vector_norm"], 0.0)
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    return out[VECTOR_INDEX_COLUMNS]
+
+
 def _normalize_cache_index(frame: pd.DataFrame) -> pd.DataFrame:
     defaults: Dict[str, object] = {
         "key": "",
@@ -533,6 +592,9 @@ NORMALIZERS: Mapping[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
     "capsules": _normalize_capsules,
     "session_rollups": _normalize_session_rollups,
     "topics": _normalize_topics,
+    "search_docs": _normalize_search_docs,
+    "lexical_index": _normalize_lexical_index,
+    "vector_index": _normalize_vector_index,
     "embedding_index_metadata": _normalize_embedding_index_metadata,
     "cache_index": _normalize_cache_index,
     "sessions": _normalize_sessions,
@@ -578,7 +640,15 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
 def _partition_value(frame: pd.DataFrame, table: str) -> pd.Series:
     if table == "messages":
         return pd.to_datetime(frame["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-    if table in {"capsules", "session_rollups", "topics", "embedding_index_metadata"}:
+    if table in {
+        "capsules",
+        "session_rollups",
+        "topics",
+        "search_docs",
+        "lexical_index",
+        "vector_index",
+        "embedding_index_metadata",
+    }:
         return pd.to_datetime(frame["updated_at"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
     if table in {"sessions", "snapshots"}:
         ts_col = "created_at"
@@ -783,6 +853,9 @@ async def migrate_schema(
     normalized_tables["session_rollups"] = rebuilt_storage["session_rollups"]
     normalized_tables["topics"] = rebuilt_storage["topics"]
     normalized_tables["capsules"] = rebuilt_storage["capsules"]
+    normalized_tables["search_docs"] = pd.DataFrame(columns=SEARCH_DOC_COLUMNS)
+    normalized_tables["lexical_index"] = pd.DataFrame(columns=LEXICAL_INDEX_COLUMNS)
+    normalized_tables["vector_index"] = pd.DataFrame(columns=VECTOR_INDEX_COLUMNS)
     normalized_tables["embedding_index_metadata"] = rebuilt_storage["embedding_index_metadata"]
 
     tmp_parquet = parquet_dir.parent / f"{parquet_dir.name}.tmp-schema-{timestamp}"

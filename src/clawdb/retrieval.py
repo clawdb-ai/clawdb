@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Sequence, Tuple
+from typing import Dict, List, Literal, Mapping, Sequence, Tuple
 
+import numpy as np
+
+from .search_index import LexicalPosting, VectorEntry, tokenize_lexical
 from .topics import _vectorize
 
 RetrievalMode = Literal["hybrid", "lexical", "vector"]
@@ -34,7 +37,7 @@ def resolve_retrieval_weights(mode: RetrievalMode) -> Tuple[float, float]:
 
 
 def _tokenize(text: str) -> List[str]:
-    return [token for token in text.lower().split() if token]
+    return tokenize_lexical(text)
 
 
 class BM25Index:
@@ -63,6 +66,43 @@ class BM25Index:
             self._tf[doc.doc_id] = tf
             for token in tf:
                 self._df[token] = self._df.get(token, 0) + 1
+        self._avg_len = (total_len / len(self._docs)) if self._docs else 0.0
+
+    def build_from_postings(
+        self,
+        docs: Sequence[RetrievalDoc],
+        postings: Sequence[LexicalPosting],
+    ) -> None:
+        self._docs = list(docs)
+        self._tf.clear()
+        self._df.clear()
+        self._doc_len.clear()
+        doc_map = {doc.doc_id: doc for doc in self._docs}
+        posting_docs = set()
+        for posting in postings:
+            doc_id = str(posting.doc_id)
+            if doc_id not in doc_map:
+                continue
+            posting_docs.add(doc_id)
+            tf = self._tf.setdefault(doc_id, {})
+            token = str(posting.token)
+            tf[token] = int(posting.term_freq)
+            self._doc_len[doc_id] = int(posting.doc_len)
+        for doc_id in posting_docs:
+            for token in self._tf.get(doc_id, {}):
+                self._df[token] = self._df.get(token, 0) + 1
+        for doc in self._docs:
+            if doc.doc_id in posting_docs:
+                continue
+            tokens = _tokenize(doc.text)
+            self._doc_len[doc.doc_id] = len(tokens)
+            tf: Dict[str, int] = {}
+            for token in tokens:
+                tf[token] = tf.get(token, 0) + 1
+            self._tf[doc.doc_id] = tf
+            for token in tf:
+                self._df[token] = self._df.get(token, 0) + 1
+        total_len = sum(max(0, int(self._doc_len.get(doc.doc_id, 0))) for doc in self._docs)
         self._avg_len = (total_len / len(self._docs)) if self._docs else 0.0
 
     def search(self, query: str, top_k: int | None = None) -> List[Tuple[str, float]]:
@@ -98,21 +138,52 @@ class HNSWIndex:
 
     def __init__(self, dim: int = 64) -> None:
         self.dim = dim
-        self._vectors: Dict[str, List[float]] = {}
+        self._vectors: Dict[str, np.ndarray] = {}
+        self._norms: Dict[str, float] = {}
 
     def build(self, docs: Sequence[RetrievalDoc]) -> None:
-        self._vectors = {doc.doc_id: _vectorize(doc.text, self.dim) for doc in docs}
+        self._vectors = {}
+        self._norms = {}
+        for doc in docs:
+            vector = np.asarray(_vectorize(doc.text, self.dim), dtype=float)
+            self._vectors[doc.doc_id] = vector
+            self._norms[doc.doc_id] = float(np.linalg.norm(vector))
+
+    def build_from_vectors(
+        self,
+        docs: Sequence[RetrievalDoc],
+        vectors: Sequence[VectorEntry],
+    ) -> None:
+        self._vectors = {}
+        self._norms = {}
+        provided = {
+            str(entry.doc_id): (
+                np.asarray(list(entry.vector), dtype=float),
+                float(entry.norm),
+            )
+            for entry in vectors
+        }
+        for doc in docs:
+            cached = provided.get(doc.doc_id)
+            if cached is not None:
+                vector, norm = cached
+            else:
+                vector = np.asarray(_vectorize(doc.text, self.dim), dtype=float)
+                norm = float(np.linalg.norm(vector))
+            self._vectors[doc.doc_id] = vector
+            self._norms[doc.doc_id] = norm
 
     def search(self, query: str, top_k: int | None = None) -> List[Tuple[str, float]]:
-        query_vector = _vectorize(query, self.dim)
+        query_vector = np.asarray(_vectorize(query, self.dim), dtype=float)
+        query_norm = float(np.linalg.norm(query_vector))
+        if query_norm <= 0.0:
+            return []
         out: List[Tuple[str, float]] = []
         for doc_id, vector in self._vectors.items():
-            dot = sum(left * right for left, right in zip(query_vector, vector))
-            query_norm = math.sqrt(sum(value * value for value in query_vector))
-            vector_norm = math.sqrt(sum(value * value for value in vector))
+            vector_norm = self._norms.get(doc_id, 0.0)
             if query_norm <= 0.0 or vector_norm <= 0.0:
                 continue
-            similarity = dot / (query_norm * vector_norm)
+            similarity = float(np.dot(query_vector, vector) / (query_norm * vector_norm))
             out.append((doc_id, float(max(0.0, similarity))))
         out.sort(key=lambda item: (-item[1], item[0]))
         if top_k is None:
@@ -131,11 +202,19 @@ class HybridRetrievalEngine:
         docs: Sequence[RetrievalDoc],
         top_k: int,
         retrieval_mode: RetrievalMode = "hybrid",
+        lexical_postings: Sequence[LexicalPosting] | None = None,
+        vector_entries: Sequence[VectorEntry] | None = None,
     ) -> List[RetrievalScore]:
         if not docs:
             return []
-        self.bm25.build(docs)
-        self.hnsw.build(docs)
+        if lexical_postings is None:
+            self.bm25.build(docs)
+        else:
+            self.bm25.build_from_postings(docs, lexical_postings)
+        if vector_entries is None:
+            self.hnsw.build(docs)
+        else:
+            self.hnsw.build_from_vectors(docs, vector_entries)
         lexical_weight, vector_weight = resolve_retrieval_weights(retrieval_mode)
         bm25_res = self.bm25.search(query, top_k=len(docs))
         vector_res = self.hnsw.search(query, top_k=len(docs))

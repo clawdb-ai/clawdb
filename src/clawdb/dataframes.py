@@ -7,7 +7,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -28,6 +28,16 @@ from .lineage import (
     normalize_identity,
 )
 from .models import SearchResult, WalRecord
+from .search_index import (
+    LEXICAL_INDEX_COLUMNS,
+    SEARCH_DOC_COLUMNS,
+    VECTOR_INDEX_COLUMNS,
+    LexicalPosting,
+    VectorEntry,
+    materialize_lexical_index,
+    materialize_vector_index,
+    parse_vector_json,
+)
 from .topics import (
     DEFAULT_TOPIC_VECTOR_DIM,
     TOPICS_COLUMNS,
@@ -178,6 +188,22 @@ SESSION_ROLLUP_MULTIINDEX_LEVELS = [
     "window_key",
 ]
 
+SEARCH_DOC_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "doc_id",
+]
+
+LEXICAL_INDEX_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "token",
+    "doc_id",
+]
+
+VECTOR_INDEX_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "doc_id",
+]
+
 SESSION_MULTIINDEX_LEVELS = [
     "tenant_id",
     "session_id",
@@ -204,6 +230,9 @@ class DataFramesState:
     capsules_df: pd.DataFrame
     session_rollups_df: pd.DataFrame
     topics_df: pd.DataFrame
+    search_docs_df: pd.DataFrame
+    lexical_index_df: pd.DataFrame
+    vector_index_df: pd.DataFrame
     embedding_index_metadata_df: pd.DataFrame
     cache_index_df: pd.DataFrame
     sessions_df: pd.DataFrame
@@ -909,6 +938,9 @@ class DataFrameStore:
             capsules_df=pd.DataFrame(columns=CAPSULES_COLUMNS),
             session_rollups_df=pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS),
             topics_df=pd.DataFrame(columns=TOPICS_COLUMNS),
+            search_docs_df=pd.DataFrame(columns=SEARCH_DOC_COLUMNS),
+            lexical_index_df=pd.DataFrame(columns=LEXICAL_INDEX_COLUMNS),
+            vector_index_df=pd.DataFrame(columns=VECTOR_INDEX_COLUMNS),
             embedding_index_metadata_df=pd.DataFrame(columns=EMBEDDING_INDEX_METADATA_COLUMNS),
             cache_index_df=pd.DataFrame(columns=CACHE_INDEX_COLUMNS),
             sessions_df=pd.DataFrame(columns=SESSIONS_COLUMNS),
@@ -1030,6 +1062,32 @@ class DataFrameStore:
                 "vector_json": "string",
             }
         )
+        self._state.search_docs_df = self._state.search_docs_df.astype(
+            {
+                "tenant_id": "string",
+                "doc_id": "string",
+                "entity_type": "string",
+                "text": "string",
+            }
+        )
+        self._state.lexical_index_df = self._state.lexical_index_df.astype(
+            {
+                "tenant_id": "string",
+                "doc_id": "string",
+                "token": "string",
+                "term_freq": "int64",
+                "doc_len": "int64",
+            }
+        )
+        self._state.vector_index_df = self._state.vector_index_df.astype(
+            {
+                "tenant_id": "string",
+                "doc_id": "string",
+                "vector_dim": "int64",
+                "vector_json": "string",
+                "vector_norm": "float64",
+            }
+        )
         self._state.embedding_index_metadata_df = self._state.embedding_index_metadata_df.astype(
             {
                 "tenant_id": "string",
@@ -1066,6 +1124,12 @@ class DataFrameStore:
         self._capsules_index_dirty = True
         self._session_rollups_indexed_df: Optional[pd.DataFrame] = None
         self._session_rollups_index_dirty = True
+        self._search_docs_indexed_df: Optional[pd.DataFrame] = None
+        self._search_docs_index_dirty = True
+        self._lexical_index_indexed_df: Optional[pd.DataFrame] = None
+        self._lexical_index_dirty = True
+        self._vector_indexed_df: Optional[pd.DataFrame] = None
+        self._vector_index_dirty = True
         self._sessions_indexed_df: Optional[pd.DataFrame] = None
         self._sessions_index_dirty = True
         self._snapshots_indexed_df: Optional[pd.DataFrame] = None
@@ -1085,6 +1149,18 @@ class DataFrameStore:
         self._session_rollups_indexed_df = None
         self._session_rollups_index_dirty = True
 
+    def _invalidate_search_docs_index_locked(self) -> None:
+        self._search_docs_indexed_df = None
+        self._search_docs_index_dirty = True
+
+    def _invalidate_lexical_index_locked(self) -> None:
+        self._lexical_index_indexed_df = None
+        self._lexical_index_dirty = True
+
+    def _invalidate_vector_index_locked(self) -> None:
+        self._vector_indexed_df = None
+        self._vector_index_dirty = True
+
     def _invalidate_sessions_index_locked(self) -> None:
         self._sessions_indexed_df = None
         self._sessions_index_dirty = True
@@ -1101,6 +1177,9 @@ class DataFrameStore:
         self._invalidate_messages_index_locked()
         self._invalidate_capsules_index_locked()
         self._invalidate_session_rollups_index_locked()
+        self._invalidate_search_docs_index_locked()
+        self._invalidate_lexical_index_locked()
+        self._invalidate_vector_index_locked()
         self._invalidate_sessions_index_locked()
         self._invalidate_snapshots_index_locked()
         self._invalidate_cache_lookup_index_locked()
@@ -1530,6 +1609,242 @@ class DataFrameStore:
             return indexed.iloc[0:0].copy()
         return scoped
 
+    def _materialize_search_docs_locked(self) -> pd.DataFrame:
+        rows: List[Dict[str, object]] = []
+
+        raw_rows = authoritative_raw_messages(self._state.messages_df)
+        if not raw_rows.empty:
+            scoped_raw = self._chronological_messages(raw_rows).reset_index(drop=True)
+            for _, row in scoped_raw.iterrows():
+                origin_id = str(row.get("origin_message_id") or row.get("message_id") or "")
+                if not origin_id:
+                    continue
+                updated_at = row.get("updated_at") if pd.notna(row.get("updated_at")) else row.get("ts")
+                rows.append(
+                    {
+                        "tenant_id": str(row.get("tenant_id") or "default"),
+                        "doc_id": f"raw:{origin_id}",
+                        "entity_type": "raw_message",
+                        "updated_at": _utc_timestamp(updated_at),
+                        "text": str(row.get("content") or ""),
+                    }
+                )
+
+        if not self._state.session_rollups_df.empty:
+            rollups = self._state.session_rollups_df.copy().reset_index(drop=True)
+            rollups["tenant_id"] = rollups["tenant_id"].fillna("default").astype(str)
+            rollups["rollup_id"] = rollups["rollup_id"].fillna("").astype(str)
+            rollups["session_id"] = rollups["session_id"].fillna("").astype(str)
+            rollups["window_kind"] = rollups["window_kind"].fillna("").astype(str)
+            rollups["window_key"] = rollups["window_key"].fillna("").astype(str)
+            rollups["summary"] = rollups["summary"].fillna("").astype(str)
+            rollups["updated_at"] = pd.to_datetime(rollups["updated_at"], utc=True, errors="coerce")
+            for _, row in rollups.iterrows():
+                primary = str(row.get("rollup_id") or "")
+                if not primary:
+                    primary = (
+                        "rollup:"
+                        f"{str(row.get('tenant_id') or 'default')}:"
+                        f"{str(row.get('session_id') or '')}:"
+                        f"{str(row.get('window_kind') or '')}:"
+                        f"{str(row.get('window_key') or '')}"
+                    )
+                rows.append(
+                    {
+                        "tenant_id": str(row.get("tenant_id") or "default"),
+                        "doc_id": primary,
+                        "entity_type": "session_rollup",
+                        "updated_at": _utc_timestamp(row.get("updated_at")),
+                        "text": str(row.get("summary") or ""),
+                    }
+                )
+
+        topic_tenants = sorted(
+            {
+                str(item)
+                for item in self._state.topics_df.get("tenant_id", pd.Series(dtype="string")).fillna("default").astype(str).tolist()
+                if str(item)
+            }
+        )
+        for tenant_id in topic_tenants:
+            topic_rows = self._topic_rows_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=None,
+                topic_id=None,
+            )
+            if topic_rows.empty:
+                continue
+            for _, row in topic_rows.iterrows():
+                canonical_topic_id = str(row.get("canonical_topic_id") or row.get("topic_id") or "default")
+                rows.append(
+                    {
+                        "tenant_id": tenant_id,
+                        "doc_id": f"topic:{canonical_topic_id}",
+                        "entity_type": "topic",
+                        "updated_at": _utc_timestamp(row.get("updated_at")),
+                        "text": str(row.get("summary") or row.get("vector_text") or ""),
+                    }
+                )
+
+        if not self._state.capsules_df.empty:
+            capsules = self._state.capsules_df.copy().reset_index(drop=True)
+            capsules["tenant_id"] = capsules["tenant_id"].fillna("default").astype(str)
+            capsules["capsule_id"] = capsules["capsule_id"].fillna("").astype(str)
+            capsules["summary"] = capsules["summary"].fillna("").astype(str)
+            capsules["updated_at"] = pd.to_datetime(capsules["updated_at"], utc=True, errors="coerce")
+            for _, row in capsules.iterrows():
+                capsule_id = str(row.get("capsule_id") or "")
+                if not capsule_id:
+                    continue
+                rows.append(
+                    {
+                        "tenant_id": str(row.get("tenant_id") or "default"),
+                        "doc_id": f"capsule:{capsule_id}",
+                        "entity_type": "capsule",
+                        "updated_at": _utc_timestamp(row.get("updated_at")),
+                        "text": str(row.get("summary") or ""),
+                    }
+                )
+
+        if not rows:
+            return pd.DataFrame(columns=SEARCH_DOC_COLUMNS)
+        frame = pd.DataFrame(rows, columns=SEARCH_DOC_COLUMNS)
+        frame["tenant_id"] = frame["tenant_id"].fillna("default").astype(str)
+        frame["doc_id"] = frame["doc_id"].fillna("").astype(str)
+        frame["entity_type"] = frame["entity_type"].fillna("").astype(str)
+        frame["updated_at"] = pd.to_datetime(frame["updated_at"], utc=True, errors="coerce")
+        frame["text"] = frame["text"].fillna("").astype(str)
+        frame = frame.sort_values(
+            ["tenant_id", "doc_id", "updated_at"],
+            ascending=[True, True, True],
+            kind="stable",
+        ).drop_duplicates(
+            subset=["tenant_id", "doc_id"],
+            keep="last",
+        )
+        return frame[SEARCH_DOC_COLUMNS].reset_index(drop=True)
+
+    def _rebuild_search_indexes_locked(self, *, vector_dim: int) -> int:
+        search_docs = self._materialize_search_docs_locked()
+        self._state.search_docs_df = search_docs
+        self._state.lexical_index_df = materialize_lexical_index(search_docs)
+        self._state.vector_index_df = materialize_vector_index(search_docs, dim=vector_dim)
+        self._invalidate_search_docs_index_locked()
+        self._invalidate_lexical_index_locked()
+        self._invalidate_vector_index_locked()
+        return int(search_docs.shape[0])
+
+    async def rebuild_search_indexes(self, *, vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM) -> int:
+        async with self._lock:
+            return self._rebuild_search_indexes_locked(vector_dim=vector_dim)
+
+    def _build_search_docs_index_locked(self) -> pd.DataFrame:
+        df = self._state.search_docs_df
+        if df.empty:
+            empty = df.copy()
+            self._search_docs_indexed_df = empty.set_index(SEARCH_DOC_MULTIINDEX_LEVELS, drop=False)
+            self._search_docs_index_dirty = False
+            return self._search_docs_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["doc_id"] = indexed["doc_id"].fillna("").astype(str)
+        indexed["entity_type"] = indexed["entity_type"].fillna("").astype(str)
+        indexed["text"] = indexed["text"].fillna("").astype(str)
+        indexed["updated_at"] = pd.to_datetime(indexed["updated_at"], utc=True, errors="coerce")
+        indexed = indexed.set_index(SEARCH_DOC_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._search_docs_indexed_df = indexed
+        self._search_docs_index_dirty = False
+        return indexed
+
+    def _build_lexical_index_locked(self) -> pd.DataFrame:
+        df = self._state.lexical_index_df
+        if df.empty:
+            empty = df.copy()
+            self._lexical_index_indexed_df = empty.set_index(LEXICAL_INDEX_MULTIINDEX_LEVELS, drop=False)
+            self._lexical_index_dirty = False
+            return self._lexical_index_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["doc_id"] = indexed["doc_id"].fillna("").astype(str)
+        indexed["token"] = indexed["token"].fillna("").astype(str)
+        indexed["term_freq"] = pd.to_numeric(indexed["term_freq"], errors="coerce").fillna(0).astype(int)
+        indexed["doc_len"] = pd.to_numeric(indexed["doc_len"], errors="coerce").fillna(0).astype(int)
+        indexed["updated_at"] = pd.to_datetime(indexed["updated_at"], utc=True, errors="coerce")
+        indexed = indexed.set_index(LEXICAL_INDEX_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._lexical_index_indexed_df = indexed
+        self._lexical_index_dirty = False
+        return indexed
+
+    def _build_vector_index_locked(self) -> pd.DataFrame:
+        df = self._state.vector_index_df
+        if df.empty:
+            empty = df.copy()
+            self._vector_indexed_df = empty.set_index(VECTOR_INDEX_MULTIINDEX_LEVELS, drop=False)
+            self._vector_index_dirty = False
+            return self._vector_indexed_df
+        indexed = df.copy()
+        indexed["tenant_id"] = indexed["tenant_id"].fillna("default").astype(str)
+        indexed["doc_id"] = indexed["doc_id"].fillna("").astype(str)
+        indexed["vector_dim"] = pd.to_numeric(indexed["vector_dim"], errors="coerce").fillna(0).astype(int)
+        indexed["vector_json"] = indexed["vector_json"].fillna("[]").astype(str)
+        indexed["vector_norm"] = pd.to_numeric(indexed["vector_norm"], errors="coerce").fillna(0.0).astype(float)
+        indexed["updated_at"] = pd.to_datetime(indexed["updated_at"], utc=True, errors="coerce")
+        indexed = indexed.set_index(VECTOR_INDEX_MULTIINDEX_LEVELS, drop=False).sort_index(kind="stable")
+        self._vector_indexed_df = indexed
+        self._vector_index_dirty = False
+        return indexed
+
+    async def search_index_entries(
+        self,
+        *,
+        tenant_id: str,
+        doc_ids: Sequence[str],
+    ) -> Tuple[List[LexicalPosting], List[VectorEntry]]:
+        scoped_doc_ids = sorted({str(item) for item in doc_ids if str(item)})
+        if not scoped_doc_ids:
+            return [], []
+        async with self._lock:
+            if self._lexical_index_dirty or self._lexical_index_indexed_df is None:
+                lexical_indexed = self._build_lexical_index_locked()
+            else:
+                lexical_indexed = self._lexical_index_indexed_df
+            if self._vector_index_dirty or self._vector_indexed_df is None:
+                vector_indexed = self._build_vector_index_locked()
+            else:
+                vector_indexed = self._vector_indexed_df
+
+            lexical_scoped = lexical_indexed[
+                (lexical_indexed["tenant_id"].astype(str) == str(tenant_id))
+                & (lexical_indexed["doc_id"].astype(str).isin(scoped_doc_ids))
+            ]
+            vector_scoped = vector_indexed[
+                (vector_indexed["tenant_id"].astype(str) == str(tenant_id))
+                & (vector_indexed["doc_id"].astype(str).isin(scoped_doc_ids))
+            ]
+
+            lexical_entries = [
+                LexicalPosting(
+                    doc_id=str(row.get("doc_id") or ""),
+                    token=str(row.get("token") or ""),
+                    term_freq=(
+                        0 if pd.isna(row.get("term_freq")) else int(row.get("term_freq"))
+                    ),
+                    doc_len=0 if pd.isna(row.get("doc_len")) else int(row.get("doc_len")),
+                )
+                for _, row in lexical_scoped.iterrows()
+            ]
+            vector_entries = [
+                VectorEntry(
+                    doc_id=str(row.get("doc_id") or ""),
+                    vector=parse_vector_json(row.get("vector_json")),
+                    norm=(
+                        0.0 if pd.isna(row.get("vector_norm")) else float(row.get("vector_norm"))
+                    ),
+                )
+                for _, row in vector_scoped.iterrows()
+            ]
+            return lexical_entries, vector_entries
+
     def _build_sessions_index_locked(self) -> pd.DataFrame:
         df = self._state.sessions_df
         if df.empty:
@@ -1933,6 +2248,7 @@ class DataFrameStore:
             self._state.topics_df = rebuilt["topics"]
             self._state.capsules_df = rebuilt["capsules"]
             self._state.embedding_index_metadata_df = rebuilt["embedding_index_metadata"]
+            self._rebuild_search_indexes_locked(vector_dim=vector_dim)
             self._invalidate_all_indexes_locked()
             return StorageRebuildResult(
                 raw_message_count=int(authoritative_raw_messages(self._state.messages_df).shape[0]),
@@ -2927,7 +3243,7 @@ class DataFrameStore:
             if df.empty:
                 target = tmp_parquet / name / "dt=empty"
                 target.mkdir(parents=True, exist_ok=True)
-                (target / f"part-{timestamp}.parquet").touch(exist_ok=True)
+                df.head(0).to_parquet(target / f"part-{timestamp}.parquet", index=False)
                 return
             write_df = df.copy()
             if "ts" in write_df.columns:
@@ -2947,6 +3263,9 @@ class DataFrameStore:
         _write_partitioned(state.capsules_df, "capsules")
         _write_partitioned(state.session_rollups_df, "session_rollups")
         _write_partitioned(state.topics_df, "topics")
+        _write_partitioned(state.search_docs_df, "search_docs")
+        _write_partitioned(state.lexical_index_df, "lexical_index")
+        _write_partitioned(state.vector_index_df, "vector_index")
         _write_partitioned(state.embedding_index_metadata_df, "embedding_index_metadata")
         _write_partitioned(state.cache_index_df, "cache_index")
         _write_partitioned(state.sessions_df, "sessions")
@@ -2986,6 +3305,9 @@ class DataFrameStore:
             capsules_df=_read_all("capsules", CAPSULES_COLUMNS),
             session_rollups_df=_read_all("session_rollups", SESSION_ROLLUPS_COLUMNS),
             topics_df=_read_all("topics", TOPICS_COLUMNS),
+            search_docs_df=_read_all("search_docs", SEARCH_DOC_COLUMNS),
+            lexical_index_df=_read_all("lexical_index", LEXICAL_INDEX_COLUMNS),
+            vector_index_df=_read_all("vector_index", VECTOR_INDEX_COLUMNS),
             embedding_index_metadata_df=_read_all(
                 "embedding_index_metadata",
                 EMBEDDING_INDEX_METADATA_COLUMNS,
