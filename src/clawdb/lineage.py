@@ -1,0 +1,235 @@
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, List, Mapping, Optional
+
+
+RAW_PROJECTION_KIND = "raw_global"
+PRIVATE_DM_PROJECTION_KIND = "private_dm"
+GROUP_PUBLIC_PROJECTION_KIND = "group_public"
+DM_MIRROR_PUBLIC_PROJECTION_KIND = "dm_mirror_public"
+
+MESSAGE_STATE_ACTIVE = "active"
+MESSAGE_STATE_EDITED = "edited"
+MESSAGE_STATE_DELETED = "deleted"
+
+
+@dataclass(frozen=True)
+class ProjectionSpec:
+    kind: str
+    scope: str
+    session_id: str
+    visibility: str
+    native_session_id: str = ""
+
+
+def normalize_platform(platform: Optional[str], channel: Optional[str] = None) -> str:
+    raw = (platform or channel or "").strip().lower()
+    return raw or "generic"
+
+
+def normalize_identity(platform: str, value: Optional[str], expected_kind: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if platform == "feishu":
+        if expected_kind == "user":
+            if raw.startswith("oc_"):
+                raise ValueError(f"Feishu user identity cannot use chat prefix: {raw}")
+            return f"feishu_user:{raw}"
+        if expected_kind == "chat":
+            if raw.startswith("ou_"):
+                raise ValueError(f"Feishu chat identity cannot use user prefix: {raw}")
+            return f"feishu_chat:{raw}"
+        if expected_kind == "account":
+            return f"feishu_account:{raw}"
+    return f"{platform}_{expected_kind}:{raw}"
+
+
+def canonical_origin_message_id(payload: Mapping[str, object]) -> str:
+    explicit = str(payload.get("origin_message_id") or "").strip()
+    if explicit:
+        return explicit
+    platform = normalize_platform(
+        str(payload.get("platform") or "") or None,
+        str(payload.get("channel") or "") or None,
+    )
+    account_id = str(payload.get("account_id") or "").strip() or "_"
+    platform_message_id = str(payload.get("platform_message_id") or "").strip()
+    if platform_message_id:
+        source = f"{platform}::{account_id}::{platform_message_id}"
+        digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:32]
+        return f"orig_{digest}"
+    return str(payload.get("message_id") or "").strip()
+
+
+def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec]:
+    platform = normalize_platform(
+        str(payload.get("platform") or "") or None,
+        str(payload.get("channel") or "") or None,
+    )
+    account_key = normalize_identity(platform, str(payload.get("account_id") or ""), "account") or (
+        f"{platform}_account:_"
+    )
+    chat_type = str(payload.get("chat_type") or "").strip().lower()
+    incoming_session_id = str(payload.get("session_id") or "").strip()
+    role = str(payload.get("role") or "").strip().lower()
+
+    def _preferred_user_id() -> str:
+        if role == "assistant":
+            candidates = [
+                payload.get("to_id"),
+                payload.get("from_id"),
+                payload.get("sender_id"),
+            ]
+        else:
+            candidates = [
+                payload.get("sender_id"),
+                payload.get("from_id"),
+                payload.get("to_id"),
+            ]
+        for candidate in candidates:
+            normalized = normalize_identity(platform, str(candidate or ""), "user")
+            if normalized:
+                return normalized
+        return ""
+
+    specs: List[ProjectionSpec] = []
+    if chat_type == "group":
+        group_key = normalize_identity(platform, str(payload.get("group_id") or ""), "chat")
+        if not group_key:
+            fallback_group = str(payload.get("native_channel_id") or incoming_session_id or "_").strip()
+            group_key = f"{platform}_chat:{fallback_group}"
+        group_scope = f"group:{account_key}:{group_key}"
+        specs.append(
+            ProjectionSpec(
+                kind=GROUP_PUBLIC_PROJECTION_KIND,
+                scope=group_scope,
+                session_id=group_scope,
+                visibility="public",
+                native_session_id=incoming_session_id,
+            )
+        )
+        actor_key = _preferred_user_id()
+        if actor_key:
+            dm_scope = f"dm:{account_key}:{actor_key}"
+            specs.append(
+                ProjectionSpec(
+                    kind=DM_MIRROR_PUBLIC_PROJECTION_KIND,
+                    scope=dm_scope,
+                    session_id=dm_scope,
+                    visibility="public",
+                )
+            )
+    else:
+        user_key = _preferred_user_id()
+        if not user_key:
+            fallback_user = incoming_session_id or str(payload.get("to_id") or payload.get("from_id") or "_")
+            user_key = f"{platform}_user:{fallback_user}"
+        dm_scope = f"dm:{account_key}:{user_key}"
+        specs.append(
+            ProjectionSpec(
+                kind=PRIVATE_DM_PROJECTION_KIND,
+                scope=dm_scope,
+                session_id=dm_scope,
+                visibility="private",
+                native_session_id=incoming_session_id,
+            )
+        )
+    deduped: Dict[tuple[str, str], ProjectionSpec] = {}
+    for spec in specs:
+        deduped[(spec.kind, spec.scope)] = spec
+    return list(deduped.values())
+
+
+def projection_message_id(origin_message_id: str, kind: str, scope: str) -> str:
+    digest = hashlib.sha256(f"{kind}::{scope}".encode("utf-8")).hexdigest()[:16]
+    return f"{origin_message_id}::proj::{digest}"
+
+
+def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, object]:
+    platform = normalize_platform(
+        str(payload.get("platform") or "") or None,
+        str(payload.get("channel") or "") or None,
+    )
+    origin_message_id = canonical_origin_message_id(payload)
+    ts_value = payload.get("ts")
+    if isinstance(ts_value, datetime):
+        ts = ts_value
+    elif ts_value:
+        ts = datetime.fromisoformat(str(ts_value).replace("Z", "+00:00"))
+    else:
+        ts = datetime.now(timezone.utc)
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    ts_iso = ts.isoformat()
+    base = {
+        "origin_message_id": origin_message_id,
+        "tenant_id": str(payload.get("tenant_id") or "default"),
+        "role": str(payload.get("role") or "user"),
+        "content": str(payload.get("content") or ""),
+        "ts": ts_iso,
+        "channel": str(payload.get("channel") or ""),
+        "chat_type": str(payload.get("chat_type") or ""),
+        "account_id": str(payload.get("account_id") or ""),
+        "from_id": str(payload.get("from_id") or ""),
+        "to_id": str(payload.get("to_id") or ""),
+        "sender_id": str(payload.get("sender_id") or ""),
+        "sender_name": str(payload.get("sender_name") or ""),
+        "sender_username": str(payload.get("sender_username") or ""),
+        "sender_e164": str(payload.get("sender_e164") or ""),
+        "group_id": str(payload.get("group_id") or ""),
+        "group_subject": str(payload.get("group_subject") or ""),
+        "group_channel": str(payload.get("group_channel") or ""),
+        "group_space": str(payload.get("group_space") or ""),
+        "native_channel_id": str(payload.get("native_channel_id") or ""),
+        "message_thread_id": str(payload.get("message_thread_id") or ""),
+        "thread_parent_id": str(payload.get("thread_parent_id") or ""),
+        "reply_to_id": str(payload.get("reply_to_id") or ""),
+        "topic_id": str(payload.get("topic_id") or "default"),
+        "topic_parent_id": str(payload.get("topic_parent_id") or ""),
+        "topic_path": str(payload.get("topic_path") or payload.get("topic_id") or "default"),
+        "topic_confidence": payload.get("topic_confidence"),
+        "topic_source": str(payload.get("topic_source") or ""),
+        "embedding_ref": str(payload.get("embedding_ref") or ""),
+        "capsule_level": str(payload.get("capsule_level") or "L0"),
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "visibility": "raw",
+        "platform": platform,
+        "platform_message_id": str(payload.get("platform_message_id") or ""),
+        "native_session_id": "",
+        "message_state": MESSAGE_STATE_ACTIVE,
+        "updated_at": ts_iso,
+        "deleted_at": None,
+    }
+    raw_row = {
+        **base,
+        "message_id": origin_message_id,
+        "session_id": "",
+        "projection_kind": RAW_PROJECTION_KIND,
+        "projection_scope": "global",
+    }
+    projections: List[Dict[str, object]] = []
+    for spec in build_projection_specs(payload):
+        projections.append(
+            {
+                **base,
+                "message_id": projection_message_id(origin_message_id, spec.kind, spec.scope),
+                "session_id": spec.session_id,
+                "projection_kind": spec.kind,
+                "projection_scope": spec.scope,
+                "visibility": spec.visibility,
+                "native_session_id": spec.native_session_id,
+            }
+        )
+    return {
+        "tenant_id": str(payload.get("tenant_id") or "default"),
+        "session_id": str(payload.get("session_id") or ""),
+        "request_message_id": str(payload.get("message_id") or origin_message_id),
+        "origin_message_id": origin_message_id,
+        "idempotency_key": str(payload.get("idempotency_key") or ""),
+        "raw_message": raw_row,
+        "projections": projections,
+    }

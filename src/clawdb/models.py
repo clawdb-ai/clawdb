@@ -13,6 +13,7 @@ class MessageIn(BaseModel):
     role: Literal["user", "assistant", "system", "tool"]
     content: str
     channel: Optional[str] = None
+    platform: Optional[str] = None
     chat_type: Optional[Literal["direct", "group", "channel", "thread"]] = None
     account_id: Optional[str] = None
     from_id: Optional[str] = None
@@ -26,6 +27,8 @@ class MessageIn(BaseModel):
     group_channel: Optional[str] = None
     group_space: Optional[str] = None
     native_channel_id: Optional[str] = None
+    platform_message_id: Optional[str] = None
+    origin_message_id: Optional[str] = None
     message_thread_id: Optional[str] = None
     thread_parent_id: Optional[str] = None
     reply_to_id: Optional[str] = None
@@ -44,6 +47,27 @@ class MessageAck(BaseModel):
     status: Literal["ok"] = "ok"
     wal_seq: int
     message_id: str
+    origin_message_id: Optional[str] = None
+    affected_projections: int = 0
+
+
+class MessageEditRequest(BaseModel):
+    tenant_id: str = "default"
+    origin_message_id: Optional[str] = None
+    platform: Optional[str] = None
+    account_id: Optional[str] = None
+    platform_message_id: Optional[str] = None
+    content: str
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class MessageDeleteRequest(BaseModel):
+    tenant_id: str = "default"
+    origin_message_id: Optional[str] = None
+    platform: Optional[str] = None
+    account_id: Optional[str] = None
+    platform_message_id: Optional[str] = None
+    ts: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class SearchRequest(BaseModel):
@@ -79,6 +103,9 @@ class SearchResult(BaseModel):
     topic_path: Optional[str] = None
     message_thread_id: Optional[str] = None
     sender_id: Optional[str] = None
+    origin_message_id: Optional[str] = None
+    projection_kind: Optional[str] = None
+    projection_scope: Optional[str] = None
 
 
 class SearchResponse(BaseModel):

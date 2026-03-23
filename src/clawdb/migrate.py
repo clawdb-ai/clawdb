@@ -19,10 +19,15 @@ from .dataframes import (
     SESSIONS_COLUMNS,
     SNAPSHOTS_COLUMNS,
 )
+from .lineage import (
+    MESSAGE_STATE_ACTIVE,
+    RAW_PROJECTION_KIND,
+    materialize_message_bundle,
+)
 from .metadata import DataFrameMetadataStore
 
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -132,6 +137,7 @@ def _ensure_columns(
 def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
     defaults: Dict[str, object | Callable[[pd.DataFrame], object]] = {
         "message_id": "",
+        "origin_message_id": lambda df: df.get("message_id", pd.Series([""] * len(df))),
         "tenant_id": "default",
         "session_id": "default",
         "role": "user",
@@ -162,10 +168,20 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
         "embedding_ref": "",
         "capsule_level": "L0",
         "idempotency_key": "",
+        "projection_kind": "",
+        "projection_scope": "",
+        "visibility": "",
+        "platform": "",
+        "platform_message_id": "",
+        "native_session_id": "",
+        "message_state": MESSAGE_STATE_ACTIVE,
+        "updated_at": lambda df: df.get("ts", pd.Series([pd.Timestamp.now(tz="UTC")] * len(df))),
+        "deleted_at": None,
     }
     out = _ensure_columns(frame, MESSAGES_COLUMNS, defaults)
 
     out["message_id"] = _fill_string(out["message_id"])
+    out["origin_message_id"] = _fill_string(out["origin_message_id"])
     out["tenant_id"] = _fill_string(out["tenant_id"], "default")
     out["session_id"] = _fill_string(out["session_id"], "default")
     out["role"] = _fill_string(out["role"], "user")
@@ -197,6 +213,44 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
     out["embedding_ref"] = _fill_string(out["embedding_ref"])
     out["capsule_level"] = _fill_string(out["capsule_level"], "L0")
     out["idempotency_key"] = _fill_string(out["idempotency_key"])
+    out["projection_kind"] = _fill_string(out["projection_kind"])
+    out["projection_scope"] = _fill_string(out["projection_scope"])
+    out["visibility"] = _fill_string(out["visibility"])
+    out["platform"] = _fill_string(out["platform"])
+    out["platform_message_id"] = _fill_string(out["platform_message_id"])
+    out["native_session_id"] = _fill_string(out["native_session_id"])
+    out["message_state"] = _fill_string(out["message_state"], MESSAGE_STATE_ACTIVE)
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    out["deleted_at"] = pd.to_datetime(out["deleted_at"], utc=True, errors="coerce")
+
+    legacy_rows = "projection_kind" not in frame.columns or "origin_message_id" not in frame.columns
+    if legacy_rows:
+        expanded: List[Dict[str, object]] = []
+        for row in out.to_dict("records"):
+            bundle = materialize_message_bundle(row)
+            expanded.append(dict(bundle["raw_message"]))
+            expanded.extend([dict(item) for item in bundle["projections"]])
+        if not expanded:
+            return out.iloc[0:0].copy()[MESSAGES_COLUMNS]
+        expanded_frame = pd.DataFrame(expanded, columns=MESSAGES_COLUMNS)
+        expanded_frame["ts"] = _to_datetime_utc(expanded_frame["ts"])
+        expanded_frame["updated_at"] = _to_datetime_utc(expanded_frame["updated_at"])
+        expanded_frame["deleted_at"] = pd.to_datetime(
+            expanded_frame["deleted_at"], utc=True, errors="coerce"
+        )
+        return expanded_frame[MESSAGES_COLUMNS]
+
+    has_raw_rows = (out["projection_kind"].astype(str) == RAW_PROJECTION_KIND).any()
+    if not has_raw_rows and not out.empty:
+        raw_rows: List[Dict[str, object]] = []
+        for _, row in out.iterrows():
+            if str(row.get("projection_kind") or "") == RAW_PROJECTION_KIND:
+                continue
+            bundle = materialize_message_bundle(row.to_dict())
+            raw_rows.append(dict(bundle["raw_message"]))
+        if raw_rows:
+            out = pd.concat([out, pd.DataFrame(raw_rows, columns=MESSAGES_COLUMNS)], ignore_index=True)
+            out = out.drop_duplicates(subset=["message_id"], keep="first")
     return out[MESSAGES_COLUMNS]
 
 
@@ -299,6 +353,14 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
     if messages_frame.empty:
         return CURRENT_SCHEMA_VERSION
     cols = set(messages_frame.columns)
+    lineage_cols = {
+        "origin_message_id",
+        "projection_kind",
+        "projection_scope",
+        "platform_message_id",
+        "native_session_id",
+        "message_state",
+    }
     im_cols = {
         "channel",
         "chat_type",
@@ -310,6 +372,8 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
         "topic_confidence",
     }
     topic_cols = {"topic_parent_id", "topic_path", "topic_source", "topic_confidence"}
+    if lineage_cols.issubset(cols):
+        return 4
     if im_cols.issubset(cols):
         return 3
     if topic_cols.issubset(cols):

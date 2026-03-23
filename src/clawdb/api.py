@@ -10,6 +10,8 @@ from .auth import build_request_auth, verify_openclaw_signature_or_raise
 from .models import (
     CapsuleRefreshRequest,
     MessageIn,
+    MessageEditRequest,
+    MessageDeleteRequest,
     SessionForkRequest,
     SessionSnapshotRequest,
     SessionSpawnRequest,
@@ -41,6 +43,28 @@ async def create_message(req: MessageIn):
         return await service.ingest_message(req)
     except ClawDBService.BackpressureRejectedError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/memory/messages/edit")
+async def edit_message(req: MessageEditRequest):
+    try:
+        return await service.edit_message(req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/v1/memory/messages/delete")
+async def delete_message(req: MessageDeleteRequest):
+    try:
+        return await service.delete_message(req)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/v1/memory/search")

@@ -12,6 +12,7 @@ from .config import ClawDBConfig
 from .dataframes import DataFrameStore
 from .embeddings import EmbeddingAuthContext, EmbeddingRouter
 from .folder_judger import FolderJudger
+from .lineage import materialize_message_bundle, normalize_platform
 from .locks import DeadlockSafeLockManager, LockRank
 from .metrics import CacheTelemetry
 from .metadata import DataFrameMetadataStore
@@ -22,6 +23,8 @@ from .models import (
     CapsuleRefreshResponse,
     HealthResponse,
     MessageAck,
+    MessageDeleteRequest,
+    MessageEditRequest,
     MessageIn,
     IndexRebuildResponse,
     IndexStatusResponse,
@@ -171,15 +174,24 @@ class ClawDBService:
                         str(record.payload.get("session_id") or "default"),
                         key,
                     )
+                    request_message_id = str(
+                        record.payload.get("request_message_id")
+                        or record.payload.get("message_id")
+                        or record.payload.get("origin_message_id")
+                        or ""
+                    )
+                    origin_message_id = str(
+                        record.payload.get("origin_message_id")
+                        or request_message_id
+                        or ""
+                    )
                     self._idempotency_index[scoped] = MessageAck(
                         wal_seq=record.seq,
-                        message_id=str(record.payload.get("message_id") or ""),
+                        message_id=request_message_id,
+                        origin_message_id=origin_message_id,
+                        affected_projections=len(list(record.payload.get("projections") or [])),
                     )
-                topic_id = str(record.payload.get("topic_id") or "")
-                content = str(record.payload.get("content") or "")
-                if topic_id and content:
-                    self.topic_model.observe_replay(topic_id, content)
-                    self.topic_trie.insert(topic_id, content)
+        await self._rebuild_topic_state_from_store()
 
     async def flush_now(self) -> None:
         await self.df_store.save_parquet(self.config.parquet_dir)
@@ -201,6 +213,8 @@ class ClawDBService:
                 break
             if event.event_type in {
                 "message_upsert",
+                "message_edit",
+                "message_delete",
                 "capsule_refresh",
                 "session_snapshot",
                 "session_fork",
@@ -216,6 +230,51 @@ class ClawDBService:
             for alert in alerts:
                 # Keep logging lightweight and structured.
                 print(alert)
+
+    def _invalidate_query_state(self) -> None:
+        self._search_cache.clear()
+        self._embedding_cache.clear()
+
+    async def _refresh_impacted_sessions(self, tenant_id: str, session_ids: Sequence[str]) -> None:
+        for session_id in sorted({str(item) for item in session_ids if str(item)}):
+            await self.df_store.refresh_capsules(tenant_id, session_id)
+
+    async def _rebuild_topic_state_from_store(self) -> None:
+        self.topic_trie = TopicTrie()
+        self.topic_model = GaussianEwensTopicModel(
+            dim=self.config.topic_gep_dim,
+            concentration=self.config.topic_gep_concentration,
+            sigma2=self.config.topic_gep_sigma2,
+            prior_sigma2=self.config.topic_gep_prior_sigma2,
+        )
+        docs = await self.df_store.message_documents(tenant_id="*", session_id=None, row_mode="raw")
+        for item in docs:
+            topic_id = str(item.get("topic_id") or "default")
+            content = str(item.get("content") or "")
+            if not content:
+                continue
+            self.topic_trie.insert(topic_id, content)
+            self.topic_model.observe_replay(topic_id, content)
+
+    async def _resolve_origin_or_raise(
+        self,
+        *,
+        tenant_id: str,
+        origin_message_id: Optional[str],
+        platform: Optional[str],
+        account_id: Optional[str],
+        platform_message_id: Optional[str],
+    ) -> str:
+        resolved_origin = await self.df_store.resolve_origin_message_id(
+            tenant_id=tenant_id,
+            origin_message_id=origin_message_id,
+            platform=(normalize_platform(platform) if platform else None),
+            account_id=account_id,
+            platform_message_id=platform_message_id,
+        )
+        if not resolved_origin:
+            raise KeyError("message origin not found")
+        return resolved_origin
 
     def _cache_key(self, req: SearchRequest) -> str:
         return (
@@ -250,6 +309,7 @@ class ClawDBService:
         await self._enforce_ingest_backpressure()
         normalized_channel = (req.channel or "").strip().lower() or None
         normalized_chat_type = (req.chat_type or "").strip().lower() or None
+        normalized_platform = normalize_platform(req.platform, normalized_channel)
         resolved_topic_id = req.topic_id
         auto_topic_assigned = False
         if self.config.topic_auto_classify_enabled and not resolved_topic_id:
@@ -268,6 +328,7 @@ class ClawDBService:
         req_with_topic = req.model_copy(
             update={
                 "channel": normalized_channel,
+                "platform": normalized_platform,
                 "chat_type": normalized_chat_type,
                 "topic_id": topic_id,
                 "topic_path": topic_path,
@@ -276,8 +337,9 @@ class ClawDBService:
                 "capsule_level": judged_level,
             }
         )
-        payload = req_with_topic.model_dump(mode="json")
-        lock_key = f"session:{req_with_topic.tenant_id}:{req_with_topic.session_id}"
+        payload = materialize_message_bundle(req_with_topic.model_dump(mode="json"))
+        origin_message_id = str(payload["origin_message_id"])
+        lock_key = f"message:{req_with_topic.tenant_id}:{origin_message_id}"
         async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
             if self.config.idempotency_dedupe_enabled and req_with_topic.idempotency_key:
                 scope = self._idempotency_scope(
@@ -289,16 +351,102 @@ class ClawDBService:
                 if cached_ack is not None:
                     return cached_ack
             record = await self.wal.append("message_upsert", payload)
-            await self.df_store.add_message(payload)
+            upsert_result = await self.df_store.apply_message_bundle(payload)
+            self._invalidate_query_state()
             await self.queue.publish(build_event(record.seq, "message_upsert", payload))
-            self.topic_model.observe(str(payload.get("topic_id") or "default"), req_with_topic.content)
-            self.topic_trie.insert(str(payload.get("topic_id") or "default"), req_with_topic.content)
-            ack = MessageAck(wal_seq=record.seq, message_id=req_with_topic.message_id)
+            if upsert_result.replaced_existing:
+                await self._rebuild_topic_state_from_store()
+            else:
+                self.topic_model.observe(str(req_with_topic.topic_id or "default"), req_with_topic.content)
+                self.topic_trie.insert(str(req_with_topic.topic_id or "default"), req_with_topic.content)
+            await self._refresh_impacted_sessions(req_with_topic.tenant_id, upsert_result.affected_sessions)
+            ack = MessageAck(
+                wal_seq=record.seq,
+                message_id=req_with_topic.message_id,
+                origin_message_id=origin_message_id,
+                affected_projections=upsert_result.affected_projections,
+            )
             if self.config.idempotency_dedupe_enabled and req_with_topic.idempotency_key:
                 self._idempotency_index[scope] = ack
                 if len(self._idempotency_index) > self._cache_cap:
                     self._idempotency_index.pop(next(iter(self._idempotency_index)))
         return ack
+
+    async def edit_message(self, req: MessageEditRequest) -> MessageAck:
+        resolved_origin = await self._resolve_origin_or_raise(
+            tenant_id=req.tenant_id,
+            origin_message_id=req.origin_message_id,
+            platform=req.platform,
+            account_id=req.account_id,
+            platform_message_id=req.platform_message_id,
+        )
+        payload = {
+            "tenant_id": req.tenant_id,
+            "origin_message_id": resolved_origin,
+            "platform": normalize_platform(req.platform) if req.platform else "",
+            "account_id": req.account_id or "",
+            "platform_message_id": req.platform_message_id or "",
+            "content": req.content,
+            "ts": req.ts.isoformat(),
+        }
+        lock_key = f"message:{req.tenant_id}:{resolved_origin}"
+        async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
+            record = await self.wal.append("message_edit", payload)
+            result = await self.df_store.edit_message(
+                tenant_id=req.tenant_id,
+                origin_message_id=resolved_origin,
+                content=req.content,
+                edited_at=req.ts,
+            )
+            if not result.found:
+                raise KeyError("message origin not found")
+            self._invalidate_query_state()
+            await self._rebuild_topic_state_from_store()
+            await self._refresh_impacted_sessions(req.tenant_id, result.affected_sessions)
+            await self.queue.publish(build_event(record.seq, "message_edit", payload))
+        return MessageAck(
+            wal_seq=record.seq,
+            message_id=resolved_origin,
+            origin_message_id=resolved_origin,
+            affected_projections=result.affected_projections,
+        )
+
+    async def delete_message(self, req: MessageDeleteRequest) -> MessageAck:
+        resolved_origin = await self._resolve_origin_or_raise(
+            tenant_id=req.tenant_id,
+            origin_message_id=req.origin_message_id,
+            platform=req.platform,
+            account_id=req.account_id,
+            platform_message_id=req.platform_message_id,
+        )
+        payload = {
+            "tenant_id": req.tenant_id,
+            "origin_message_id": resolved_origin,
+            "platform": normalize_platform(req.platform) if req.platform else "",
+            "account_id": req.account_id or "",
+            "platform_message_id": req.platform_message_id or "",
+            "ts": req.ts.isoformat(),
+        }
+        lock_key = f"message:{req.tenant_id}:{resolved_origin}"
+        async with self.lock_manager.acquire(lock_key, LockRank.SESSION):
+            record = await self.wal.append("message_delete", payload)
+            result = await self.df_store.delete_message(
+                tenant_id=req.tenant_id,
+                origin_message_id=resolved_origin,
+                deleted_at=req.ts,
+            )
+            if not result.found:
+                raise KeyError("message origin not found")
+            self._invalidate_query_state()
+            await self._rebuild_topic_state_from_store()
+            await self._refresh_impacted_sessions(req.tenant_id, result.affected_sessions)
+            await self.queue.publish(build_event(record.seq, "message_delete", payload))
+        return MessageAck(
+            wal_seq=record.seq,
+            message_id=resolved_origin,
+            origin_message_id=resolved_origin,
+            affected_projections=result.affected_projections,
+        )
 
     def _embedding_cache_key(self, ctx: EmbeddingAuthContext, text: str) -> str:
         model = ctx.model or "_default_"
@@ -400,7 +548,7 @@ class ClawDBService:
                         snippet=str(item["content"])[:700],
                         source="memory",
                         source_tier=str(item.get("capsule_level") or "L0"),
-                        citation=f"message:{item['message_id']}",
+                        citation=f"origin:{item.get('origin_message_id') or item['message_id']}",
                         channel=str(item.get("channel") or "") or None,
                         chat_type=str(item.get("chat_type") or "") or None,
                         account_id=str(item.get("account_id") or "") or None,
@@ -409,6 +557,9 @@ class ClawDBService:
                         topic_path=str(item.get("topic_path") or item.get("topic_id") or "default"),
                         message_thread_id=str(item.get("message_thread_id") or "") or None,
                         sender_id=str(item.get("sender_id") or "") or None,
+                        origin_message_id=str(item.get("origin_message_id") or item["message_id"]),
+                        projection_kind=str(item.get("projection_kind") or "") or None,
+                        projection_scope=str(item.get("projection_scope") or "") or None,
                     )
                 )
             if not raw:
@@ -584,23 +735,9 @@ class ClawDBService:
         )
 
     async def rebuild_indexes(self) -> IndexRebuildResponse:
-        self.topic_trie = TopicTrie()
-        self.topic_model = GaussianEwensTopicModel(
-            dim=self.config.topic_gep_dim,
-            concentration=self.config.topic_gep_concentration,
-            sigma2=self.config.topic_gep_sigma2,
-            prior_sigma2=self.config.topic_gep_prior_sigma2,
-        )
-        docs = await self.df_store.message_documents(tenant_id="*", session_id=None)
-        rebuilt = 0
-        for item in docs:
-            topic_id = str(item.get("topic_id") or "default")
-            content = str(item.get("content") or "")
-            if not content:
-                continue
-            self.topic_trie.insert(topic_id, content)
-            self.topic_model.observe_replay(topic_id, content)
-            rebuilt += 1
+        await self._rebuild_topic_state_from_store()
+        docs = await self.df_store.message_documents(tenant_id="*", session_id=None, row_mode="raw")
+        rebuilt = len([item for item in docs if str(item.get("content") or "")])
         return IndexRebuildResponse(
             wal_seq=self.wal.last_seq,
             rebuilt_topics=self.topic_trie.topic_count,
@@ -677,6 +814,9 @@ class ClawDBService:
                 "topicPath": item.topic_path,
                 "threadId": item.message_thread_id,
                 "senderId": item.sender_id,
+                "originMessageId": item.origin_message_id,
+                "projectionKind": item.projection_kind,
+                "projectionScope": item.projection_scope,
             }
             for item in result.results
         ]
