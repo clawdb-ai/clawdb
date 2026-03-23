@@ -3129,9 +3129,49 @@ class DataFrameStore:
         self._state.semantic_jobs_df = normalized
         return self._state.semantic_jobs_df
 
+    def _semantic_job_stats_locked(self, jobs: pd.DataFrame) -> SemanticJobStats:
+        if jobs.empty:
+            return SemanticJobStats(pending=0, running=0, total=0, max_wal_seq=0)
+        pending = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_PENDING).sum())
+        running = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_RUNNING).sum())
+        max_wal_seq = int(pd.to_numeric(jobs["latest_wal_seq"], errors="coerce").fillna(0).max())
+        return SemanticJobStats(
+            pending=pending,
+            running=running,
+            total=int(jobs.shape[0]),
+            max_wal_seq=max_wal_seq,
+        )
+
     async def clear_semantic_jobs(self) -> None:
         async with self._lock:
             self._state.semantic_jobs_df = pd.DataFrame(columns=SEMANTIC_JOBS_COLUMNS)
+
+    async def recover_semantic_jobs_for_startup(self) -> SemanticJobStats:
+        async with self._lock:
+            jobs = self._normalize_semantic_jobs_locked()
+            if jobs.empty:
+                return SemanticJobStats(pending=0, running=0, total=0, max_wal_seq=0)
+            now = pd.Timestamp.now(tz="UTC")
+            for row_id in jobs.index:
+                status = str(jobs.at[row_id, "status"] or SEMANTIC_JOB_STATUS_PENDING)
+                impacted_sessions = _json_string_list(jobs.at[row_id, "impacted_sessions_json"])
+                claimed_sessions = _json_string_list(jobs.at[row_id, "claimed_sessions_json"])
+                merged_sessions = sorted({*impacted_sessions, *claimed_sessions})
+                self._state.semantic_jobs_df.at[row_id, "impacted_sessions_json"] = json.dumps(
+                    merged_sessions,
+                    separators=(",", ":"),
+                )
+                self._state.semantic_jobs_df.at[row_id, "claimed_sessions_json"] = "[]"
+                self._state.semantic_jobs_df.at[row_id, "lease_owner"] = ""
+                self._state.semantic_jobs_df.at[row_id, "lease_expires_at"] = pd.NaT
+                if status != SEMANTIC_JOB_STATUS_PENDING:
+                    self._state.semantic_jobs_df.at[row_id, "status"] = SEMANTIC_JOB_STATUS_PENDING
+                    self._state.semantic_jobs_df.at[row_id, "available_at"] = now
+                    self._state.semantic_jobs_df.at[row_id, "updated_at"] = now
+                elif pd.isna(jobs.at[row_id, "available_at"]):
+                    self._state.semantic_jobs_df.at[row_id, "available_at"] = now
+            jobs = self._normalize_semantic_jobs_locked()
+            return self._semantic_job_stats_locked(jobs)
 
     async def enqueue_semantic_refresh(
         self,
@@ -3196,31 +3236,12 @@ class DataFrameStore:
                 self._state.semantic_jobs_df.at[row_id, "last_error"] = ""
                 self._state.semantic_jobs_df.at[row_id, "updated_at"] = now
             jobs = self._normalize_semantic_jobs_locked()
-            pending = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_PENDING).sum())
-            running = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_RUNNING).sum())
-            total = int(jobs.shape[0])
-            max_wal_seq = int(pd.to_numeric(jobs["latest_wal_seq"], errors="coerce").fillna(0).max())
-            return SemanticJobStats(
-                pending=pending,
-                running=running,
-                total=total,
-                max_wal_seq=max_wal_seq,
-            )
+            return self._semantic_job_stats_locked(jobs)
 
     async def semantic_job_stats(self) -> SemanticJobStats:
         async with self._lock:
             jobs = self._normalize_semantic_jobs_locked()
-            if jobs.empty:
-                return SemanticJobStats(pending=0, running=0, total=0, max_wal_seq=0)
-            pending = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_PENDING).sum())
-            running = int((jobs["status"].astype(str) == SEMANTIC_JOB_STATUS_RUNNING).sum())
-            max_wal_seq = int(pd.to_numeric(jobs["latest_wal_seq"], errors="coerce").fillna(0).max())
-            return SemanticJobStats(
-                pending=pending,
-                running=running,
-                total=int(jobs.shape[0]),
-                max_wal_seq=max_wal_seq,
-            )
+            return self._semantic_job_stats_locked(jobs)
 
     async def claim_next_semantic_job(
         self,

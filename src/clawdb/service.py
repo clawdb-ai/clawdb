@@ -118,7 +118,7 @@ class ClawDBService:
             metadata_parquet_path=self.config.metadata_parquet_path,
         )
         await self._load_checkpoint_and_replay()
-        await self.df_store.clear_semantic_jobs()
+        recovered_semantic_jobs = await self.df_store.recover_semantic_jobs_for_startup()
         self._stop.clear()
         self._flush_task = asyncio.create_task(self._periodic_flush_loop(), name="clawdb-flush")
         self._queue_tasks = []
@@ -132,6 +132,13 @@ class ClawDBService:
                     )
                 )
         self._watchdog_task = asyncio.create_task(self._watchdog_loop(), name="clawdb-watchdog")
+        if recovered_semantic_jobs.total > 0:
+            await self._wake_semantic_pipeline(
+                wal_seq=recovered_semantic_jobs.max_wal_seq,
+                tenant_id="*",
+                session_ids=[],
+                cause="startup_recovery",
+            )
 
     async def shutdown(self) -> None:
         self._stop.set()
