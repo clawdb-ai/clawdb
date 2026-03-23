@@ -16,7 +16,14 @@ from .embeddings import EmbeddingAuthContext, EmbeddingRouter, embedding_backend
 from .folder_judger import FolderJudger
 from .lineage import materialize_message_bundle, normalize_platform
 from .locks import DeadlockSafeLockManager, LockRank
-from .metrics import CacheTelemetry, aggregate_ranked_relevance, hit_at_k, ndcg_at_k, percentile
+from .metrics import (
+    CacheTelemetry,
+    aggregate_ranked_relevance,
+    hit_at_k,
+    ndcg_at_k,
+    percentile,
+    record_acceptance_benchmark,
+)
 from .metadata import DataFrameMetadataStore
 from .migrate import auto_migrate_if_needed
 from .models import (
@@ -1052,15 +1059,26 @@ class ClawDBService:
             )
         )
 
+        passed = all(check.passed for check in checks)
+        record_acceptance_benchmark(
+            passed=passed,
+            case_count=case_count,
+            cold_latency_sample_count=len(cold_samples),
+            warm_latency_sample_count=len(warm_samples),
+            checks=[check.model_dump() for check in checks],
+        )
+
         return AcceptanceBenchmarkResponse(
-            passed=all(check.passed for check in checks),
+            passed=passed,
             case_count=case_count,
             hit_at=hit_summary,
             ndcg_at=ndcg_summary,
             cold_latency_ms_p50=cold_latency_p50,
             cold_latency_ms_p95=cold_latency_p95,
+            cold_latency_sample_count=len(cold_samples),
             warm_latency_ms_p50=warm_latency_p50,
             warm_latency_ms_p95=warm_latency_p95,
+            warm_latency_sample_count=len(warm_samples),
             dataframe_bytes=dataframe_bytes,
             cache_bytes=cache_bytes,
             index_bytes=index_bytes,

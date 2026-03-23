@@ -4,10 +4,11 @@ import math
 from collections import deque
 from dataclasses import dataclass
 from statistics import median
+from time import time
 from time import monotonic
 from typing import Deque, Dict, Mapping, Sequence, Tuple
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 
 DEFAULT_HIT_AT_TARGETS: Dict[int, float] = {1: 0.50, 3: 0.75, 5: 0.85}
@@ -30,6 +31,39 @@ CACHE_LOOKUPS_BY_DIMENSION = Counter(
     "memory_cache_lookups_by_dimension_total",
     "Cache lookup outcomes by tenant/session/query dimensions",
     labelnames=("tenant_id", "session_id", "query_type", "capsule_level", "outcome"),
+)
+ACCEPTANCE_RUNS = Counter(
+    "memory_acceptance_runs_total",
+    "Acceptance benchmark runs by final status",
+    labelnames=("status",),
+)
+ACCEPTANCE_LAST_RUN_UNIX = Gauge(
+    "memory_acceptance_last_run_unix_seconds",
+    "Unix timestamp for the most recent acceptance benchmark run",
+)
+ACCEPTANCE_CASE_COUNT = Gauge(
+    "memory_acceptance_case_count",
+    "Number of judged search cases in the most recent acceptance benchmark run",
+)
+ACCEPTANCE_LATENCY_SAMPLE_COUNT = Gauge(
+    "memory_acceptance_latency_sample_count",
+    "Latency sample counts captured in the most recent acceptance benchmark run",
+    labelnames=("temperature",),
+)
+ACCEPTANCE_CHECK_ACTUAL = Gauge(
+    "memory_acceptance_check_actual",
+    "Actual values from the most recent acceptance benchmark run",
+    labelnames=("name", "comparator", "unit"),
+)
+ACCEPTANCE_CHECK_TARGET = Gauge(
+    "memory_acceptance_check_target",
+    "Target values from the most recent acceptance benchmark run",
+    labelnames=("name", "comparator", "unit"),
+)
+ACCEPTANCE_CHECK_PASSED = Gauge(
+    "memory_acceptance_check_passed",
+    "Pass state for each acceptance check in the most recent benchmark run",
+    labelnames=("name",),
 )
 
 
@@ -150,6 +184,35 @@ def percentile(values: Sequence[float], q: float) -> float:
     ordered = sorted(float(value) for value in values)
     rank = max(0, min(len(ordered) - 1, math.ceil((bounded / 100.0) * len(ordered)) - 1))
     return float(ordered[rank])
+
+
+def record_acceptance_benchmark(
+    *,
+    passed: bool,
+    case_count: int,
+    cold_latency_sample_count: int,
+    warm_latency_sample_count: int,
+    checks: Sequence[Mapping[str, object]],
+) -> None:
+    ACCEPTANCE_RUNS.labels(status="passed" if passed else "failed").inc()
+    ACCEPTANCE_LAST_RUN_UNIX.set(time())
+    ACCEPTANCE_CASE_COUNT.set(max(0, int(case_count)))
+    ACCEPTANCE_LATENCY_SAMPLE_COUNT.labels(temperature="cold").set(
+        max(0, int(cold_latency_sample_count))
+    )
+    ACCEPTANCE_LATENCY_SAMPLE_COUNT.labels(temperature="warm").set(
+        max(0, int(warm_latency_sample_count))
+    )
+    for check in checks:
+        name = str(check.get("name") or "")
+        comparator = str(check.get("comparator") or "")
+        unit = str(check.get("unit") or "")
+        actual = float(check.get("actual") or 0.0)
+        target = float(check.get("target") or 0.0)
+        passed_value = 1.0 if bool(check.get("passed")) else 0.0
+        ACCEPTANCE_CHECK_ACTUAL.labels(name=name, comparator=comparator, unit=unit).set(actual)
+        ACCEPTANCE_CHECK_TARGET.labels(name=name, comparator=comparator, unit=unit).set(target)
+        ACCEPTANCE_CHECK_PASSED.labels(name=name).set(passed_value)
 
 
 def _dcg(values: Sequence[float]) -> float:

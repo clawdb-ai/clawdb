@@ -17,6 +17,18 @@ MESSAGE_STATE_ACTIVE = "active"
 MESSAGE_STATE_EDITED = "edited"
 MESSAGE_STATE_DELETED = "deleted"
 
+PLATFORM_IDENTITY_COLUMNS = [
+    "account_key",
+    "from_user_key",
+    "to_user_key",
+    "sender_user_key",
+    "group_chat_key",
+]
+
+_PLATFORM_ALIASES = {
+    "lark": "feishu",
+}
+
 
 @dataclass(frozen=True)
 class ProjectionSpec:
@@ -29,50 +41,89 @@ class ProjectionSpec:
 
 def normalize_platform(platform: Optional[str], channel: Optional[str] = None) -> str:
     raw = (platform or channel or "").strip().lower()
-    return raw or "generic"
+    if not raw:
+        return "generic"
+    return _PLATFORM_ALIASES.get(raw, raw)
 
 
 def normalize_identity(platform: str, value: Optional[str], expected_kind: str) -> str:
     raw = (value or "").strip()
     if not raw:
         return ""
+    canonical_prefix = f"{platform}_{expected_kind}:"
+    if raw.startswith(canonical_prefix):
+        return raw
     if platform == "feishu":
         if expected_kind == "user":
-            if raw.startswith("oc_"):
+            if raw.startswith("feishu_chat:") or raw.startswith("oc_"):
                 raise ValueError(f"Feishu user identity cannot use chat prefix: {raw}")
             return f"feishu_user:{raw}"
         if expected_kind == "chat":
-            if raw.startswith("ou_"):
+            if raw.startswith("feishu_user:") or raw.startswith("ou_"):
                 raise ValueError(f"Feishu chat identity cannot use user prefix: {raw}")
             return f"feishu_chat:{raw}"
         if expected_kind == "account":
+            if raw.startswith("feishu_user:") or raw.startswith("feishu_chat:"):
+                raise ValueError(f"Feishu account identity cannot use user/chat prefix: {raw}")
             return f"feishu_account:{raw}"
     return f"{platform}_{expected_kind}:{raw}"
+
+
+def normalize_platform_identities(payload: Mapping[str, object]) -> Dict[str, str]:
+    platform = normalize_platform(
+        str(payload.get("platform") or "") or None,
+        str(payload.get("channel") or "") or None,
+    )
+    account_key = normalize_identity(
+        platform,
+        str(payload.get("account_key") or payload.get("account_id") or ""),
+        "account",
+    ) or f"{platform}_account:_"
+    return {
+        "platform": platform,
+        "account_key": account_key,
+        "from_user_key": normalize_identity(
+            platform,
+            str(payload.get("from_user_key") or payload.get("from_id") or ""),
+            "user",
+        ),
+        "to_user_key": normalize_identity(
+            platform,
+            str(payload.get("to_user_key") or payload.get("to_id") or ""),
+            "user",
+        ),
+        "sender_user_key": normalize_identity(
+            platform,
+            str(payload.get("sender_user_key") or payload.get("sender_id") or ""),
+            "user",
+        ),
+        "group_chat_key": normalize_identity(
+            platform,
+            str(payload.get("group_chat_key") or payload.get("group_id") or ""),
+            "chat",
+        ),
+    }
 
 
 def canonical_origin_message_id(payload: Mapping[str, object]) -> str:
     explicit = str(payload.get("origin_message_id") or "").strip()
     if explicit:
         return explicit
-    platform = normalize_platform(
-        str(payload.get("platform") or "") or None,
-        str(payload.get("channel") or "") or None,
-    )
-    account_id = str(payload.get("account_id") or "").strip() or "_"
+    identities = normalize_platform_identities(payload)
+    platform = identities["platform"]
+    account_key = str(identities["account_key"] or "").strip() or f"{platform}_account:_"
     platform_message_id = str(payload.get("platform_message_id") or "").strip()
     if platform_message_id:
-        source = f"{platform}::{account_id}::{platform_message_id}"
+        source = f"{platform}::{account_key}::{platform_message_id}"
         digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:32]
         return f"orig_{digest}"
     return str(payload.get("message_id") or "").strip()
 
 
 def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec]:
-    platform = normalize_platform(
-        str(payload.get("platform") or "") or None,
-        str(payload.get("channel") or "") or None,
-    )
-    account_key = normalize_identity(platform, str(payload.get("account_id") or ""), "account") or (
+    identities = normalize_platform_identities(payload)
+    platform = identities["platform"]
+    account_key = str(payload.get("account_key") or identities["account_key"] or "").strip() or (
         f"{platform}_account:_"
     )
     chat_type = str(payload.get("chat_type") or "").strip().lower()
@@ -82,12 +133,18 @@ def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec
     def _preferred_user_id() -> str:
         if role == "assistant":
             candidates = [
+                payload.get("to_user_key"),
+                payload.get("from_user_key"),
+                payload.get("sender_user_key"),
                 payload.get("to_id"),
                 payload.get("from_id"),
                 payload.get("sender_id"),
             ]
         else:
             candidates = [
+                payload.get("sender_user_key"),
+                payload.get("from_user_key"),
+                payload.get("to_user_key"),
                 payload.get("sender_id"),
                 payload.get("from_id"),
                 payload.get("to_id"),
@@ -100,7 +157,7 @@ def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec
 
     specs: List[ProjectionSpec] = []
     if chat_type == "group":
-        group_key = normalize_identity(platform, str(payload.get("group_id") or ""), "chat")
+        group_key = str(payload.get("group_chat_key") or identities["group_chat_key"] or "").strip()
         if not group_key:
             fallback_group = str(payload.get("native_channel_id") or incoming_session_id or "_").strip()
             group_key = f"{platform}_chat:{fallback_group}"
@@ -155,10 +212,10 @@ def materialize_projection_rows(raw_message: Mapping[str, object]) -> List[Dict[
     source = dict(raw_message)
     origin_message_id = str(source.get("origin_message_id") or source.get("message_id") or "").strip()
     source["origin_message_id"] = origin_message_id
-    source["platform"] = normalize_platform(
-        str(source.get("platform") or "") or None,
-        str(source.get("channel") or "") or None,
-    )
+    identities = normalize_platform_identities(source)
+    source["platform"] = identities["platform"]
+    for column in PLATFORM_IDENTITY_COLUMNS:
+        source[column] = identities[column]
     source["native_session_id"] = str(source.get("native_session_id") or "")
     projections: List[Dict[str, object]] = []
     for spec in build_projection_specs(source):
@@ -177,10 +234,8 @@ def materialize_projection_rows(raw_message: Mapping[str, object]) -> List[Dict[
 
 
 def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, object]:
-    platform = normalize_platform(
-        str(payload.get("platform") or "") or None,
-        str(payload.get("channel") or "") or None,
-    )
+    identities = normalize_platform_identities(payload)
+    platform = identities["platform"]
     origin_message_id = canonical_origin_message_id(payload)
     ts_value = payload.get("ts")
     if isinstance(ts_value, datetime):
@@ -231,6 +286,7 @@ def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, objec
         "message_state": MESSAGE_STATE_ACTIVE,
         "updated_at": ts_iso,
         "deleted_at": None,
+        **{column: identities[column] for column in PLATFORM_IDENTITY_COLUMNS},
     }
     raw_row = {
         **base,

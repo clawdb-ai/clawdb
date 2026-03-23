@@ -293,8 +293,10 @@ class AcceptanceBenchmarkResponse(BaseModel):
     ndcg_at: Dict[int, float]
     cold_latency_ms_p50: float
     cold_latency_ms_p95: float
+    cold_latency_sample_count: int
     warm_latency_ms_p50: float
     warm_latency_ms_p95: float
+    warm_latency_sample_count: int
     dataframe_bytes: int
     cache_bytes: int
     index_bytes: int

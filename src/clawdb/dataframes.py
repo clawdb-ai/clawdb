@@ -21,9 +21,11 @@ from .embeddings import (
 from .lineage import (
     DM_MIRROR_PUBLIC_PROJECTION_KIND,
     MESSAGE_STATE_DELETED,
+    PLATFORM_IDENTITY_COLUMNS,
     RAW_PROJECTION_KIND,
     materialize_message_bundle,
     materialize_projection_rows,
+    normalize_identity,
 )
 from .models import SearchResult, WalRecord
 from .topics import (
@@ -45,13 +47,18 @@ MESSAGES_COLUMNS = [
     "channel",
     "chat_type",
     "account_id",
+    "account_key",
     "from_id",
+    "from_user_key",
     "to_id",
+    "to_user_key",
     "sender_id",
+    "sender_user_key",
     "sender_name",
     "sender_username",
     "sender_e164",
     "group_id",
+    "group_chat_key",
     "group_subject",
     "group_channel",
     "group_space",
@@ -918,13 +925,18 @@ class DataFrameStore:
                 "channel": "string",
                 "chat_type": "string",
                 "account_id": "string",
+                "account_key": "string",
                 "from_id": "string",
+                "from_user_key": "string",
                 "to_id": "string",
+                "to_user_key": "string",
                 "sender_id": "string",
+                "sender_user_key": "string",
                 "sender_name": "string",
                 "sender_username": "string",
                 "sender_e164": "string",
                 "group_id": "string",
+                "group_chat_key": "string",
                 "group_subject": "string",
                 "group_channel": "string",
                 "group_space": "string",
@@ -1750,7 +1762,17 @@ class DataFrameStore:
             if platform is not None:
                 mask &= df["platform"].astype(str) == str(platform)
             if account_id is not None and str(account_id).strip():
-                mask &= df["account_id"].astype(str) == str(account_id)
+                account_id_text = str(account_id).strip()
+                account_candidates = {account_id_text}
+                if platform is not None:
+                    account_candidates.add(normalize_identity(str(platform), account_id_text, "account"))
+                if "account_key" not in df.columns:
+                    df = df.copy()
+                    df["account_key"] = ""
+                mask &= (
+                    df["account_id"].astype(str).isin(account_candidates)
+                    | df["account_key"].astype(str).isin(account_candidates)
+                )
             matches = df[mask]["origin_message_id"].astype(str).dropna().unique().tolist()
             if not matches:
                 return None

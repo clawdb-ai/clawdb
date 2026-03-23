@@ -24,14 +24,16 @@ from .dataframes import (
 )
 from .lineage import (
     MESSAGE_STATE_ACTIVE,
+    PLATFORM_IDENTITY_COLUMNS,
     RAW_PROJECTION_KIND,
     materialize_message_bundle,
+    normalize_platform_identities,
 )
 from .metadata import DataFrameMetadataStore
 from .topics import TOPICS_COLUMNS
 
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -153,13 +155,18 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
         "channel": "",
         "chat_type": "",
         "account_id": "",
+        "account_key": "",
         "from_id": "",
+        "from_user_key": "",
         "to_id": "",
+        "to_user_key": "",
         "sender_id": "",
+        "sender_user_key": "",
         "sender_name": "",
         "sender_username": "",
         "sender_e164": "",
         "group_id": "",
+        "group_chat_key": "",
         "group_subject": "",
         "group_channel": "",
         "group_space": "",
@@ -197,13 +204,18 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
     out["channel"] = _fill_string(out["channel"])
     out["chat_type"] = _fill_string(out["chat_type"])
     out["account_id"] = _fill_string(out["account_id"])
+    out["account_key"] = _fill_string(out["account_key"])
     out["from_id"] = _fill_string(out["from_id"])
+    out["from_user_key"] = _fill_string(out["from_user_key"])
     out["to_id"] = _fill_string(out["to_id"])
+    out["to_user_key"] = _fill_string(out["to_user_key"])
     out["sender_id"] = _fill_string(out["sender_id"])
+    out["sender_user_key"] = _fill_string(out["sender_user_key"])
     out["sender_name"] = _fill_string(out["sender_name"])
     out["sender_username"] = _fill_string(out["sender_username"])
     out["sender_e164"] = _fill_string(out["sender_e164"])
     out["group_id"] = _fill_string(out["group_id"])
+    out["group_chat_key"] = _fill_string(out["group_chat_key"])
     out["group_subject"] = _fill_string(out["group_subject"])
     out["group_channel"] = _fill_string(out["group_channel"])
     out["group_space"] = _fill_string(out["group_space"])
@@ -229,6 +241,12 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
     out["message_state"] = _fill_string(out["message_state"], MESSAGE_STATE_ACTIVE)
     out["updated_at"] = _to_datetime_utc(out["updated_at"])
     out["deleted_at"] = pd.to_datetime(out["deleted_at"], utc=True, errors="coerce")
+
+    if not out.empty:
+        identity_rows = [normalize_platform_identities(row) for row in out.to_dict("records")]
+        identity_frame = pd.DataFrame(identity_rows)
+        for column in PLATFORM_IDENTITY_COLUMNS:
+            out[column] = _fill_string(identity_frame.get(column, pd.Series([""] * len(out))))
 
     legacy_rows = "projection_kind" not in frame.columns or "origin_message_id" not in frame.columns
     if legacy_rows:
@@ -526,6 +544,7 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
     if messages_frame.empty:
         return CURRENT_SCHEMA_VERSION
     cols = set(messages_frame.columns)
+    identity_cols = set(PLATFORM_IDENTITY_COLUMNS)
     lineage_cols = {
         "origin_message_id",
         "projection_kind",
@@ -545,8 +564,10 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
         "topic_confidence",
     }
     topic_cols = {"topic_parent_id", "topic_path", "topic_source", "topic_confidence"}
+    if lineage_cols.union(identity_cols).issubset(cols):
+        return CURRENT_SCHEMA_VERSION
     if lineage_cols.issubset(cols):
-        return 4
+        return 8
     if im_cols.issubset(cols):
         return 3
     if topic_cols.issubset(cols):
