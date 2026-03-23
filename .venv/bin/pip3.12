@@ -1,4 +1,4 @@
-#!/home/sansha/Github/clawdb/.cron/automation_repo/.venv/bin/python3
+#!/home/sansha/Github/clawdb/.cron/automation_repo/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
