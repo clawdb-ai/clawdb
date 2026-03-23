@@ -525,7 +525,7 @@ def materialize_session_rollups(
         return pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS)
 
     rows: List[Dict[str, object]] = []
-    materialized_at = pd.Timestamp.utcnow()
+    materialized_at = pd.Timestamp.now(tz="UTC")
     resolved_vector_dim = max(8, int(vector_dim))
     for (tenant_id, session_id), session_subset in scoped.groupby(["tenant_id", "session_id"], sort=True):
         ordered = session_subset.sort_values("ts", kind="stable").reset_index(drop=True)
@@ -2590,7 +2590,7 @@ class DataFrameStore:
                 "session_id": session_id,
                 "parent_session_id": parent_session_id or "",
                 "origin": origin,
-                "created_at": pd.Timestamp.utcnow(),
+                "created_at": pd.Timestamp.now(tz="UTC"),
             }
             row_df = pd.DataFrame([row], columns=SESSIONS_COLUMNS)
             if df.empty:
@@ -2981,7 +2981,7 @@ class DataFrameStore:
                 "session_id": session_id,
                 "wal_seq": int(wal_seq),
                 "note": note,
-                "created_at": pd.Timestamp.utcnow(),
+                "created_at": pd.Timestamp.now(tz="UTC"),
             }
             row_df = pd.DataFrame([row], columns=SNAPSHOTS_COLUMNS)
             if self._state.snapshots_df.empty:
@@ -3431,7 +3431,7 @@ class DataFrameStore:
         hit: bool,
     ) -> None:
         async with self._lock:
-            now = pd.Timestamp.utcnow()
+            now = pd.Timestamp.now(tz="UTC")
             row_id = self._cache_lookup_row_id_locked(
                 key=key,
                 tenant_id=tenant_id,
@@ -4347,7 +4347,7 @@ class DataFrameStore:
 
     def _save_parquet_sync(self, parquet_dir: Path, state: DataFramesState) -> None:
         parquet_dir.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        timestamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%d-%H%M%S")
         tmp_parquet = parquet_dir.parent / f"{parquet_dir.name}.tmp-save-{timestamp}"
         if tmp_parquet.exists():
             shutil.rmtree(tmp_parquet)
@@ -4367,7 +4367,7 @@ class DataFrameStore:
             elif "created_at" in write_df.columns:
                 write_df["dt"] = pd.to_datetime(write_df["created_at"], utc=True).dt.strftime("%Y-%m-%d")
             else:
-                write_df["dt"] = datetime.utcnow().strftime("%Y-%m-%d")
+                write_df["dt"] = pd.Timestamp.now(tz="UTC").strftime("%Y-%m-%d")
             for dt, part in write_df.groupby("dt"):
                 target = tmp_parquet / name / f"dt={dt}"
                 target.mkdir(parents=True, exist_ok=True)

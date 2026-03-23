@@ -204,7 +204,7 @@ def materialize_projection_state(
         ).append(key)
 
     rows: List[Dict[str, object]] = []
-    materialized_at = pd.Timestamp.utcnow()
+    materialized_at = pd.Timestamp.now(tz="UTC")
     for (tenant_id, session_id, projection_kind, projection_scope), group in scoped.groupby(
         ["tenant_id", "session_id", "projection_kind", "projection_scope"],
         sort=True,

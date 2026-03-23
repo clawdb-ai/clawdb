@@ -193,7 +193,7 @@ def materialize_l0_beliefs(
     resolved_dim = max(8, int(vector_dim))
     projection_rows = _projection_rows(messages_frame)
     rows: List[Dict[str, object]] = []
-    materialized_at = pd.Timestamp.utcnow()
+    materialized_at = pd.Timestamp.now(tz="UTC")
 
     for tenant_id, group in raw_rows.groupby("tenant_id", sort=True):
         ordered = group.sort_values(["ts", "origin_message_id"], kind="stable").reset_index(drop=True)
