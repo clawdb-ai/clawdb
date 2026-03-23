@@ -123,9 +123,7 @@ def canonical_origin_message_id(payload: Mapping[str, object]) -> str:
 def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec]:
     identities = normalize_platform_identities(payload)
     platform = identities["platform"]
-    account_key = str(payload.get("account_key") or identities["account_key"] or "").strip() or (
-        f"{platform}_account:_"
-    )
+    account_key = str(identities["account_key"] or "").strip() or f"{platform}_account:_"
     chat_type = str(payload.get("chat_type") or "").strip().lower()
     incoming_session_id = str(payload.get("session_id") or payload.get("native_session_id") or "").strip()
     role = str(payload.get("role") or "").strip().lower()
@@ -157,10 +155,10 @@ def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec
 
     specs: List[ProjectionSpec] = []
     if chat_type == "group":
-        group_key = str(payload.get("group_chat_key") or identities["group_chat_key"] or "").strip()
+        group_key = str(identities["group_chat_key"] or "").strip()
         if not group_key:
             fallback_group = str(payload.get("native_channel_id") or incoming_session_id or "_").strip()
-            group_key = f"{platform}_chat:{fallback_group}"
+            group_key = normalize_identity(platform, fallback_group, "chat")
         group_scope = f"group:{account_key}:{group_key}"
         specs.append(
             ProjectionSpec(
@@ -186,7 +184,7 @@ def build_projection_specs(payload: Mapping[str, object]) -> List[ProjectionSpec
         user_key = _preferred_user_id()
         if not user_key:
             fallback_user = incoming_session_id or str(payload.get("to_id") or payload.get("from_id") or "_")
-            user_key = f"{platform}_user:{fallback_user}"
+            user_key = normalize_identity(platform, fallback_user, "user")
         dm_scope = f"dm:{account_key}:{user_key}"
         specs.append(
             ProjectionSpec(
