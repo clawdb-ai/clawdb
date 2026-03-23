@@ -229,6 +229,7 @@ class IndexRebuildResponse(BaseModel):
     rebuilt_projection_messages: int = 0
     rebuilt_session_rollups: int = 0
     rebuilt_capsules: int = 0
+    rebuilt_embedding_metadata: int = 0
 
 
 class CacheHitReportResponse(BaseModel):

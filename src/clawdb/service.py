@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from .config import ClawDBConfig
 from .dataframes import DataFrameStore
-from .embeddings import EmbeddingAuthContext, EmbeddingRouter
+from .embeddings import EmbeddingAuthContext, EmbeddingRouter, embedding_backend_signature
 from .folder_judger import FolderJudger
 from .lineage import materialize_message_bundle, normalize_platform
 from .locks import DeadlockSafeLockManager, LockRank
@@ -466,9 +466,8 @@ class ClawDBService:
         )
 
     def _embedding_cache_key(self, ctx: EmbeddingAuthContext, text: str) -> str:
-        model = ctx.model or "_default_"
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        return f"{ctx.provider}:{model}:{digest}"
+        return f"{embedding_backend_signature(ctx)}:{digest}"
 
     async def _embed_texts_cached(
         self,
@@ -635,7 +634,7 @@ class ClawDBService:
         started = monotonic()
         key = self._cache_key(req)
         if embedding_ctx:
-            key = f"{key}::emb:{embedding_ctx.provider}:{embedding_ctx.model or '_'}"
+            key = f"{key}::emb:{embedding_backend_signature(embedding_ctx)}"
         cached = self._search_cache.get(key)
         cache_hit = cached is not None
         if cache_hit:
@@ -867,6 +866,7 @@ class ClawDBService:
             rebuilt_projection_messages=rebuild.projection_message_count,
             rebuilt_session_rollups=rebuild.session_rollup_count,
             rebuilt_capsules=rebuild.capsule_count,
+            rebuilt_embedding_metadata=rebuild.embedding_metadata_count,
         )
 
     async def refresh_capsules(self, req: CapsuleRefreshRequest) -> CapsuleRefreshResponse:

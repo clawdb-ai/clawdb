@@ -15,6 +15,7 @@ import pandas as pd
 from .capsules import CAPSULES_COLUMNS
 from .dataframes import (
     CACHE_INDEX_COLUMNS,
+    EMBEDDING_INDEX_METADATA_COLUMNS,
     MESSAGES_COLUMNS,
     SESSION_ROLLUPS_COLUMNS,
     SESSIONS_COLUMNS,
@@ -30,7 +31,7 @@ from .metadata import DataFrameMetadataStore
 from .topics import TOPICS_COLUMNS
 
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -66,6 +67,7 @@ TABLE_COLUMNS: Mapping[str, List[str]] = {
     "capsules": CAPSULES_COLUMNS,
     "session_rollups": SESSION_ROLLUPS_COLUMNS,
     "topics": TOPICS_COLUMNS,
+    "embedding_index_metadata": EMBEDDING_INDEX_METADATA_COLUMNS,
     "cache_index": CACHE_INDEX_COLUMNS,
     "sessions": SESSIONS_COLUMNS,
     "snapshots": SNAPSHOTS_COLUMNS,
@@ -420,6 +422,31 @@ def _normalize_topics(frame: pd.DataFrame) -> pd.DataFrame:
     return out[TOPICS_COLUMNS]
 
 
+def _normalize_embedding_index_metadata(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "tenant_id": "default",
+        "entity_type": "",
+        "entity_id": "",
+        "embedding_ref": "",
+        "embedding_provider": "",
+        "embedding_model": "",
+        "source_hash": "",
+        "reembed_policy": "",
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+    }
+    out = _ensure_columns(frame, EMBEDDING_INDEX_METADATA_COLUMNS, defaults)
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["entity_type"] = _fill_string(out["entity_type"])
+    out["entity_id"] = _fill_string(out["entity_id"])
+    out["embedding_ref"] = _fill_string(out["embedding_ref"])
+    out["embedding_provider"] = _fill_string(out["embedding_provider"])
+    out["embedding_model"] = _fill_string(out["embedding_model"])
+    out["source_hash"] = _fill_string(out["source_hash"])
+    out["reembed_policy"] = _fill_string(out["reembed_policy"])
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    return out[EMBEDDING_INDEX_METADATA_COLUMNS]
+
+
 def _normalize_cache_index(frame: pd.DataFrame) -> pd.DataFrame:
     defaults: Dict[str, object] = {
         "key": "",
@@ -488,6 +515,7 @@ NORMALIZERS: Mapping[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
     "capsules": _normalize_capsules,
     "session_rollups": _normalize_session_rollups,
     "topics": _normalize_topics,
+    "embedding_index_metadata": _normalize_embedding_index_metadata,
     "cache_index": _normalize_cache_index,
     "sessions": _normalize_sessions,
     "snapshots": _normalize_snapshots,
@@ -529,7 +557,7 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
 def _partition_value(frame: pd.DataFrame, table: str) -> pd.Series:
     if table == "messages":
         return pd.to_datetime(frame["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-    if table in {"capsules", "session_rollups", "topics"}:
+    if table in {"capsules", "session_rollups", "topics", "embedding_index_metadata"}:
         return pd.to_datetime(frame["updated_at"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
     if table in {"sessions", "snapshots"}:
         ts_col = "created_at"
@@ -734,6 +762,7 @@ async def migrate_schema(
     normalized_tables["session_rollups"] = rebuilt_storage["session_rollups"]
     normalized_tables["topics"] = rebuilt_storage["topics"]
     normalized_tables["capsules"] = rebuilt_storage["capsules"]
+    normalized_tables["embedding_index_metadata"] = rebuilt_storage["embedding_index_metadata"]
 
     tmp_parquet = parquet_dir.parent / f"{parquet_dir.name}.tmp-schema-{timestamp}"
     if tmp_parquet.exists():

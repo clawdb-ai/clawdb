@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import List, Optional
 
 import httpx
+
+
+DETERMINISTIC_EMBEDDING_PROVIDER = "deterministic"
+DETERMINISTIC_EMBEDDING_MODEL = "hashed-token-v1"
 
 
 @dataclass(frozen=True)
@@ -13,6 +18,36 @@ class EmbeddingAuthContext:
     model: Optional[str] = None
     base_url: Optional[str] = None
     auth_source: Optional[str] = None
+
+
+def normalize_embedding_text(value: object) -> str:
+    return str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def embedding_source_hash(value: object) -> str:
+    normalized = normalize_embedding_text(value)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def deterministic_embedding_ref(entity_type: str, value: object) -> str:
+    source_hash = embedding_source_hash(value)
+    digest = hashlib.sha256(
+        (
+            f"{DETERMINISTIC_EMBEDDING_PROVIDER}:"
+            f"{DETERMINISTIC_EMBEDDING_MODEL}:"
+            f"{str(entity_type or '').strip()}:"
+            f"{source_hash}"
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"embed:{str(entity_type or '').strip() or 'entity'}:{digest[:32]}"
+
+
+def embedding_backend_signature(ctx: EmbeddingAuthContext) -> str:
+    provider = str(ctx.provider or "").strip().lower() or "unknown"
+    model = str(ctx.model or "").strip() or "_default_"
+    base_url = str(ctx.base_url or "").strip().rstrip("/")
+    auth_source = str(ctx.auth_source or "").strip()
+    return f"{provider}:{model}:{base_url}:{auth_source}"
 
 
 class EmbeddingRouter:

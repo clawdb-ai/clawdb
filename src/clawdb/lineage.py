@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Mapping, Optional
 
+from .embeddings import deterministic_embedding_ref
+
 
 RAW_PROJECTION_KIND = "raw_global"
 PRIVATE_DM_PROJECTION_KIND = "private_dm"
@@ -190,11 +192,12 @@ def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, objec
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     ts_iso = ts.isoformat()
+    content = str(payload.get("content") or "")
     base = {
         "origin_message_id": origin_message_id,
         "tenant_id": str(payload.get("tenant_id") or "default"),
         "role": str(payload.get("role") or "user"),
-        "content": str(payload.get("content") or ""),
+        "content": content,
         "ts": ts_iso,
         "channel": str(payload.get("channel") or ""),
         "chat_type": str(payload.get("chat_type") or ""),
@@ -218,7 +221,7 @@ def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, objec
         "topic_path": str(payload.get("topic_path") or payload.get("topic_id") or "default"),
         "topic_confidence": payload.get("topic_confidence"),
         "topic_source": str(payload.get("topic_source") or ""),
-        "embedding_ref": str(payload.get("embedding_ref") or ""),
+        "embedding_ref": str(payload.get("embedding_ref") or deterministic_embedding_ref("raw_message", content)),
         "capsule_level": str(payload.get("capsule_level") or "L0"),
         "idempotency_key": str(payload.get("idempotency_key") or ""),
         "visibility": "raw",

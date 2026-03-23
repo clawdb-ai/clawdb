@@ -12,6 +12,12 @@ from typing import Dict, List, Literal, Optional, Tuple
 import pandas as pd
 
 from .capsules import CAPSULES_COLUMNS, materialize_capsule_lifecycle
+from .embeddings import (
+    DETERMINISTIC_EMBEDDING_MODEL,
+    DETERMINISTIC_EMBEDDING_PROVIDER,
+    deterministic_embedding_ref,
+    embedding_source_hash,
+)
 from .lineage import (
     DM_MIRROR_PUBLIC_PROJECTION_KIND,
     MESSAGE_STATE_DELETED,
@@ -127,6 +133,18 @@ SNAPSHOTS_COLUMNS = [
     "created_at",
 ]
 
+EMBEDDING_INDEX_METADATA_COLUMNS = [
+    "tenant_id",
+    "entity_type",
+    "entity_id",
+    "embedding_ref",
+    "embedding_provider",
+    "embedding_model",
+    "source_hash",
+    "reembed_policy",
+    "updated_at",
+]
+
 
 MESSAGE_MULTIINDEX_LEVELS = [
     "tenant_id",
@@ -179,6 +197,7 @@ class DataFramesState:
     capsules_df: pd.DataFrame
     session_rollups_df: pd.DataFrame
     topics_df: pd.DataFrame
+    embedding_index_metadata_df: pd.DataFrame
     cache_index_df: pd.DataFrame
     sessions_df: pd.DataFrame
     snapshots_df: pd.DataFrame
@@ -208,6 +227,7 @@ class StorageRebuildResult:
     session_rollup_count: int
     topic_count: int
     capsule_count: int
+    embedding_metadata_count: int
 
 
 ROLLUP_WINDOW_KINDS = (
@@ -742,6 +762,12 @@ def rebuild_materialized_storage_from_raw(
         topics_frame=rebuilt_topics,
         vector_dim=vector_dim,
     )
+    rebuilt_embedding_metadata = materialize_embedding_index_metadata(
+        rebuilt_messages,
+        rebuilt_rollups,
+        rebuilt_topics,
+        rebuilt_capsules,
+    )
     return {
         "messages": rebuilt_messages,
         "projection_messages": projection_messages,
@@ -749,7 +775,124 @@ def rebuild_materialized_storage_from_raw(
         "session_rollups": rebuilt_rollups,
         "topics": rebuilt_topics,
         "capsules": rebuilt_capsules,
+        "embedding_index_metadata": rebuilt_embedding_metadata,
     }
+
+
+def materialize_embedding_index_metadata(
+    messages_frame: pd.DataFrame,
+    session_rollups_frame: pd.DataFrame,
+    topics_frame: pd.DataFrame,
+    capsules_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: List[Dict[str, object]] = []
+
+    def _append_entity_rows(
+        frame: pd.DataFrame,
+        *,
+        entity_type: str,
+        entity_id_col: str,
+        text_col: str,
+        ref_col: str,
+    ) -> None:
+        if frame.empty:
+            return
+        scoped = frame.copy().reset_index(drop=True)
+        scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+        scoped[entity_id_col] = scoped[entity_id_col].fillna("").astype(str)
+        scoped[text_col] = scoped[text_col].fillna("").astype(str)
+        scoped[ref_col] = scoped[ref_col].fillna("").astype(str)
+        scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
+        for _, row in scoped.iterrows():
+            entity_id = str(row.get(entity_id_col) or "")
+            if not entity_id:
+                continue
+            text = str(row.get(text_col) or "")
+            rows.append(
+                {
+                    "tenant_id": str(row.get("tenant_id") or "default"),
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "embedding_ref": str(row.get(ref_col) or deterministic_embedding_ref(entity_type, text)),
+                    "embedding_provider": DETERMINISTIC_EMBEDDING_PROVIDER,
+                    "embedding_model": DETERMINISTIC_EMBEDDING_MODEL,
+                    "source_hash": embedding_source_hash(text),
+                    "reembed_policy": "content_hash_change",
+                    "updated_at": _utc_timestamp(row.get("updated_at")),
+                }
+            )
+
+    raw_messages = authoritative_raw_messages(messages_frame)
+    if not raw_messages.empty:
+        scoped = raw_messages.copy().reset_index(drop=True)
+        scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+        scoped["origin_message_id"] = scoped["origin_message_id"].fillna(scoped["message_id"]).astype(str)
+        scoped["content"] = scoped["content"].fillna("").astype(str)
+        scoped["embedding_ref"] = scoped["embedding_ref"].fillna("").astype(str)
+        scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
+        scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
+        for _, row in scoped.iterrows():
+            content = str(row.get("content") or "")
+            rows.append(
+                {
+                    "tenant_id": str(row.get("tenant_id") or "default"),
+                    "entity_type": "raw_message",
+                    "entity_id": str(row.get("origin_message_id") or row.get("message_id") or ""),
+                    "embedding_ref": str(
+                        row.get("embedding_ref") or deterministic_embedding_ref("raw_message", content)
+                    ),
+                    "embedding_provider": DETERMINISTIC_EMBEDDING_PROVIDER,
+                    "embedding_model": DETERMINISTIC_EMBEDDING_MODEL,
+                    "source_hash": embedding_source_hash(content),
+                    "reembed_policy": "content_hash_change",
+                    "updated_at": _utc_timestamp(
+                        row.get("updated_at") if pd.notna(row.get("updated_at")) else row.get("ts")
+                    ),
+                }
+            )
+
+    _append_entity_rows(
+        session_rollups_frame,
+        entity_type="session_rollup",
+        entity_id_col="rollup_id",
+        text_col="vector_text",
+        ref_col="vector_ref",
+    )
+    _append_entity_rows(
+        topics_frame,
+        entity_type="topic",
+        entity_id_col="topic_id",
+        text_col="vector_text",
+        ref_col="vector_ref",
+    )
+    _append_entity_rows(
+        capsules_frame,
+        entity_type="capsule",
+        entity_id_col="capsule_id",
+        text_col="vector_text",
+        ref_col="vector_ref",
+    )
+    if not rows:
+        return pd.DataFrame(columns=EMBEDDING_INDEX_METADATA_COLUMNS)
+    frame = pd.DataFrame(rows, columns=EMBEDDING_INDEX_METADATA_COLUMNS)
+    frame["tenant_id"] = frame["tenant_id"].fillna("default").astype(str)
+    frame["entity_type"] = frame["entity_type"].fillna("").astype(str)
+    frame["entity_id"] = frame["entity_id"].fillna("").astype(str)
+    frame["embedding_ref"] = frame["embedding_ref"].fillna("").astype(str)
+    frame["embedding_provider"] = frame["embedding_provider"].fillna("").astype(str)
+    frame["embedding_model"] = frame["embedding_model"].fillna("").astype(str)
+    frame["source_hash"] = frame["source_hash"].fillna("").astype(str)
+    frame["reembed_policy"] = frame["reembed_policy"].fillna("").astype(str)
+    frame["updated_at"] = pd.to_datetime(frame["updated_at"], utc=True, errors="coerce")
+    frame = frame.sort_values(
+        ["tenant_id", "entity_type", "entity_id"],
+        ascending=[True, True, True],
+        kind="stable",
+    ).drop_duplicates(
+        subset=["tenant_id", "entity_type", "entity_id"],
+        keep="last",
+    )
+    return frame[EMBEDDING_INDEX_METADATA_COLUMNS].reset_index(drop=True)
 
 
 class DataFrameStore:
@@ -759,6 +902,7 @@ class DataFrameStore:
             capsules_df=pd.DataFrame(columns=CAPSULES_COLUMNS),
             session_rollups_df=pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS),
             topics_df=pd.DataFrame(columns=TOPICS_COLUMNS),
+            embedding_index_metadata_df=pd.DataFrame(columns=EMBEDDING_INDEX_METADATA_COLUMNS),
             cache_index_df=pd.DataFrame(columns=CACHE_INDEX_COLUMNS),
             sessions_df=pd.DataFrame(columns=SESSIONS_COLUMNS),
             snapshots_df=pd.DataFrame(columns=SNAPSHOTS_COLUMNS),
@@ -872,6 +1016,18 @@ class DataFrameStore:
                 "vector_ref": "string",
                 "vector_dim": "int64",
                 "vector_json": "string",
+            }
+        )
+        self._state.embedding_index_metadata_df = self._state.embedding_index_metadata_df.astype(
+            {
+                "tenant_id": "string",
+                "entity_type": "string",
+                "entity_id": "string",
+                "embedding_ref": "string",
+                "embedding_provider": "string",
+                "embedding_model": "string",
+                "source_hash": "string",
+                "reembed_policy": "string",
             }
         )
         self._state.sessions_df = self._state.sessions_df.astype(
@@ -1477,6 +1633,19 @@ class DataFrameStore:
     def state(self) -> DataFramesState:
         return self._state
 
+    def _rebuild_embedding_index_metadata_locked(self) -> int:
+        self._state.embedding_index_metadata_df = materialize_embedding_index_metadata(
+            self._state.messages_df,
+            self._state.session_rollups_df,
+            self._state.topics_df,
+            self._state.capsules_df,
+        )
+        return int(self._state.embedding_index_metadata_df.shape[0])
+
+    async def rebuild_embedding_index_metadata(self) -> int:
+        async with self._lock:
+            return self._rebuild_embedding_index_metadata_locked()
+
     async def ensure_session(
         self,
         tenant_id: str,
@@ -1535,6 +1704,7 @@ class DataFrameStore:
                     ignore_index=True,
                 )
             self._invalidate_messages_index_locked()
+            self._rebuild_embedding_index_metadata_locked()
             affected_sessions = sorted(
                 {
                     str(row.get("session_id") or "")
@@ -1620,11 +1790,14 @@ class DataFrameStore:
                 )
             projection_rows = rows[rows["projection_kind"].astype(str) != RAW_PROJECTION_KIND]
             edited_at_text = pd.to_datetime(edited_at, utc=True).isoformat()
+            updated_embedding_ref = deterministic_embedding_ref("raw_message", content)
             self._state.messages_df.loc[mask, "content"] = str(content)
+            self._state.messages_df.loc[mask, "embedding_ref"] = updated_embedding_ref
             self._state.messages_df.loc[mask, "updated_at"] = edited_at_text
             self._state.messages_df.loc[mask, "message_state"] = "edited"
             self._state.messages_df.loc[mask, "deleted_at"] = None
             self._invalidate_messages_index_locked()
+            self._rebuild_embedding_index_metadata_locked()
             return MessageMutationResult(
                 origin_message_id=origin_message_id,
                 affected_sessions=sorted(
@@ -1659,12 +1832,15 @@ class DataFrameStore:
                 )
             rows = self._state.messages_df[mask]
             projection_rows = rows[rows["projection_kind"].astype(str) != RAW_PROJECTION_KIND]
+            deleted_embedding_ref = deterministic_embedding_ref("raw_message", "")
             self._state.messages_df.loc[mask, "content"] = ""
+            self._state.messages_df.loc[mask, "embedding_ref"] = deleted_embedding_ref
             self._state.messages_df.loc[mask, "message_state"] = MESSAGE_STATE_DELETED
             deleted_at_text = pd.to_datetime(deleted_at, utc=True).isoformat()
             self._state.messages_df.loc[mask, "updated_at"] = deleted_at_text
             self._state.messages_df.loc[mask, "deleted_at"] = deleted_at_text
             self._invalidate_messages_index_locked()
+            self._rebuild_embedding_index_metadata_locked()
             return MessageMutationResult(
                 origin_message_id=origin_message_id,
                 affected_sessions=sorted(
@@ -1695,6 +1871,7 @@ class DataFrameStore:
                 vector_dim=vector_dim,
             )
             self._invalidate_session_rollups_index_locked()
+            self._rebuild_embedding_index_metadata_locked()
             return int(self._state.session_rollups_df.shape[0])
 
     async def rebuild_all_topics(self, *, vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM) -> int:
@@ -1703,6 +1880,7 @@ class DataFrameStore:
                 self._state.messages_df,
                 vector_dim=vector_dim,
             )
+            self._rebuild_embedding_index_metadata_locked()
             return int(self._state.topics_df.shape[0])
 
     async def rebuild_all_capsules(self, *, vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM) -> int:
@@ -1713,6 +1891,7 @@ class DataFrameStore:
                 vector_dim=vector_dim,
             )
             self._invalidate_capsules_index_locked()
+            self._rebuild_embedding_index_metadata_locked()
             return int(self._state.capsules_df.shape[0])
 
     async def rebuild_storage_from_authoritative_raw(
@@ -1731,6 +1910,7 @@ class DataFrameStore:
             self._state.session_rollups_df = rebuilt["session_rollups"]
             self._state.topics_df = rebuilt["topics"]
             self._state.capsules_df = rebuilt["capsules"]
+            self._state.embedding_index_metadata_df = rebuilt["embedding_index_metadata"]
             self._invalidate_all_indexes_locked()
             return StorageRebuildResult(
                 raw_message_count=int(authoritative_raw_messages(self._state.messages_df).shape[0]),
@@ -1739,6 +1919,7 @@ class DataFrameStore:
                 session_rollup_count=int(self._state.session_rollups_df.shape[0]),
                 topic_count=int(self._state.topics_df.shape[0]),
                 capsule_count=int(self._state.capsules_df.shape[0]),
+                embedding_metadata_count=int(self._state.embedding_index_metadata_df.shape[0]),
             )
 
     async def refresh_session_rollups(
@@ -1766,12 +1947,14 @@ class DataFrameStore:
             materialized = materialize_session_rollups(subset, vector_dim=vector_dim)
             if materialized.empty:
                 self._invalidate_session_rollups_index_locked()
+                self._rebuild_embedding_index_metadata_locked()
                 return 0
             self._state.session_rollups_df = pd.concat(
                 [self._state.session_rollups_df, materialized[SESSION_ROLLUPS_COLUMNS]],
                 ignore_index=True,
             )
             self._invalidate_session_rollups_index_locked()
+            self._rebuild_embedding_index_metadata_locked()
             return int(materialized.shape[0])
 
     async def refresh_capsules(
@@ -1792,6 +1975,7 @@ class DataFrameStore:
                 ]
             self._invalidate_capsules_index_locked()
             if not impacted_topic_ids:
+                self._rebuild_embedding_index_metadata_locked()
                 return 0
             tenant_messages = self._messages_for_query_locked(
                 tenant_id=tenant_id,
@@ -1807,17 +1991,20 @@ class DataFrameStore:
                 vector_dim=vector_dim,
             )
             if materialized.empty:
+                self._rebuild_embedding_index_metadata_locked()
                 return 0
             materialized = materialized[
                 materialized["topic_id"].astype(str).isin(impacted_topic_ids)
             ].reset_index(drop=True)
             if materialized.empty:
+                self._rebuild_embedding_index_metadata_locked()
                 return 0
             self._state.capsules_df = pd.concat(
                 [self._state.capsules_df, materialized[CAPSULES_COLUMNS]],
                 ignore_index=True,
             )
             self._invalidate_capsules_index_locked()
+            self._rebuild_embedding_index_metadata_locked()
             return int(materialized.shape[0])
 
     async def create_snapshot(
@@ -2738,6 +2925,7 @@ class DataFrameStore:
         _write_partitioned(state.capsules_df, "capsules")
         _write_partitioned(state.session_rollups_df, "session_rollups")
         _write_partitioned(state.topics_df, "topics")
+        _write_partitioned(state.embedding_index_metadata_df, "embedding_index_metadata")
         _write_partitioned(state.cache_index_df, "cache_index")
         _write_partitioned(state.sessions_df, "sessions")
         _write_partitioned(state.snapshots_df, "snapshots")
@@ -2776,6 +2964,10 @@ class DataFrameStore:
             capsules_df=_read_all("capsules", CAPSULES_COLUMNS),
             session_rollups_df=_read_all("session_rollups", SESSION_ROLLUPS_COLUMNS),
             topics_df=_read_all("topics", TOPICS_COLUMNS),
+            embedding_index_metadata_df=_read_all(
+                "embedding_index_metadata",
+                EMBEDDING_INDEX_METADATA_COLUMNS,
+            ),
             cache_index_df=_read_all("cache_index", CACHE_INDEX_COLUMNS),
             sessions_df=_read_all("sessions", SESSIONS_COLUMNS),
             snapshots_df=_read_all("snapshots", SNAPSHOTS_COLUMNS),
