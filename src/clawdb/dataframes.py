@@ -27,6 +27,7 @@ from .lineage import (
     materialize_message_bundle,
     materialize_projection_rows,
     normalize_identity,
+    normalize_platform,
 )
 from .models import SearchResult, WalRecord
 from .projections import PROJECTIONS_COLUMNS, materialize_projection_state
@@ -2675,19 +2676,24 @@ class DataFrameStore:
             platform_message_id_text = str(platform_message_id or "").strip()
             if not platform_message_id_text:
                 return None
+            resolved_platform = None
+            if platform is not None and str(platform).strip():
+                resolved_platform = normalize_platform(str(platform))
             df = self._state.messages_df
             mask = (
                 (df["tenant_id"].astype(str) == str(tenant_id))
                 & (df["projection_kind"].astype(str) == RAW_PROJECTION_KIND)
                 & (df["platform_message_id"].astype(str) == platform_message_id_text)
             )
-            if platform is not None:
-                mask &= df["platform"].astype(str) == str(platform)
+            if resolved_platform is not None:
+                mask &= df["platform"].astype(str) == str(resolved_platform)
             if account_id is not None and str(account_id).strip():
                 account_id_text = str(account_id).strip()
                 account_candidates = {account_id_text}
-                if platform is not None:
-                    account_candidates.add(normalize_identity(str(platform), account_id_text, "account"))
+                if resolved_platform is not None:
+                    account_candidates.add(
+                        normalize_identity(str(resolved_platform), account_id_text, "account")
+                    )
                 if "account_key" not in df.columns:
                     df = df.copy()
                     df["account_key"] = ""
