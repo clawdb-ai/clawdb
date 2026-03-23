@@ -378,10 +378,36 @@ The following points were not fully specified yet and must be defined before imp
 
 ### Retrieval contract
 
-- [ ] Exact cross-tier ranking between L0, L1, topics, capsules, and raw messages
-- [ ] Exact lexical/vector weighting by retrieval mode
-- [ ] Whether reranking is mandatory or optional
-- [ ] What gets cited in final results
+Search uses one candidate pool spanning:
+
+- a synthesized L0 scope abstract over the authoritative raw-message scope
+- L1 session rollup windows
+- L2 canonical topics
+- L2 capsules
+- raw messages from the authoritative global raw store
+
+Cross-tier ranking uses one normalized score for every candidate. Sort by final score descending; exact ties break toward the more specific surviving object in this order:
+
+- raw messages
+- capsules
+- topics
+- L1 session rollups
+- L0 scope abstracts
+
+Retrieval modes are:
+
+- `hybrid`: lexical `0.3`, vector `0.7`
+- `lexical`: lexical `1.0`, vector `0.0`
+- `vector`: lexical `0.0`, vector `1.0`
+
+Reranking is optional, not mandatory. It is applied only when an external embedding context is available and the caller leaves rerank in `auto`; otherwise first-pass ranking is final.
+
+Final results cite the returned entity itself. Derived results additionally carry up to two raw `origin_message_id` anchors; raw-message hits cite only their own `origin_message_id`.
+
+- [x] Exact cross-tier ranking between L0, L1, topics, capsules, and raw messages
+- [x] Exact lexical/vector weighting by retrieval mode
+- [x] Whether reranking is mandatory or optional
+- [x] What gets cited in final results
 
 ### Storage and rebuild contract
 

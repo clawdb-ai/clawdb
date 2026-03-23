@@ -41,7 +41,7 @@ from .models import (
     SearchResponse,
 )
 from .mq import AsyncMessageQueue, build_event, create_queue
-from .retrieval import HybridRetrievalEngine, RetrievalDoc
+from .retrieval import HybridRetrievalEngine, RetrievalDoc, resolve_retrieval_weights
 from .trie import TopicTrie
 from .topics import GaussianEwensTopicModel
 from .wal import WalManager
@@ -293,7 +293,8 @@ class ClawDBService:
             f"{req.tenant_id or 'default'}::{req.session_id or '_'}::"
             f"{req.query.strip().lower()}::{req.max_results}::{req.min_score}::"
             f"{req.channel or '_'}::{req.chat_type or '_'}::{req.group_id or '_'}::"
-            f"{req.topic_id or '_'}::{req.message_thread_id or '_'}"
+            f"{req.topic_id or '_'}::{req.message_thread_id or '_'}::"
+            f"{req.retrieval_mode}::{req.rerank}"
         )
 
     def _idempotency_scope(self, tenant_id: str, session_id: str, idempotency_key: str) -> str:
@@ -506,6 +507,24 @@ class ClawDBService:
             return 0.0
         return dot / (math.sqrt(left_norm) * math.sqrt(right_norm))
 
+    def _result_sort_key(self, item: SearchResult) -> tuple[float, int, float, float, str]:
+        entity_priority = {
+            "raw_message": 0,
+            "capsule": 1,
+            "topic": 2,
+            "session_rollup": 3,
+            "l0_abstract": 4,
+        }
+        semantic_component = float(item.score_semantic or 0.0) if item.reranked else 0.0
+        vector_component = semantic_component if item.reranked else float(item.score_vector or 0.0)
+        return (
+            -float(item.score),
+            entity_priority.get(str(item.entity_type), 99),
+            -float(item.score_lexical or 0.0),
+            -vector_component,
+            str(item.entity_id or item.path),
+        )
+
     async def search(
         self,
         req: SearchRequest,
@@ -520,7 +539,7 @@ class ClawDBService:
         if cache_hit:
             results = cached
         else:
-            docs_raw = await self.df_store.message_documents(
+            docs_raw = await self.df_store.retrieval_documents(
                 tenant_id=req.tenant_id,
                 session_id=req.session_id,
                 channel=req.channel,
@@ -530,7 +549,7 @@ class ClawDBService:
                 message_thread_id=req.message_thread_id,
             )
             docs = [
-                RetrievalDoc(doc_id=str(item["doc_id"]), text=str(item["content"]))
+                RetrievalDoc(doc_id=str(item["doc_id"]), text=str(item["text"]))
                 for item in docs_raw
             ]
             doc_map = {str(item["doc_id"]): item for item in docs_raw}
@@ -538,78 +557,68 @@ class ClawDBService:
                 query=req.query,
                 docs=docs,
                 top_k=max(req.max_results * 5, req.max_results),
+                retrieval_mode=req.retrieval_mode,
             )
-            raw: List[SearchResult] = []
-            for doc_id, fused, bm25_score, vec_score in retrieval:
-                item = doc_map.get(doc_id)
+            raw_results: List[SearchResult] = []
+            for score in retrieval:
+                item = doc_map.get(score.doc_id)
                 if item is None:
                     continue
-                raw.append(
+                raw_results.append(
                     SearchResult(
                         path=str(item["path"]),
-                        start_line=int(item["line_no"]),
-                        end_line=int(item["line_no"]),
-                        score=round(float(fused), 6),
-                        score_lexical=round(float(bm25_score), 6),
+                        start_line=int(item.get("start_line") or 1),
+                        end_line=int(item.get("end_line") or item.get("start_line") or 1),
+                        score=round(float(score.score), 6),
+                        score_lexical=round(float(score.score_lexical), 6),
                         score_semantic=0.0,
-                        score_vector=round(float(vec_score), 6),
-                        snippet=str(item["content"])[:700],
+                        score_vector=round(float(score.score_vector), 6),
+                        snippet=str(item["snippet"])[:700],
                         source="memory",
-                        source_tier=str(item.get("capsule_level") or "L0"),
-                        citation=f"origin:{item.get('origin_message_id') or item['message_id']}",
+                        source_tier=str(item.get("source_tier") or "L0"),
+                        entity_type=str(item.get("entity_type") or "raw_message"),
+                        entity_id=str(item.get("entity_id") or item["doc_id"]),
+                        retrieval_mode=req.retrieval_mode,
+                        reranked=False,
+                        citation=str(item.get("citation") or "") or None,
+                        citations=[str(citation) for citation in list(item.get("citations") or [])],
                         channel=str(item.get("channel") or "") or None,
                         chat_type=str(item.get("chat_type") or "") or None,
                         account_id=str(item.get("account_id") or "") or None,
                         group_id=str(item.get("group_id") or "") or None,
-                        topic_id=str(item.get("topic_id") or "default"),
-                        topic_path=str(item.get("topic_path") or item.get("topic_id") or "default"),
+                        topic_id=str(item.get("topic_id") or "") or None,
+                        topic_path=str(item.get("topic_path") or "") or None,
                         message_thread_id=str(item.get("message_thread_id") or "") or None,
                         sender_id=str(item.get("sender_id") or "") or None,
-                        origin_message_id=str(item.get("origin_message_id") or item["message_id"]),
+                        origin_message_id=str(item.get("origin_message_id") or "") or None,
                         projection_kind=str(item.get("projection_kind") or "") or None,
                         projection_scope=str(item.get("projection_scope") or "") or None,
                     )
                 )
-            if not raw:
-                raw = await self.df_store.hybrid_search(
-                    query=req.query,
-                    tenant_id=req.tenant_id,
-                    session_id=req.session_id,
-                    channel=req.channel,
-                    chat_type=req.chat_type,
-                    group_id=req.group_id,
-                    topic_id=req.topic_id,
-                    message_thread_id=req.message_thread_id,
-                    max_results=max(req.max_results * 5, req.max_results),
-                    min_score=max(0.0, min(req.min_score, 0.15)),
-                )
-            rescored = raw
-            if embedding_ctx and raw:
+            rescored = sorted(raw_results, key=self._result_sort_key)
+            if embedding_ctx and rescored and req.rerank != "off":
                 try:
-                    texts = [req.query, *[item.snippet for item in raw]]
+                    lexical_weight, vector_weight = resolve_retrieval_weights(req.retrieval_mode)
+                    texts = [req.query, *[item.snippet for item in rescored]]
                     vectors = await self._embed_texts_cached(embedding_ctx, texts)
                     query_vec = vectors[0]
                     msg_vecs = vectors[1:]
                     merged = []
-                    for item, vector in zip(raw, msg_vecs):
-                        lexical_score = float(item.score_lexical or item.score)
-                        vector_score = self._cosine_similarity(query_vec, vector)
-                        semantic_score = float(item.score_semantic)
-                        combined = (
-                            (0.30 * lexical_score)
-                            + (0.20 * semantic_score)
-                            + (0.50 * max(0.0, vector_score))
-                        )
+                    for item, vector in zip(rescored, msg_vecs):
+                        lexical_score = float(item.score_lexical or 0.0)
+                        semantic_score = max(0.0, self._cosine_similarity(query_vec, vector))
+                        combined = (lexical_weight * lexical_score) + (vector_weight * semantic_score)
                         updated = item.model_copy(
                             update={
                                 "score": round(float(combined), 6),
-                                "score_vector": round(float(vector_score), 6),
+                                "score_semantic": round(float(semantic_score), 6),
+                                "reranked": True,
                             }
                         )
                         merged.append(updated)
-                    rescored = sorted(merged, key=lambda r: r.score, reverse=True)
+                    rescored = sorted(merged, key=self._result_sort_key)
                 except Exception:
-                    rescored = raw
+                    rescored = sorted(raw_results, key=self._result_sort_key)
             filtered = [item for item in rescored if item.score >= req.min_score]
             results = [item.model_dump() for item in filtered[: max(1, req.max_results)]]
             self._search_cache[key] = results
@@ -818,7 +827,12 @@ class ClawDBService:
                 "snippet": item.snippet,
                 "source": item.source,
                 "sourceTier": item.source_tier,
+                "entityType": item.entity_type,
+                "entityId": item.entity_id,
+                "retrievalMode": item.retrieval_mode,
+                "reranked": item.reranked,
                 "citation": item.citation,
+                "citations": item.citations,
                 "channel": item.channel,
                 "chatType": item.chat_type,
                 "accountId": item.account_id,

@@ -27,5 +27,6 @@ src/clawdb.egg-info/requires.txt
 src/clawdb.egg-info/top_level.txt
 tests/test_capsule_lifecycle.py
 tests/test_lineage_projections.py
+tests/test_retrieval_contract.py
 tests/test_session_rollups.py
 tests/test_topic_lifecycle.py

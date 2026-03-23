@@ -79,6 +79,8 @@ class SearchRequest(BaseModel):
     group_id: Optional[str] = None
     topic_id: Optional[str] = None
     message_thread_id: Optional[str] = None
+    retrieval_mode: Literal["hybrid", "lexical", "vector"] = "hybrid"
+    rerank: Literal["auto", "off"] = "auto"
     max_results: int = 6
     min_score: float = 0.0
 
@@ -94,7 +96,14 @@ class SearchResult(BaseModel):
     snippet: str
     source: Literal["memory", "sessions"] = "memory"
     source_tier: Literal["L0", "L1", "L2"] = "L0"
+    entity_type: Literal["l0_abstract", "session_rollup", "topic", "capsule", "raw_message"] = (
+        "raw_message"
+    )
+    entity_id: Optional[str] = None
+    retrieval_mode: Literal["hybrid", "lexical", "vector"] = "hybrid"
+    reranked: bool = False
     citation: Optional[str] = None
+    citations: List[str] = Field(default_factory=list)
     channel: Optional[str] = None
     chat_type: Optional[str] = None
     account_id: Optional[str] = None

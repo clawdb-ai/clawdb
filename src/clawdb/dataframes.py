@@ -208,6 +208,7 @@ ROLLUP_WINDOW_KINDS = (
 )
 ROLLUP_SUMMARY_MAX_CHARS = 4000
 DEFAULT_ROLLUP_VECTOR_DIM = 64
+RETRIEVAL_ABSTRACT_MAX_CHARS = 4000
 
 
 def _utc_timestamp(value: object) -> pd.Timestamp:
@@ -319,6 +320,38 @@ def _render_rollup_summary(
 def _serialize_vector(text: str, dim: int) -> str:
     vec = [round(float(item), 8) for item in _vectorize(text, max(8, int(dim)))]
     return json.dumps(vec, separators=(",", ":"))
+
+
+def _trim_text(value: object, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= max(0, int(limit)):
+        return text
+    return text[: max(0, int(limit) - 3)] + "..."
+
+
+def _safe_path_fragment(value: object) -> str:
+    raw = str(value or "").strip() or "_"
+    out = []
+    for char in raw:
+        if char.isalnum() or char in {"-", "_", "."}:
+            out.append(char)
+        else:
+            out.append("_")
+    return "".join(out)
+
+
+def _dedupe_citations(values: List[str], limit: int = 3) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for value in values:
+        citation = str(value or "").strip()
+        if not citation or citation in seen:
+            continue
+        out.append(citation)
+        seen.add(citation)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
 
 
 def materialize_session_rollups(
@@ -846,6 +879,176 @@ class DataFrameStore:
         ]
         if window_kind is not None:
             scoped = scoped[scoped["window_kind"].astype(str) == str(window_kind)]
+        if scoped.empty:
+            return indexed.iloc[0:0].copy()
+        return scoped
+
+    def _raw_messages_for_query_locked(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+        channel: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        group_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
+        include_deleted: bool = False,
+    ) -> pd.DataFrame:
+        if session_id is None:
+            return self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=None,
+                channel=channel,
+                chat_type=chat_type,
+                group_id=group_id,
+                topic_id=topic_id,
+                message_thread_id=message_thread_id,
+                row_mode="raw",
+                include_deleted=include_deleted,
+            )
+        scoped = self._messages_for_query_locked(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            channel=channel,
+            chat_type=chat_type,
+            group_id=group_id,
+            topic_id=topic_id,
+            message_thread_id=message_thread_id,
+            row_mode="all",
+            include_deleted=include_deleted,
+        )
+        if scoped.empty:
+            return scoped.iloc[0:0].copy()
+        if self._messages_index_dirty or self._messages_indexed_df is None:
+            indexed = self._build_messages_index_locked()
+        else:
+            indexed = self._messages_indexed_df
+        origin_ids = {
+            str(item)
+            for item in scoped["origin_message_id"].astype(str).tolist()
+            if str(item)
+        }
+        if not origin_ids:
+            return indexed.iloc[0:0].copy()
+        raw_rows = indexed[
+            (indexed["tenant_id"].astype(str) == str(tenant_id))
+            & (indexed["projection_kind"].astype(str) == RAW_PROJECTION_KIND)
+            & (indexed["origin_message_id"].astype(str).isin(origin_ids))
+        ]
+        if not include_deleted:
+            raw_rows = raw_rows[raw_rows["message_state"].astype(str) != MESSAGE_STATE_DELETED]
+        if raw_rows.empty:
+            return indexed.iloc[0:0].copy()
+        return self._chronological_messages(raw_rows)
+
+    def _topic_rows_for_query_locked(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+        topic_id: Optional[str],
+    ) -> pd.DataFrame:
+        topics = self._state.topics_df
+        if topics.empty:
+            return topics.iloc[0:0].copy()
+        scoped = topics.copy().reset_index(drop=True)
+        scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+        scoped["topic_id"] = scoped["topic_id"].fillna("default").astype(str)
+        scoped["canonical_topic_id"] = scoped["canonical_topic_id"].fillna(scoped["topic_id"]).astype(str)
+        scoped["topic_path"] = scoped["topic_path"].fillna(scoped["canonical_topic_id"]).astype(str)
+        scoped["status"] = scoped["status"].fillna("").astype(str)
+        scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
+        scoped = scoped[scoped["tenant_id"].astype(str) == str(tenant_id)]
+        if topic_id is not None:
+            canonical_ids = self._canonical_topic_ids_locked(tenant_id, [str(topic_id)])
+            scoped = scoped[scoped["canonical_topic_id"].astype(str).isin(canonical_ids)]
+        elif session_id is not None:
+            canonical_ids = self._topic_ids_for_session_locked(
+                tenant_id,
+                str(session_id),
+                include_deleted=False,
+            )
+            scoped = scoped[scoped["canonical_topic_id"].astype(str).isin(canonical_ids)]
+        if scoped.empty:
+            return topics.iloc[0:0].copy()
+        scoped = scoped[scoped["status"].astype(str) != "compacted"].copy()
+        if scoped.empty:
+            return topics.iloc[0:0].copy()
+        scoped["_canonical_priority"] = (
+            scoped["topic_id"].astype(str) != scoped["canonical_topic_id"].astype(str)
+        ).astype(int)
+        scoped = scoped.sort_values(
+            ["canonical_topic_id", "_canonical_priority", "updated_at", "topic_id"],
+            ascending=[True, True, False, True],
+            kind="stable",
+        )
+        scoped = scoped.groupby("canonical_topic_id", sort=True, as_index=False).head(1)
+        return scoped.drop(columns=["_canonical_priority"]).reset_index(drop=True)
+
+    def _session_rollup_rows_for_scope_locked(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+        channel: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        group_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
+    ) -> pd.DataFrame:
+        if self._session_rollups_index_dirty or self._session_rollups_indexed_df is None:
+            indexed = self._build_session_rollups_index_locked()
+        else:
+            indexed = self._session_rollups_indexed_df
+        if indexed.empty:
+            return indexed.iloc[0:0].copy()
+        if session_id is not None:
+            return self._session_rollups_for_query_locked(tenant_id, str(session_id))
+        scoped = indexed[indexed["tenant_id"].astype(str) == str(tenant_id)]
+        projection_rows = self._messages_for_query_locked(
+            tenant_id=tenant_id,
+            session_id=None,
+            channel=channel,
+            chat_type=chat_type,
+            group_id=group_id,
+            topic_id=topic_id,
+            message_thread_id=message_thread_id,
+            row_mode="projection",
+            include_deleted=False,
+        )
+        if not projection_rows.empty:
+            session_ids = sorted(
+                {
+                    str(item)
+                    for item in projection_rows["session_id"].astype(str).tolist()
+                    if str(item)
+                }
+            )
+            scoped = scoped[scoped["session_id"].astype(str).isin(session_ids)]
+        if scoped.empty:
+            return indexed.iloc[0:0].copy()
+        return scoped
+
+    def _capsule_rows_for_scope_locked(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+        topic_id: Optional[str],
+    ) -> pd.DataFrame:
+        if self._capsules_index_dirty or self._capsules_indexed_df is None:
+            indexed = self._build_capsules_index_locked()
+        else:
+            indexed = self._capsules_indexed_df
+        if indexed.empty:
+            return indexed.iloc[0:0].copy()
+        if session_id is not None:
+            return self._capsules_for_query_locked(tenant_id, str(session_id))
+        scoped = indexed[indexed["tenant_id"].astype(str) == str(tenant_id)]
+        if topic_id is not None:
+            canonical_ids = self._canonical_topic_ids_locked(tenant_id, [str(topic_id)])
+            scoped = scoped[scoped["topic_id"].astype(str).isin(canonical_ids)]
         if scoped.empty:
             return indexed.iloc[0:0].copy()
         return scoped
@@ -1614,6 +1817,359 @@ class DataFrameStore:
                         "line_no": line_no,
                     }
                 )
+            return docs
+
+    async def retrieval_documents(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+        channel: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        group_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        async with self._lock:
+            projection_rows = self._messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                channel=channel,
+                chat_type=chat_type,
+                group_id=group_id,
+                topic_id=topic_id,
+                message_thread_id=message_thread_id,
+                row_mode="projection",
+                include_deleted=False,
+            )
+            raw_rows = self._raw_messages_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                channel=channel,
+                chat_type=chat_type,
+                group_id=group_id,
+                topic_id=topic_id,
+                message_thread_id=message_thread_id,
+                include_deleted=False,
+            )
+            rollup_rows = self._session_rollup_rows_for_scope_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                channel=channel,
+                chat_type=chat_type,
+                group_id=group_id,
+                topic_id=topic_id,
+                message_thread_id=message_thread_id,
+            )
+            topic_rows = self._topic_rows_for_query_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                topic_id=topic_id,
+            )
+            capsule_rows = self._capsule_rows_for_scope_locked(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                topic_id=topic_id,
+            )
+            if (
+                projection_rows.empty
+                and raw_rows.empty
+                and rollup_rows.empty
+                and topic_rows.empty
+                and capsule_rows.empty
+            ):
+                return []
+
+            docs: List[Dict[str, object]] = []
+            projection_rows = projection_rows.reset_index(drop=True)
+            raw_rows = self._chronological_messages(raw_rows)
+            rollup_rows = rollup_rows.reset_index(drop=True)
+            topic_rows = topic_rows.reset_index(drop=True)
+            capsule_rows = capsule_rows.reset_index(drop=True)
+            for idx, (_, row) in enumerate(raw_rows.iterrows(), start=1):
+                origin_id = str(row.get("origin_message_id") or row["message_id"])
+                citations = [f"origin:{origin_id}"]
+                docs.append(
+                    {
+                        "doc_id": f"raw:{origin_id}",
+                        "text": str(row.get("content") or ""),
+                        "path": f"memory/raw/{_safe_path_fragment(tenant_id)}/{origin_id}.md",
+                        "start_line": idx,
+                        "end_line": idx,
+                        "snippet": _trim_text(row.get("content") or "", 700),
+                        "source_tier": "L0",
+                        "entity_type": "raw_message",
+                        "entity_id": origin_id,
+                        "citation": citations[0],
+                        "citations": citations,
+                        "channel": str(row.get("channel") or "") or None,
+                        "chat_type": str(row.get("chat_type") or "") or None,
+                        "account_id": str(row.get("account_id") or "") or None,
+                        "group_id": str(row.get("group_id") or "") or None,
+                        "topic_id": str(row.get("topic_id") or "default"),
+                        "topic_path": str(row.get("topic_path") or row.get("topic_id") or "default"),
+                        "message_thread_id": str(row.get("message_thread_id") or "") or None,
+                        "sender_id": str(row.get("sender_id") or "") or None,
+                        "origin_message_id": origin_id,
+                        "projection_kind": str(row.get("projection_kind") or "") or None,
+                        "projection_scope": str(row.get("projection_scope") or "") or None,
+                    }
+                )
+
+            topic_aliases: Dict[str, set[str]] = {}
+            if not self._state.topics_df.empty:
+                topic_state = self._state.topics_df.copy().reset_index(drop=True)
+                topic_state["tenant_id"] = topic_state["tenant_id"].fillna("default").astype(str)
+                topic_state["topic_id"] = topic_state["topic_id"].fillna("default").astype(str)
+                topic_state["canonical_topic_id"] = topic_state["canonical_topic_id"].fillna(
+                    topic_state["topic_id"]
+                ).astype(str)
+                scoped_topics = topic_state[topic_state["tenant_id"].astype(str) == str(tenant_id)]
+                for _, row in scoped_topics.iterrows():
+                    canonical_id = str(row["canonical_topic_id"] or row["topic_id"])
+                    topic_aliases.setdefault(canonical_id, set()).add(str(row["topic_id"]))
+
+            def _origin_bounds(frame: pd.DataFrame) -> List[str]:
+                if frame.empty:
+                    return []
+                ordered = self._chronological_messages(frame)
+                first_origin = str(ordered.iloc[0].get("origin_message_id") or ordered.iloc[0]["message_id"])
+                last_origin = str(ordered.iloc[-1].get("origin_message_id") or ordered.iloc[-1]["message_id"])
+                citations = [f"origin:{first_origin}"]
+                if last_origin and last_origin != first_origin:
+                    citations.append(f"origin:{last_origin}")
+                return citations
+
+            def _scope_id() -> str:
+                if session_id:
+                    return f"session_{_safe_path_fragment(session_id)}"
+                if topic_id:
+                    return f"topic_{_safe_path_fragment(topic_id)}"
+                if group_id:
+                    return f"group_{_safe_path_fragment(group_id)}"
+                return f"tenant_{_safe_path_fragment(tenant_id)}"
+
+            if not raw_rows.empty:
+                l0_header = (
+                    f"l0 scope={_scope_id()} raw_messages={int(raw_rows.shape[0])} "
+                    f"rollups={int(rollup_rows.shape[0])} topics={int(topic_rows.shape[0])} "
+                    f"capsules={int(capsule_rows.shape[0])}"
+                )
+                l0_sections: List[str] = [l0_header]
+                lifetime_rollups = rollup_rows[rollup_rows["window_kind"].astype(str) == "lifetime"]
+                if not lifetime_rollups.empty:
+                    latest_lifetimes = lifetime_rollups.sort_values(
+                        ["source_last_ts", "session_id"],
+                        ascending=[False, True],
+                        kind="stable",
+                    ).head(3)
+                    for _, row in latest_lifetimes.iterrows():
+                        l0_sections.append(
+                            "session "
+                            f"{str(row.get('session_id') or '')} "
+                            f"{_trim_text(row.get('summary') or '', 900)}"
+                        )
+                if not topic_rows.empty:
+                    for _, row in topic_rows.head(3).iterrows():
+                        l0_sections.append(
+                            "topic "
+                            f"{str(row.get('canonical_topic_id') or row.get('topic_id') or 'default')} "
+                            f"{_trim_text(row.get('summary') or '', 700)}"
+                        )
+                if not capsule_rows.empty:
+                    recent_capsules = capsule_rows.sort_values(
+                        ["updated_at", "capsule_ordinal"],
+                        ascending=[False, False],
+                        kind="stable",
+                    ).head(2)
+                    for _, row in recent_capsules.iterrows():
+                        l0_sections.append(
+                            "capsule "
+                            f"{str(row.get('capsule_id') or '')} "
+                            f"{_trim_text(row.get('summary') or '', 700)}"
+                        )
+                raw_tail = raw_rows.tail(4)
+                for _, row in raw_tail.iterrows():
+                    l0_sections.append(_trim_text(row.get("content") or "", 350))
+                l0_text = _trim_text("\n".join(part for part in l0_sections if part), RETRIEVAL_ABSTRACT_MAX_CHARS)
+                l0_primary = f"l0:{tenant_id}:{_scope_id()}"
+                l0_citations = _dedupe_citations([l0_primary, *_origin_bounds(raw_rows)], limit=3)
+                docs.append(
+                    {
+                        "doc_id": l0_primary,
+                        "text": l0_text,
+                        "path": f"memory/l0/{_scope_id()}.md",
+                        "start_line": 1,
+                        "end_line": 1,
+                        "snippet": _trim_text(l0_text, 700),
+                        "source_tier": "L0",
+                        "entity_type": "l0_abstract",
+                        "entity_id": l0_primary,
+                        "citation": l0_primary,
+                        "citations": l0_citations,
+                        "channel": None,
+                        "chat_type": None,
+                        "account_id": None,
+                        "group_id": None,
+                        "topic_id": None,
+                        "topic_path": None,
+                        "message_thread_id": None,
+                        "sender_id": None,
+                        "origin_message_id": (
+                            l0_citations[1].split(":", 1)[1] if len(l0_citations) > 1 else None
+                        ),
+                        "projection_kind": None,
+                        "projection_scope": None,
+                    }
+                )
+
+            if not rollup_rows.empty:
+                ordered_rollups = rollup_rows.sort_values(
+                    ["source_last_ts", "window_kind", "window_key"],
+                    ascending=[False, True, True],
+                    kind="stable",
+                )
+                projection_rows = self._chronological_messages(projection_rows)
+                for _, row in ordered_rollups.iterrows():
+                    session_rollup_id = str(row.get("rollup_id") or "")
+                    session_key = str(row.get("session_id") or "")
+                    bucket_start = pd.to_datetime(row.get("bucket_start"), utc=True, errors="coerce")
+                    bucket_end = pd.to_datetime(row.get("bucket_end"), utc=True, errors="coerce")
+                    supporting = projection_rows[projection_rows["session_id"].astype(str) == session_key]
+                    if pd.notna(bucket_start):
+                        supporting = supporting[supporting["ts"] >= bucket_start]
+                    if pd.notna(bucket_end):
+                        supporting = supporting[supporting["ts"] < bucket_end]
+                    primary = session_rollup_id or (
+                        "rollup:"
+                        f"{tenant_id}:{session_key}:{str(row.get('window_kind') or '')}:{str(row.get('window_key') or '')}"
+                    )
+                    citations = _dedupe_citations([primary, *_origin_bounds(supporting)], limit=3)
+                    docs.append(
+                        {
+                            "doc_id": primary,
+                            "text": str(row.get("summary") or ""),
+                            "path": (
+                                "memory/rollups/"
+                                f"{_safe_path_fragment(session_key)}/"
+                                f"{_safe_path_fragment(row.get('window_kind') or '')}/"
+                                f"{_safe_path_fragment(row.get('window_key') or '')}.md"
+                            ),
+                            "start_line": 1,
+                            "end_line": 1,
+                            "snippet": _trim_text(row.get("summary") or "", 700),
+                            "source_tier": "L1",
+                            "entity_type": "session_rollup",
+                            "entity_id": primary,
+                            "citation": primary,
+                            "citations": citations,
+                            "channel": None,
+                            "chat_type": None,
+                            "account_id": None,
+                            "group_id": None,
+                            "topic_id": None,
+                            "topic_path": None,
+                            "message_thread_id": None,
+                            "sender_id": None,
+                            "origin_message_id": (
+                                citations[1].split(":", 1)[1] if len(citations) > 1 else None
+                            ),
+                            "projection_kind": None,
+                            "projection_scope": session_key or None,
+                        }
+                    )
+
+            if not topic_rows.empty:
+                ordered_topics = topic_rows.sort_values(
+                    ["updated_at", "canonical_topic_id"],
+                    ascending=[False, True],
+                    kind="stable",
+                )
+                for _, row in ordered_topics.iterrows():
+                    canonical_topic_id = str(row.get("canonical_topic_id") or row.get("topic_id") or "default")
+                    aliases = topic_aliases.get(canonical_topic_id, {canonical_topic_id})
+                    supporting = raw_rows[raw_rows["topic_id"].astype(str).isin(sorted(aliases))]
+                    primary = f"topic:{canonical_topic_id}"
+                    citations = _dedupe_citations([primary, *_origin_bounds(supporting)], limit=3)
+                    docs.append(
+                        {
+                            "doc_id": primary,
+                            "text": str(row.get("summary") or row.get("vector_text") or ""),
+                            "path": f"memory/topics/{_safe_path_fragment(canonical_topic_id)}.md",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "snippet": _trim_text(row.get("summary") or row.get("vector_text") or "", 700),
+                            "source_tier": "L2",
+                            "entity_type": "topic",
+                            "entity_id": canonical_topic_id,
+                            "citation": primary,
+                            "citations": citations,
+                            "channel": None,
+                            "chat_type": None,
+                            "account_id": None,
+                            "group_id": None,
+                            "topic_id": canonical_topic_id,
+                            "topic_path": str(row.get("topic_path") or canonical_topic_id),
+                            "message_thread_id": None,
+                            "sender_id": None,
+                            "origin_message_id": (
+                                citations[1].split(":", 1)[1] if len(citations) > 1 else None
+                            ),
+                            "projection_kind": None,
+                            "projection_scope": None,
+                        }
+                    )
+
+            if not capsule_rows.empty:
+                ordered_capsules = capsule_rows.sort_values(
+                    ["updated_at", "capsule_ordinal"],
+                    ascending=[False, False],
+                    kind="stable",
+                )
+                for _, row in ordered_capsules.iterrows():
+                    capsule_id = str(row.get("capsule_id") or "")
+                    first_origin = str(row.get("first_origin_message_id") or "").strip()
+                    last_origin = str(row.get("last_origin_message_id") or "").strip()
+                    primary = f"capsule:{capsule_id}"
+                    citations = _dedupe_citations(
+                        [
+                            primary,
+                            f"origin:{first_origin}" if first_origin else "",
+                            f"origin:{last_origin}" if last_origin else "",
+                        ],
+                        limit=3,
+                    )
+                    docs.append(
+                        {
+                            "doc_id": primary,
+                            "text": str(row.get("summary") or ""),
+                            "path": (
+                                "memory/capsules/"
+                                f"{_safe_path_fragment(row.get('topic_id') or 'default')}/"
+                                f"{int(row.get('capsule_ordinal') or 0):04d}.md"
+                            ),
+                            "start_line": 1,
+                            "end_line": 1,
+                            "snippet": _trim_text(row.get("summary") or "", 700),
+                            "source_tier": "L2",
+                            "entity_type": "capsule",
+                            "entity_id": capsule_id,
+                            "citation": primary,
+                            "citations": citations,
+                            "channel": None,
+                            "chat_type": None,
+                            "account_id": None,
+                            "group_id": None,
+                            "topic_id": str(row.get("topic_id") or "default"),
+                            "topic_path": str(row.get("topic_path") or row.get("topic_id") or "default"),
+                            "message_thread_id": None,
+                            "sender_id": None,
+                            "origin_message_id": first_origin or None,
+                            "projection_kind": None,
+                            "projection_scope": None,
+                        }
+                    )
+
             return docs
 
     async def hybrid_search(
