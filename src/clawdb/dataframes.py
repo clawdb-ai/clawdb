@@ -3243,6 +3243,47 @@ class DataFrameStore:
             jobs = self._normalize_semantic_jobs_locked()
             return self._semantic_job_stats_locked(jobs)
 
+    async def has_pending_semantic_refresh(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str] = None,
+    ) -> bool:
+        async with self._lock:
+            jobs = self._normalize_semantic_jobs_locked()
+            if jobs.empty:
+                return False
+            jobs = jobs[
+                jobs["status"].astype(str).isin(
+                    [SEMANTIC_JOB_STATUS_PENDING, SEMANTIC_JOB_STATUS_RUNNING]
+                )
+            ]
+            if jobs.empty:
+                return False
+            tenant_jobs = jobs[
+                (jobs["tenant_id"].astype(str) == str(tenant_id))
+                | (jobs["tenant_id"].astype(str) == "*")
+            ]
+            if tenant_jobs.empty:
+                return False
+            if session_id is None:
+                return True
+            session_text = str(session_id).strip()
+            if not session_text:
+                return True
+            session_candidates = {
+                session_text,
+                *self._resolve_session_ids_locked(str(tenant_id), session_text, include_mirrors=True),
+            }
+            for _, row in tenant_jobs.iterrows():
+                impacted_sessions = {
+                    *_json_string_list(row.get("impacted_sessions_json")),
+                    *_json_string_list(row.get("claimed_sessions_json")),
+                }
+                if not impacted_sessions or impacted_sessions.intersection(session_candidates):
+                    return True
+            return False
+
     async def claim_next_semantic_job(
         self,
         *,

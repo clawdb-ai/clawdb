@@ -406,6 +406,22 @@ class ClawDBService:
                 vector_dim=self.config.topic_gep_dim,
             )
 
+    async def _sync_semantic_state_for_read(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+    ) -> None:
+        if not self._semantic_pipeline_async_enabled:
+            return
+        requires_refresh = await self.df_store.has_pending_semantic_refresh(
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
+        if not requires_refresh:
+            return
+        await self.drain_semantic_pipeline()
+
     async def _rebuild_topic_state_from_store(self, *, rebuild_materialized_topics: bool = True) -> None:
         if rebuild_materialized_topics:
             await self.df_store.rebuild_all_topics(vector_dim=self.config.topic_gep_dim)
@@ -816,6 +832,10 @@ class ClawDBService:
         req: SearchRequest,
         embedding_ctx: Optional[EmbeddingAuthContext] = None,
     ) -> SearchResponse:
+        await self._sync_semantic_state_for_read(
+            tenant_id=req.tenant_id,
+            session_id=req.session_id,
+        )
         started = monotonic()
         key = self._cache_key(req)
         if embedding_ctx:
@@ -1022,6 +1042,10 @@ class ClawDBService:
         return await self.openclaw_memory_get(path, from_line=1, lines=5000)
 
     async def present_capsule_cards(self, tenant_id: str, session_id: str) -> List[dict]:
+        await self._sync_semantic_state_for_read(
+            tenant_id=tenant_id,
+            session_id=session_id,
+        )
         cards = await self.df_store.capsule_cards(tenant_id=tenant_id, session_id=session_id)
         if cards:
             return cards
