@@ -488,6 +488,7 @@ Recommended direction:
    - capsules
    - L0 beliefs
 7. Make every derived layer rebuildable from authoritative raw data.
+8. Keep `.venv/` and `tests/` as local validation artifacts only. Both paths must stay gitignored and must not be committed by execution batches.
 
 ## Final Judgment
 
