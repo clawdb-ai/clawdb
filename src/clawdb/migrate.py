@@ -27,9 +27,10 @@ from .lineage import (
     materialize_message_bundle,
 )
 from .metadata import DataFrameMetadataStore
+from .topics import TOPICS_COLUMNS, materialize_topic_lifecycle
 
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 SCHEMA_VERSION_SLOT = "schema_version"
 
 
@@ -64,6 +65,7 @@ TABLE_COLUMNS: Mapping[str, List[str]] = {
     "messages": MESSAGES_COLUMNS,
     "capsules": CAPSULES_COLUMNS,
     "session_rollups": SESSION_ROLLUPS_COLUMNS,
+    "topics": TOPICS_COLUMNS,
     "cache_index": CACHE_INDEX_COLUMNS,
     "sessions": SESSIONS_COLUMNS,
     "snapshots": SNAPSHOTS_COLUMNS,
@@ -321,6 +323,61 @@ def _normalize_session_rollups(frame: pd.DataFrame) -> pd.DataFrame:
     return out[SESSION_ROLLUPS_COLUMNS]
 
 
+def _normalize_topics(frame: pd.DataFrame) -> pd.DataFrame:
+    defaults: Dict[str, object] = {
+        "topic_id": "default",
+        "tenant_id": "default",
+        "canonical_topic_id": "default",
+        "topic_parent_id": "",
+        "topic_path": "default",
+        "source_topic_id": "default",
+        "status": "active",
+        "historical_message_count": 0,
+        "message_count": 0,
+        "deleted_message_count": 0,
+        "content_char_count": 0,
+        "keywords_json": "[]",
+        "merged_topic_ids_json": "[]",
+        "split_topic_ids_json": "[]",
+        "drift_score": 0.0,
+        "drift_corrected_at": pd.NaT,
+        "first_ts": pd.Timestamp.now(tz="UTC"),
+        "last_ts": pd.Timestamp.now(tz="UTC"),
+        "summary": "",
+        "vector_text": "",
+        "vector_ref": "",
+        "vector_dim": 64,
+        "vector_json": "[]",
+        "updated_at": pd.Timestamp.now(tz="UTC"),
+    }
+    out = _ensure_columns(frame, TOPICS_COLUMNS, defaults)
+    out["topic_id"] = _fill_string(out["topic_id"], "default")
+    out["tenant_id"] = _fill_string(out["tenant_id"], "default")
+    out["canonical_topic_id"] = _fill_string(out["canonical_topic_id"], "default")
+    out["topic_parent_id"] = _fill_string(out["topic_parent_id"])
+    out["topic_path"] = _fill_string(out["topic_path"], "default")
+    out["source_topic_id"] = _fill_string(out["source_topic_id"], "default")
+    out["status"] = _fill_string(out["status"], "active")
+    out["historical_message_count"] = _to_int(out["historical_message_count"], 0)
+    out["message_count"] = _to_int(out["message_count"], 0)
+    out["deleted_message_count"] = _to_int(out["deleted_message_count"], 0)
+    out["content_char_count"] = _to_int(out["content_char_count"], 0)
+    out["keywords_json"] = _fill_string(out["keywords_json"], "[]")
+    out["merged_topic_ids_json"] = _fill_string(out["merged_topic_ids_json"], "[]")
+    out["split_topic_ids_json"] = _fill_string(out["split_topic_ids_json"], "[]")
+    out["drift_score"] = _to_float(out["drift_score"], 0.0)
+    out["drift_corrected_at"] = pd.to_datetime(out["drift_corrected_at"], utc=True, errors="coerce")
+    out["first_ts"] = _to_datetime_utc(out["first_ts"])
+    out["last_ts"] = _to_datetime_utc(out["last_ts"])
+    out["summary"] = _fill_string(out["summary"])
+    out["vector_text"] = _fill_string(out["vector_text"])
+    out["vector_ref"] = _fill_string(out["vector_ref"])
+    out["vector_dim"] = _to_int(out["vector_dim"], 64)
+    out["vector_json"] = _fill_string(out["vector_json"], "[]")
+    out["updated_at"] = _to_datetime_utc(out["updated_at"])
+    return out[TOPICS_COLUMNS]
+
+
 def _normalize_cache_index(frame: pd.DataFrame) -> pd.DataFrame:
     defaults: Dict[str, object] = {
         "key": "",
@@ -388,6 +445,7 @@ NORMALIZERS: Mapping[str, Callable[[pd.DataFrame], pd.DataFrame]] = {
     "messages": _normalize_messages,
     "capsules": _normalize_capsules,
     "session_rollups": _normalize_session_rollups,
+    "topics": _normalize_topics,
     "cache_index": _normalize_cache_index,
     "sessions": _normalize_sessions,
     "snapshots": _normalize_snapshots,
@@ -429,7 +487,7 @@ def _infer_schema_version(messages_frame: pd.DataFrame) -> int:
 def _partition_value(frame: pd.DataFrame, table: str) -> pd.Series:
     if table == "messages":
         return pd.to_datetime(frame["ts"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
-    if table in {"capsules", "session_rollups"}:
+    if table in {"capsules", "session_rollups", "topics"}:
         return pd.to_datetime(frame["updated_at"], utc=True, errors="coerce").dt.strftime("%Y-%m-%d")
     if table in {"sessions", "snapshots"}:
         ts_col = "created_at"
@@ -625,6 +683,11 @@ async def migrate_schema(
         normalized_tables[table] = await asyncio.to_thread(normalizer, frame)
     normalized_tables["session_rollups"] = await asyncio.to_thread(
         materialize_session_rollups,
+        normalized_tables["messages"],
+        vector_dim=_rollup_vector_dim_from_env(),
+    )
+    normalized_tables["topics"] = await asyncio.to_thread(
+        materialize_topic_lifecycle,
         normalized_tables["messages"],
         vector_dim=_rollup_vector_dim_from_env(),
     )

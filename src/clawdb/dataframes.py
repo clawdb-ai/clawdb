@@ -17,7 +17,12 @@ from .lineage import (
     materialize_message_bundle,
 )
 from .models import SearchResult, WalRecord
-from .topics import _vectorize
+from .topics import (
+    DEFAULT_TOPIC_VECTOR_DIM,
+    TOPICS_COLUMNS,
+    _vectorize,
+    materialize_topic_lifecycle,
+)
 
 
 MESSAGES_COLUMNS = [
@@ -93,6 +98,11 @@ SESSION_ROLLUPS_COLUMNS = [
     "vector_dim",
     "vector_json",
     "updated_at",
+]
+
+TOPIC_MULTIINDEX_LEVELS = [
+    "tenant_id",
+    "topic_id",
 ]
 
 CACHE_INDEX_COLUMNS = [
@@ -176,6 +186,7 @@ class DataFramesState:
     messages_df: pd.DataFrame
     capsules_df: pd.DataFrame
     session_rollups_df: pd.DataFrame
+    topics_df: pd.DataFrame
     cache_index_df: pd.DataFrame
     sessions_df: pd.DataFrame
     snapshots_df: pd.DataFrame
@@ -415,6 +426,7 @@ class DataFrameStore:
             messages_df=pd.DataFrame(columns=MESSAGES_COLUMNS),
             capsules_df=pd.DataFrame(columns=CAPSULES_COLUMNS),
             session_rollups_df=pd.DataFrame(columns=SESSION_ROLLUPS_COLUMNS),
+            topics_df=pd.DataFrame(columns=TOPICS_COLUMNS),
             cache_index_df=pd.DataFrame(columns=CACHE_INDEX_COLUMNS),
             sessions_df=pd.DataFrame(columns=SESSIONS_COLUMNS),
             snapshots_df=pd.DataFrame(columns=SNAPSHOTS_COLUMNS),
@@ -474,6 +486,30 @@ class DataFrameStore:
                 "vector_json": "string",
                 "message_count": "int64",
                 "content_char_count": "int64",
+            }
+        )
+        self._state.topics_df = self._state.topics_df.astype(
+            {
+                "topic_id": "string",
+                "tenant_id": "string",
+                "canonical_topic_id": "string",
+                "topic_parent_id": "string",
+                "topic_path": "string",
+                "source_topic_id": "string",
+                "status": "string",
+                "historical_message_count": "int64",
+                "message_count": "int64",
+                "deleted_message_count": "int64",
+                "content_char_count": "int64",
+                "keywords_json": "string",
+                "merged_topic_ids_json": "string",
+                "split_topic_ids_json": "string",
+                "drift_score": "float64",
+                "summary": "string",
+                "vector_text": "string",
+                "vector_ref": "string",
+                "vector_dim": "int64",
+                "vector_json": "string",
             }
         )
         self._state.sessions_df = self._state.sessions_df.astype(
@@ -1078,6 +1114,14 @@ class DataFrameStore:
             )
             self._invalidate_session_rollups_index_locked()
             return int(self._state.session_rollups_df.shape[0])
+
+    async def rebuild_all_topics(self, *, vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM) -> int:
+        async with self._lock:
+            self._state.topics_df = materialize_topic_lifecycle(
+                self._state.messages_df,
+                vector_dim=vector_dim,
+            )
+            return int(self._state.topics_df.shape[0])
 
     async def refresh_session_rollups(
         self,
@@ -1706,6 +1750,7 @@ class DataFrameStore:
         _write_partitioned(state.messages_df, "messages")
         _write_partitioned(state.capsules_df, "capsules")
         _write_partitioned(state.session_rollups_df, "session_rollups")
+        _write_partitioned(state.topics_df, "topics")
         _write_partitioned(state.cache_index_df, "cache_index")
         _write_partitioned(state.sessions_df, "sessions")
         _write_partitioned(state.snapshots_df, "snapshots")
@@ -1740,6 +1785,7 @@ class DataFrameStore:
             messages_df=_read_all("messages", MESSAGES_COLUMNS),
             capsules_df=_read_all("capsules", CAPSULES_COLUMNS),
             session_rollups_df=_read_all("session_rollups", SESSION_ROLLUPS_COLUMNS),
+            topics_df=_read_all("topics", TOPICS_COLUMNS),
             cache_index_df=_read_all("cache_index", CACHE_INDEX_COLUMNS),
             sessions_df=_read_all("sessions", SESSIONS_COLUMNS),
             snapshots_df=_read_all("snapshots", SNAPSHOTS_COLUMNS),

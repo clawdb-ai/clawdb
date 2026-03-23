@@ -246,6 +246,7 @@ class ClawDBService:
             await self.df_store.refresh_capsules(tenant_id, session_id)
 
     async def _rebuild_topic_state_from_store(self) -> None:
+        await self.df_store.rebuild_all_topics(vector_dim=self.config.topic_gep_dim)
         self.topic_trie = TopicTrie()
         self.topic_model = GaussianEwensTopicModel(
             dim=self.config.topic_gep_dim,
@@ -360,11 +361,7 @@ class ClawDBService:
             upsert_result = await self.df_store.apply_message_bundle(payload)
             self._invalidate_query_state()
             await self.queue.publish(build_event(record.seq, "message_upsert", payload))
-            if upsert_result.replaced_existing:
-                await self._rebuild_topic_state_from_store()
-            else:
-                self.topic_model.observe(str(req_with_topic.topic_id or "default"), req_with_topic.content)
-                self.topic_trie.insert(str(req_with_topic.topic_id or "default"), req_with_topic.content)
+            await self._rebuild_topic_state_from_store()
             await self._refresh_impacted_sessions(req_with_topic.tenant_id, upsert_result.affected_sessions)
             ack = MessageAck(
                 wal_seq=record.seq,

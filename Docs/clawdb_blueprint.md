@@ -354,12 +354,12 @@ The following points were not fully specified yet and must be defined before imp
 
 ### Topic lifecycle
 
-- [ ] Topic merge policy
-- [ ] Topic split policy
-- [ ] Topic drift correction
-- [ ] Topic reparenting
-- [ ] Topic compaction policy
-- [ ] Topic vector refresh policy
+- [x] Topic merge policy
+- [x] Topic split policy
+- [x] Topic drift correction
+- [x] Topic reparenting
+- [x] Topic compaction policy
+- [x] Topic vector refresh policy
 
 ### Capsule lifecycle
 
