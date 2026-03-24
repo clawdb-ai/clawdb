@@ -523,8 +523,10 @@ class ClawDBService:
             }
         )
         payload_input = req_with_topic.model_dump(mode="json")
+        explicit_projection_target = str(req_with_topic.projection_target_user_key or "").strip()
         if (
             str(req_with_topic.role or "").strip().lower() == "assistant"
+            and explicit_projection_target == ""
             and str(req_with_topic.to_id or "").strip() == ""
             and str(req_with_topic.chat_type or "").strip().lower() in {"direct", "group"}
         ):
