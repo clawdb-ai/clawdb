@@ -22,6 +22,7 @@ from .embeddings import (
 from .lineage import (
     CANONICAL_PROJECTION_KINDS,
     DM_MIRROR_PUBLIC_PROJECTION_KIND,
+    MESSAGE_STATE_ACTIVE,
     MESSAGE_STATE_DELETED,
     PLATFORM_IDENTITY_COLUMNS,
     RAW_PROJECTION_KIND,
@@ -43,6 +44,7 @@ from .search_index import (
     materialize_vector_index,
     parse_vector_json,
 )
+from .storage_layout import MessageChannelFile, table_parquet_files
 from .topics import (
     DEFAULT_TOPIC_VECTOR_DIM,
     TOPICS_COLUMNS,
@@ -201,6 +203,15 @@ MESSAGE_MULTIINDEX_LEVELS = [
     "ts",
     "message_id",
 ]
+
+MESSAGE_IDENTITY_COLUMNS = [
+    "tenant_id",
+    "origin_message_id",
+    "projection_kind",
+    "projection_scope",
+]
+
+RAW_COMPAT_PROJECTION_KINDS = {RAW_PROJECTION_KIND, "raw"}
 
 CAPSULE_MULTIINDEX_LEVELS = [
     "tenant_id",
@@ -1562,9 +1573,9 @@ class DataFrameStore:
             return df
         out = df
         if row_mode == "projection":
-            out = out[out["projection_kind"].astype(str) != RAW_PROJECTION_KIND]
+            out = out[~out["projection_kind"].astype(str).isin(RAW_COMPAT_PROJECTION_KINDS)]
         elif row_mode == "raw":
-            out = out[out["projection_kind"].astype(str) == RAW_PROJECTION_KIND]
+            out = out[out["projection_kind"].astype(str).isin(RAW_COMPAT_PROJECTION_KINDS)]
         if not include_deleted:
             out = out[out["message_state"].astype(str) != MESSAGE_STATE_DELETED]
         return out
@@ -1718,9 +1729,10 @@ class DataFrameStore:
             ]
             scoped["topic_id"] = canonical_ids
             scoped["topic_path"] = [
-                canonical_path_lookup.get(
+                source_topic_path
+                or canonical_path_lookup.get(
                     (tenant_id, canonical_topic_id),
-                    source_topic_path or canonical_topic_id,
+                    canonical_topic_id,
                 )
                 for tenant_id, canonical_topic_id, source_topic_path in zip(
                     scoped["tenant_id"].astype(str).tolist(),
@@ -2631,6 +2643,202 @@ class DataFrameStore:
             return df
         return df.reset_index(drop=True).sort_values("ts", kind="stable")
 
+    def _compact_messages_for_storage(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame(columns=MESSAGES_COLUMNS)
+        compacted = df.reset_index(drop=True).copy()
+        for col in MESSAGES_COLUMNS:
+            if col not in compacted.columns:
+                compacted[col] = None
+        compacted["tenant_id"] = compacted["tenant_id"].fillna("default").astype(str)
+        compacted["origin_message_id"] = compacted["origin_message_id"].fillna(
+            compacted["message_id"]
+        ).astype(str)
+        compacted["projection_kind"] = compacted["projection_kind"].fillna("").astype(str)
+        compacted["projection_scope"] = compacted["projection_scope"].fillna("").astype(str)
+        compacted["ts"] = pd.to_datetime(compacted["ts"], utc=True, errors="coerce")
+        compacted["updated_at"] = pd.to_datetime(compacted["updated_at"], utc=True, errors="coerce")
+        compacted = compacted.sort_values(["ts", "updated_at"], kind="stable")
+        compacted = compacted.drop_duplicates(subset=MESSAGE_IDENTITY_COLUMNS, keep="last")
+        compacted = compacted.drop_duplicates(subset=MESSAGES_COLUMNS, keep="last")
+        return compacted[MESSAGES_COLUMNS].reset_index(drop=True)
+
+    def _message_channel_file(self, row: pd.Series) -> MessageChannelFile:
+        return MessageChannelFile.from_record(row)
+
+    def _messages_for_channel_file_locked(self, channel_file: MessageChannelFile) -> pd.DataFrame:
+        scoped = self._messages_for_query_locked(
+            tenant_id=channel_file.tenant_id,
+            session_id=channel_file.scope_value if channel_file.scope_kind == "session" else None,
+            channel=channel_file.channel,
+            chat_type=channel_file.chat_type,
+            group_id=channel_file.scope_value if channel_file.scope_kind == "group" else None,
+            message_thread_id=channel_file.scope_value if channel_file.scope_kind == "thread" else None,
+        )
+        if scoped.empty:
+            return scoped
+        if channel_file.scope_kind == "native":
+            return scoped[
+                scoped["native_channel_id"].fillna("").astype(str) == channel_file.scope_value
+            ]
+        return scoped
+
+    def _visible_message_rows_locked(
+        self,
+        df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        if df.empty:
+            return df
+        out = df.reset_index(drop=True).copy()
+        out["origin_message_id"] = out["origin_message_id"].fillna(out["message_id"]).astype(str)
+        out["projection_kind"] = out["projection_kind"].fillna("").astype(str)
+        out["ts"] = pd.to_datetime(out["ts"], utc=True, errors="coerce")
+        out["updated_at"] = pd.to_datetime(out["updated_at"], utc=True, errors="coerce")
+        out["_is_projection"] = ~out["projection_kind"].astype(str).isin(RAW_COMPAT_PROJECTION_KINDS)
+        out = out.sort_values(["ts", "updated_at", "_is_projection"], kind="stable")
+        out = out.drop_duplicates(subset=["origin_message_id"], keep="last")
+        return self._chronological_messages(out.drop(columns=["_is_projection"]))
+
+    def _default_projection_scope_from_payload(self, payload: Dict[str, object]) -> str:
+        native_channel_id = str(payload.get("native_channel_id") or "").strip()
+        group_id = str(payload.get("group_id") or "").strip()
+        message_thread_id = str(payload.get("message_thread_id") or "").strip()
+        session_id = str(payload.get("session_id") or "default").strip() or "default"
+        if native_channel_id:
+            return f"native:{native_channel_id}"
+        if group_id:
+            return f"group:{group_id}"
+        if message_thread_id:
+            return f"thread:{message_thread_id}"
+        return f"session:{session_id}"
+
+    def _message_view_rows_locked(
+        self,
+        *,
+        tenant_id: str,
+        session_id: Optional[str],
+        channel: Optional[str] = None,
+        chat_type: Optional[str] = None,
+        group_id: Optional[str] = None,
+        topic_id: Optional[str] = None,
+        message_thread_id: Optional[str] = None,
+        row_mode: Literal["projection", "raw", "all"] = "projection",
+        include_deleted: bool = False,
+    ) -> pd.DataFrame:
+        effective_row_mode: Literal["projection", "raw", "all"] = (
+            "all" if row_mode == "projection" else row_mode
+        )
+        scoped = self._messages_for_query_locked(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            channel=channel,
+            chat_type=chat_type,
+            group_id=group_id,
+            topic_id=topic_id,
+            message_thread_id=message_thread_id,
+            row_mode=effective_row_mode,
+            include_deleted=include_deleted,
+        )
+        if session_id is not None:
+            if self._messages_index_dirty or self._messages_indexed_df is None:
+                indexed = self._build_messages_index_locked()
+            else:
+                indexed = self._messages_indexed_df
+            native = indexed[indexed["tenant_id"].astype(str) == str(tenant_id)]
+            native = native[native["native_session_id"].fillna("").astype(str) == str(session_id)]
+            if channel is not None:
+                native = native[native["channel"].astype(str) == str(channel)]
+            if chat_type is not None:
+                native = native[native["chat_type"].astype(str) == str(chat_type)]
+            if group_id is not None:
+                native = native[_group_identity_mask(native, group_id)]
+            if topic_id is not None:
+                canonical_ids = self._canonical_topic_ids_locked(tenant_id, [str(topic_id)])
+                if canonical_ids:
+                    native = native[native["topic_id"].astype(str).isin(canonical_ids)]
+                else:
+                    native = native[native["topic_id"].astype(str) == str(topic_id)]
+            if message_thread_id is not None:
+                native = native[native["message_thread_id"].astype(str) == str(message_thread_id)]
+            if not include_deleted:
+                native = native[native["message_state"].astype(str) != MESSAGE_STATE_DELETED]
+            if not native.empty:
+                scoped = pd.concat(
+                    [scoped.reset_index(drop=True), native.reset_index(drop=True)],
+                    ignore_index=True,
+                )
+                scoped = scoped.drop_duplicates(subset=["message_id"], keep="last")
+        if scoped.empty:
+            return scoped
+        if row_mode == "projection":
+            return self._visible_message_rows_locked(scoped)
+        return self._chronological_messages(
+            self._filter_message_rows(scoped, row_mode=row_mode, include_deleted=include_deleted)
+        )
+
+    def _message_block_lines(self, row: pd.Series) -> List[str]:
+        role = str(row["role"])
+        ts_text = pd.to_datetime(row["ts"], utc=True).isoformat()
+        lines = [
+            f"## {ts_text} [{role}]",
+            f"- message_id: {str(row['message_id'])}",
+            f"- origin_message_id: {str(row.get('origin_message_id') or row['message_id'])}",
+            f"- session_id: {str(row['session_id'])}",
+        ]
+        projection_kind = str(row.get("projection_kind") or "raw")
+        projection_scope = str(row.get("projection_scope") or "")
+        if projection_kind != "raw" or projection_scope:
+            lines.append(
+                f"- projection: {projection_kind} | scope: {projection_scope or '(blank)'}"
+            )
+        channel = str(row.get("channel") or "")
+        chat_type = str(row.get("chat_type") or "")
+        if channel or chat_type:
+            lines.append(f"- channel: {channel or '(blank)'}")
+            lines.append(f"- chat_type: {chat_type or '(blank)'}")
+        topic_id = str(row.get("topic_id") or "")
+        if topic_id and topic_id != "default":
+            lines.append(f"- topic_id: {topic_id}")
+        sender_id = str(row.get("sender_id") or "")
+        if sender_id:
+            lines.append(f"- sender_id: {sender_id}")
+        if str(row.get("message_state") or "") == MESSAGE_STATE_DELETED:
+            lines.append("- tombstone: deleted")
+        lines.append("")
+        lines.extend(str(row.get("content") or "").splitlines() or [""])
+        lines.append("")
+        return lines
+
+    def _message_layout_entries(self, df: pd.DataFrame) -> List[Dict[str, object]]:
+        offsets: Dict[str, int] = {}
+        entries: List[Dict[str, object]] = []
+        for _, row in self._chronological_messages(df).iterrows():
+            path = self._message_channel_file(row).virtual_path
+            block_lines = self._message_block_lines(row)
+            start_line = offsets.get(path, 0) + 1
+            end_line = start_line + len(block_lines) - 1
+            offsets[path] = end_line
+            entries.append(
+                {
+                    "row": row,
+                    "path": path,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                }
+            )
+        return entries
+
+    def _legacy_session_virtual_path(self, rel_path: str) -> Optional[Tuple[str, str]]:
+        normalized = rel_path.replace("\\", "/").lstrip("/")
+        if not normalized.startswith("memory/") or not normalized.endswith(".md"):
+            return None
+        parts = normalized.split("/")
+        if len(parts) == 2:
+            return ("default", parts[-1].replace(".md", ""))
+        if len(parts) == 3:
+            return (parts[1], parts[2].replace(".md", ""))
+        return None
+
     @property
     def state(self) -> DataFramesState:
         return self._state
@@ -2734,7 +2942,110 @@ class DataFrameStore:
         self._invalidate_sessions_index_locked()
 
     async def add_message(self, payload: Dict[str, object]) -> None:
-        await self.apply_message_bundle(materialize_message_bundle(payload))
+        tenant_id = str(payload.get("tenant_id") or "default")
+        session_id = str(payload.get("session_id") or "default")
+        await self.ensure_session(tenant_id=tenant_id, session_id=session_id)
+        async with self._lock:
+            ts = pd.to_datetime(payload.get("ts"), utc=True, errors="coerce")
+            if pd.isna(ts):
+                ts = pd.Timestamp.now(tz="UTC")
+            is_deleted = bool(payload.get("is_deleted") or payload.get("deleted_at"))
+            message_id = str(payload.get("message_id") or "")
+            origin_message_id = str(payload.get("origin_message_id") or message_id)
+            projection_kind = str(payload.get("projection_kind") or "raw")
+            projection_scope = str(payload.get("projection_scope") or "").strip()
+            if not projection_scope:
+                projection_scope = self._default_projection_scope_from_payload(payload)
+            raw_topic_confidence = payload.get("topic_confidence")
+            row = {
+                "message_id": message_id,
+                "origin_message_id": origin_message_id,
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "role": str(payload.get("role") or "user"),
+                "content": str(payload.get("content") or ""),
+                "ts": ts,
+                "channel": str(payload.get("channel") or ""),
+                "chat_type": str(payload.get("chat_type") or ""),
+                "account_id": str(payload.get("account_id") or ""),
+                "account_key": str(payload.get("account_key") or ""),
+                "from_id": str(payload.get("from_id") or ""),
+                "from_user_key": str(payload.get("from_user_key") or ""),
+                "to_id": str(payload.get("to_id") or ""),
+                "to_user_key": str(payload.get("to_user_key") or ""),
+                "projection_target_user_key": str(payload.get("projection_target_user_key") or ""),
+                "sender_id": str(payload.get("sender_id") or ""),
+                "sender_user_key": str(payload.get("sender_user_key") or ""),
+                "sender_name": str(payload.get("sender_name") or ""),
+                "sender_username": str(payload.get("sender_username") or ""),
+                "sender_e164": str(payload.get("sender_e164") or ""),
+                "group_id": str(payload.get("group_id") or ""),
+                "group_chat_key": str(payload.get("group_chat_key") or ""),
+                "group_subject": str(payload.get("group_subject") or ""),
+                "group_channel": str(payload.get("group_channel") or ""),
+                "group_space": str(payload.get("group_space") or ""),
+                "native_channel_id": str(payload.get("native_channel_id") or ""),
+                "message_thread_id": str(payload.get("message_thread_id") or ""),
+                "thread_parent_id": str(payload.get("thread_parent_id") or ""),
+                "reply_to_id": str(payload.get("reply_to_id") or ""),
+                "topic_id": str(payload.get("topic_id") or "default"),
+                "source_topic_id": str(payload.get("source_topic_id") or payload.get("topic_id") or "default"),
+                "topic_parent_id": str(payload.get("topic_parent_id") or ""),
+                "topic_path": str(payload.get("topic_path") or payload.get("topic_id") or "default"),
+                "source_topic_path": str(
+                    payload.get("source_topic_path")
+                    or payload.get("topic_path")
+                    or payload.get("topic_id")
+                    or "default"
+                ),
+                "topic_confidence": float(raw_topic_confidence) if raw_topic_confidence is not None else 1.0,
+                "topic_source": str(payload.get("topic_source") or "explicit"),
+                "embedding_ref": str(payload.get("embedding_ref") or ""),
+                "capsule_level": str(payload.get("capsule_level") or "L0"),
+                "idempotency_key": str(payload.get("idempotency_key") or ""),
+                "projection_kind": projection_kind,
+                "projection_scope": projection_scope,
+                "visibility": str(payload.get("visibility") or ("raw" if projection_kind in RAW_COMPAT_PROJECTION_KINDS else "")),
+                "platform": str(payload.get("platform") or ""),
+                "platform_message_id": str(payload.get("platform_message_id") or ""),
+                "native_session_id": str(payload.get("native_session_id") or ""),
+                "message_state": MESSAGE_STATE_DELETED if is_deleted else str(payload.get("message_state") or MESSAGE_STATE_ACTIVE),
+                "updated_at": pd.to_datetime(payload.get("updated_at"), utc=True, errors="coerce")
+                if payload.get("updated_at") is not None
+                else ts,
+                "deleted_at": pd.to_datetime(payload.get("deleted_at"), utc=True, errors="coerce")
+                if payload.get("deleted_at") is not None
+                else ts if is_deleted else pd.NaT,
+            }
+            row_df = pd.DataFrame([{**row, "is_deleted": is_deleted}], columns=[*MESSAGES_COLUMNS, "is_deleted"])
+            base_messages = self._state.messages_df.reset_index(drop=True).copy()
+            if "is_deleted" not in base_messages.columns:
+                base_messages["is_deleted"] = (
+                    base_messages.get("message_state", pd.Series([""] * len(base_messages)))
+                    .astype(str)
+                    .eq(MESSAGE_STATE_DELETED)
+                )
+            if not base_messages.empty:
+                existing_mask = (
+                    (base_messages["tenant_id"].fillna("default").astype(str) == tenant_id)
+                    & (
+                        base_messages["origin_message_id"]
+                        .fillna(base_messages["message_id"])
+                        .astype(str)
+                        == origin_message_id
+                    )
+                    & (base_messages["projection_kind"].fillna("raw").astype(str) == projection_kind)
+                    & (base_messages["projection_scope"].fillna("").astype(str) == projection_scope)
+                )
+                if existing_mask.any():
+                    base_messages = base_messages.loc[~existing_mask].reset_index(drop=True)
+            merged = (
+                row_df
+                if base_messages.empty
+                else pd.concat([base_messages, row_df], ignore_index=True)
+            )
+            self._state.messages_df = merged
+            self._invalidate_messages_index_locked()
 
     async def apply_message_bundle(
         self,
@@ -3832,10 +4143,12 @@ class DataFrameStore:
         group_id: Optional[str] = None,
         topic_id: Optional[str] = None,
         message_thread_id: Optional[str] = None,
+        projection_kind: Optional[str] = None,
+        projection_scope: Optional[str] = None,
         row_mode: Literal["projection", "raw", "all"] = "projection",
     ) -> List[Dict[str, object]]:
         async with self._lock:
-            df = self._messages_for_query_locked(
+            df = self._message_view_rows_locked(
                 tenant_id=tenant_id,
                 session_id=session_id,
                 channel=channel,
@@ -3845,17 +4158,18 @@ class DataFrameStore:
                 message_thread_id=message_thread_id,
                 row_mode=row_mode,
             )
+            if projection_kind is not None:
+                df = df[df["projection_kind"].fillna("").astype(str) == str(projection_kind)]
+            if projection_scope is not None:
+                df = df[df["projection_scope"].fillna("").astype(str) == str(projection_scope)]
             if df.empty:
                 return []
-            grouped: Dict[str, int] = {}
             docs: List[Dict[str, object]] = []
-            for _, row in self._chronological_messages(df).iterrows():
+            for entry in self._message_layout_entries(df):
+                row = entry["row"]
                 tid = str(row["tenant_id"])
                 sid = str(row["session_id"])
-                key = f"{tid}:{sid}"
-                grouped[key] = grouped.get(key, 0) + 1
-                line_no = grouped[key]
-                path = f"memory/{sid}.md" if tid == "default" else f"memory/{tid}/{sid}.md"
+                path = str(entry["path"])
                 doc_id = (
                     str(row.get("origin_message_id") or row["message_id"])
                     if row_mode == "raw"
@@ -3881,7 +4195,7 @@ class DataFrameStore:
                         "projection_scope": str(row.get("projection_scope") or ""),
                         "content": str(row["content"]),
                         "path": path,
-                        "line_no": line_no,
+                        "line_no": int(entry["start_line"]),
                     }
                 )
             return docs
@@ -4637,36 +4951,41 @@ class DataFrameStore:
 
     async def virtual_memory_file(self, rel_path: str) -> Tuple[str, str]:
         normalized = rel_path.replace("\\", "/").lstrip("/")
-        if not normalized.startswith("memory/") or not normalized.endswith(".md"):
-            raise FileNotFoundError(f"unsupported memory path: {rel_path}")
-        parts = normalized.split("/")
-        tenant_id = "default"
-        if len(parts) == 2:
-            session_id = parts[-1].replace(".md", "")
-        elif len(parts) == 3:
-            tenant_id = parts[1]
-            session_id = parts[2].replace(".md", "")
-        else:
-            raise FileNotFoundError(f"unsupported memory path: {rel_path}")
+        channel_file = MessageChannelFile.from_virtual_path(normalized)
         async with self._lock:
-            df = self._chronological_messages(
-                self._messages_for_query_locked(tenant_id=tenant_id, session_id=session_id)
-            )
+            if channel_file is not None:
+                if channel_file.scope_kind == "session":
+                    df = self._message_view_rows_locked(
+                        tenant_id=channel_file.tenant_id,
+                        session_id=channel_file.scope_value,
+                        channel=channel_file.channel,
+                        chat_type=channel_file.chat_type,
+                        row_mode="projection",
+                        include_deleted=False,
+                    )
+                else:
+                    df = self._visible_message_rows_locked(
+                        self._messages_for_channel_file_locked(channel_file)
+                    )
+                canonical = channel_file.virtual_path
+            else:
+                legacy = self._legacy_session_virtual_path(normalized)
+                if legacy is None:
+                    raise FileNotFoundError(f"unsupported memory path: {rel_path}")
+                tenant_id, session_id = legacy
+                df = self._message_view_rows_locked(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    row_mode="projection",
+                    include_deleted=False,
+                )
+                canonical = normalized
             if df.empty:
-                raise FileNotFoundError(f"no session memory found for tenant={tenant_id} session={session_id}")
-            lines = []
+                raise FileNotFoundError(f"no memory found for path={rel_path}")
+            lines: List[str] = []
             for _, row in df.iterrows():
-                role = str(row["role"])
-                content = str(row["content"])
-                lines.append(f"- [{role}] {content}")
-            resolved_ids = self._resolve_session_ids_locked(tenant_id, session_id)
-            canonical_session_id = resolved_ids[0] if resolved_ids else session_id
-        canonical = (
-            f"memory/{canonical_session_id}.md"
-            if tenant_id == "default"
-            else f"memory/{tenant_id}/{canonical_session_id}.md"
-        )
-        return "\n".join(lines), canonical
+                lines.extend(self._message_block_lines(row))
+        return "\n".join(lines).rstrip() + "\n", canonical
 
     async def save_parquet(self, parquet_dir: Path) -> None:
         async with self._lock:
@@ -4701,7 +5020,19 @@ class DataFrameStore:
                 target.mkdir(parents=True, exist_ok=True)
                 part.drop(columns=["dt"]).to_parquet(target / f"part-{timestamp}.parquet", index=False)
 
-        _write_partitioned(state.messages_df, "messages")
+        messages_dir = tmp_parquet / "messages"
+        messages_dir.mkdir(parents=True, exist_ok=True)
+        messages_df = self._compact_messages_for_storage(state.messages_df)
+        if not messages_df.empty:
+            write_df = messages_df.sort_values("ts", kind="stable").copy()
+            write_df["_channel_file_path"] = [
+                str(self._message_channel_file(row).storage_relative_path)
+                for _, row in write_df.iterrows()
+            ]
+            for rel_path, part in write_df.groupby("_channel_file_path", sort=True):
+                target = messages_dir / rel_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                part.drop(columns=["_channel_file_path"]).to_parquet(target, index=False)
         _write_partitioned(state.capsules_df, "capsules")
         _write_partitioned(state.beliefs_df, "beliefs")
         _write_partitioned(state.projections_df, "projections")
@@ -4728,7 +5059,7 @@ class DataFrameStore:
             base = parquet_dir / name
             if not base.exists():
                 return pd.DataFrame(columns=columns)
-            files = sorted(base.glob("dt=*/part-*.parquet"))
+            files = table_parquet_files(base)
             if not files:
                 return pd.DataFrame(columns=columns)
             parts = []
@@ -4763,5 +5094,8 @@ class DataFrameStore:
             sessions_df=_read_all("sessions", SESSIONS_COLUMNS),
             snapshots_df=_read_all("snapshots", SNAPSHOTS_COLUMNS),
             semantic_jobs_df=_read_all("semantic_jobs", SEMANTIC_JOBS_COLUMNS),
+        )
+        self._state.messages_df["is_deleted"] = (
+            self._state.messages_df["message_state"].fillna("").astype(str) == MESSAGE_STATE_DELETED
         )
         self._invalidate_all_indexes_locked()

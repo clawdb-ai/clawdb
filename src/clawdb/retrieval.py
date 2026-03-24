@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
-from dataclasses import dataclass
-from typing import Dict, List, Literal, Mapping, Sequence, Tuple
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -22,6 +24,7 @@ RETRIEVAL_MODE_WEIGHTS: Dict[str, Tuple[float, float]] = {
 class RetrievalDoc:
     doc_id: str
     text: str
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -192,37 +195,139 @@ class HNSWIndex:
 
 
 class HybridRetrievalEngine:
-    def __init__(self, dim: int = 64) -> None:
+    def __init__(self, dim: int = 64, index_dir: Optional[Path] = None) -> None:
+        self.dim = dim
         self.bm25 = BM25Index()
         self.hnsw = HNSWIndex(dim=dim)
+        self.index_dir = index_dir.resolve() if index_dir is not None else None
+        self._docs: List[RetrievalDoc] = []
+        self._doc_signature: Optional[str] = None
+
+    def _docs_signature(self, docs: Sequence[RetrievalDoc]) -> str:
+        payload = [
+            {
+                "doc_id": str(doc.doc_id),
+                "text": str(doc.text or ""),
+                "metadata": {str(k): doc.metadata.get(k) for k in sorted(doc.metadata)},
+            }
+            for doc in docs
+        ]
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+
+    def _manifest_path(self) -> Optional[Path]:
+        if self.index_dir is None:
+            return None
+        return self.index_dir / "hybrid_retrieval_docs.json"
+
+    def refresh(self, docs: Sequence[RetrievalDoc]) -> bool:
+        docs_list = list(docs)
+        signature = self._docs_signature(docs_list)
+        if signature == self._doc_signature and len(docs_list) == len(self._docs):
+            return False
+        self._docs = docs_list
+        self._doc_signature = signature
+        manifest = self._manifest_path()
+        if manifest is not None:
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.write_text(
+                json.dumps(
+                    [
+                        {
+                            "doc_id": doc.doc_id,
+                            "text": doc.text,
+                            "metadata": dict(doc.metadata),
+                        }
+                        for doc in docs_list
+                    ],
+                    indent=2,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                ),
+                encoding="utf-8",
+            )
+        return True
+
+    def load(self) -> bool:
+        manifest = self._manifest_path()
+        if manifest is None or not manifest.exists():
+            return False
+        raw = json.loads(manifest.read_text(encoding="utf-8"))
+        docs = [
+            RetrievalDoc(
+                doc_id=str(item.get("doc_id") or ""),
+                text=str(item.get("text") or ""),
+                metadata=dict(item.get("metadata") or {}),
+            )
+            for item in raw
+        ]
+        self._docs = docs
+        self._doc_signature = self._docs_signature(docs)
+        return True
+
+    def _filter_docs(
+        self,
+        docs: Sequence[RetrievalDoc],
+        filters: Optional[Mapping[str, object]],
+    ) -> List[RetrievalDoc]:
+        if not filters:
+            return list(docs)
+        filtered: List[RetrievalDoc] = []
+        for doc in docs:
+            matched = True
+            for key, value in filters.items():
+                if value is None:
+                    continue
+                if key == "tenant_id" and str(value) == "*":
+                    continue
+                if str(doc.metadata.get(key) or "") != str(value):
+                    matched = False
+                    break
+            if matched:
+                filtered.append(doc)
+        return filtered
 
     def search(
         self,
         query: str,
-        docs: Sequence[RetrievalDoc],
-        top_k: int,
+        docs: Sequence[RetrievalDoc] | None = None,
+        top_k: int = 10,
         retrieval_mode: RetrievalMode = "hybrid",
         lexical_postings: Sequence[LexicalPosting] | None = None,
         vector_entries: Sequence[VectorEntry] | None = None,
+        filters: Optional[Mapping[str, object]] = None,
     ) -> List[RetrievalScore]:
-        if not docs:
+        source_docs = list(docs) if docs is not None else list(self._docs)
+        filtered_docs = self._filter_docs(source_docs, filters)
+        if not filtered_docs:
             return []
-        if lexical_postings is None:
-            self.bm25.build(docs)
+        allowed_doc_ids = {doc.doc_id for doc in filtered_docs}
+        filtered_postings = (
+            [posting for posting in lexical_postings if str(posting.doc_id) in allowed_doc_ids]
+            if lexical_postings is not None
+            else None
+        )
+        filtered_vectors = (
+            [entry for entry in vector_entries if str(entry.doc_id) in allowed_doc_ids]
+            if vector_entries is not None
+            else None
+        )
+        if filtered_postings is None:
+            self.bm25.build(filtered_docs)
         else:
-            self.bm25.build_from_postings(docs, lexical_postings)
-        if vector_entries is None:
-            self.hnsw.build(docs)
+            self.bm25.build_from_postings(filtered_docs, filtered_postings)
+        if filtered_vectors is None:
+            self.hnsw.build(filtered_docs)
         else:
-            self.hnsw.build_from_vectors(docs, vector_entries)
+            self.hnsw.build_from_vectors(filtered_docs, filtered_vectors)
         lexical_weight, vector_weight = resolve_retrieval_weights(retrieval_mode)
-        bm25_res = self.bm25.search(query, top_k=len(docs))
-        vector_res = self.hnsw.search(query, top_k=len(docs))
+        bm25_res = self.bm25.search(query, top_k=len(filtered_docs))
+        vector_res = self.hnsw.search(query, top_k=len(filtered_docs))
         bm25_map = dict(bm25_res)
         vector_map = dict(vector_res)
         max_bm25 = max((score for _, score in bm25_res), default=0.0)
         ranked: List[RetrievalScore] = []
-        for doc in docs:
+        for doc in filtered_docs:
             lexical_raw = float(bm25_map.get(doc.doc_id, 0.0))
             lexical_score = (lexical_raw / max_bm25) if max_bm25 > 0.0 else 0.0
             vector_score = float(vector_map.get(doc.doc_id, 0.0))

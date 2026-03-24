@@ -33,6 +33,12 @@ from .lineage import (
 from .metadata import DataFrameMetadataStore
 from .projections import PROJECTIONS_COLUMNS
 from .search_index import LEXICAL_INDEX_COLUMNS, SEARCH_DOC_COLUMNS, VECTOR_INDEX_COLUMNS
+from .storage_layout import (
+    MessageChannelFile,
+    table_has_legacy_partitions,
+    table_has_zero_byte_parquet,
+    table_parquet_files,
+)
 from .topics import TOPICS_COLUMNS
 
 
@@ -108,15 +114,7 @@ def _fill_string(series: pd.Series, default: str = "") -> pd.Series:
 
 
 def _table_files(table_dir: Path) -> List[Path]:
-    if not table_dir.exists():
-        return []
-    partitioned = sorted(table_dir.glob("dt=*/part-*.parquet"))
-    flat = sorted(table_dir.glob("*.parquet"))
-    files = partitioned + flat
-    uniq: Dict[str, Path] = {}
-    for file_path in files:
-        uniq[str(file_path.resolve())] = file_path
-    return list(uniq.values())
+    return table_parquet_files(table_dir)
 
 
 def _read_table(parquet_dir: Path, table: str) -> Tuple[pd.DataFrame, List[Path]]:
@@ -270,7 +268,12 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
         for column in PLATFORM_IDENTITY_COLUMNS:
             out[column] = _fill_string(identity_frame.get(column, pd.Series([""] * len(out))))
 
-    legacy_rows = "projection_kind" not in frame.columns or "origin_message_id" not in frame.columns
+    projection_kinds = out["projection_kind"].fillna("").astype(str)
+    legacy_rows = (
+        "projection_kind" not in frame.columns
+        or "origin_message_id" not in frame.columns
+        or projection_kinds.eq("").all()
+    )
     if legacy_rows:
         expanded: List[Dict[str, object]] = []
         for row in out.to_dict("records"):
@@ -878,6 +881,19 @@ def _write_table(frame: pd.DataFrame, table: str, parquet_dir: Path, timestamp: 
     if base.exists():
         shutil.rmtree(base)
     base.mkdir(parents=True, exist_ok=True)
+    if table == "messages":
+        if frame.empty:
+            return
+        write_df = frame.copy().sort_values("ts", kind="stable")
+        write_df["_channel_file_path"] = [
+            str(MessageChannelFile.from_record(row).storage_relative_path)
+            for _, row in write_df.iterrows()
+        ]
+        for rel_path, part in write_df.groupby("_channel_file_path", sort=True):
+            target = base / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            part.drop(columns=["_channel_file_path"]).to_parquet(target, index=False)
+        return
     if frame.empty:
         target = base / "dt=empty"
         target.mkdir(parents=True, exist_ok=True)
@@ -920,24 +936,36 @@ def _build_plan_sync(
 ) -> SchemaMigrationPlan:
     tables: List[TableMigrationPlan] = []
     frames: Dict[str, pd.DataFrame] = {}
+    legacy_layout_detected = False
+    zero_byte_detected = False
     for table, columns in TABLE_COLUMNS.items():
+        table_dir = parquet_dir / table
         frame, files = _read_table(parquet_dir, table)
         frames[table] = frame
         existing_cols = set(frame.columns)
         missing = [col for col in columns if col not in existing_cols]
+        has_legacy_layout = table_has_legacy_partitions(table_dir)
+        has_zero_byte = table_has_zero_byte_parquet(table_dir)
+        legacy_layout_detected = legacy_layout_detected or has_legacy_layout
+        zero_byte_detected = zero_byte_detected or has_zero_byte
+        raw_file_count = (
+            sum(1 for path in table_dir.rglob("*.parquet") if path.is_file()) if table_dir.exists() else 0
+        )
         tables.append(
             TableMigrationPlan(
                 table=table,
-                file_count=len(files),
+                file_count=raw_file_count,
                 row_count=int(frame.shape[0]),
                 missing_columns=missing,
-                needs_rewrite=bool(missing),
+                needs_rewrite=bool(missing or has_legacy_layout or has_zero_byte),
             )
         )
     source_from_metadata = _read_schema_version_sync(metadata_parquet_path)
     source_version = (
         source_from_metadata
         if source_from_metadata is not None
+        else 3
+        if legacy_layout_detected or zero_byte_detected
         else _infer_schema_version(frames.get("messages", pd.DataFrame()))
     )
     has_table_rewrite = any(item.needs_rewrite for item in tables)
@@ -945,7 +973,7 @@ def _build_plan_sync(
     needs_migration = has_table_rewrite or needs_metadata_update
     reason = "already up to date"
     if has_table_rewrite:
-        reason = "missing columns detected in one or more parquet tables"
+        reason = "legacy parquet layout or missing columns detected"
     elif needs_metadata_update:
         reason = "schema metadata version differs from target"
     return SchemaMigrationPlan(

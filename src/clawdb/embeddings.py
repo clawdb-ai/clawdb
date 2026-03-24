@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import os
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
 
 import httpx
@@ -9,6 +13,7 @@ import httpx
 
 DETERMINISTIC_EMBEDDING_PROVIDER = "deterministic"
 DETERMINISTIC_EMBEDDING_MODEL = "hashed-token-v1"
+API_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]+\b")
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,142 @@ def embedding_backend_signature(ctx: EmbeddingAuthContext) -> str:
     base_url = str(ctx.base_url or "").strip().rstrip("/")
     auth_source = str(ctx.auth_source or "").strip()
     return f"{provider}:{model}:{base_url}:{auth_source}"
+
+
+def _candidate_embedding_key_files() -> List[Path]:
+    explicit = os.getenv("CLAWDB_EMBEDDING_KEY_FILE", "").strip()
+    candidates: List[Path] = []
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    candidates.extend(
+        [
+            Path("~/kimi_keys.csv").expanduser(),
+            Path("~/kimi_keys.txt").expanduser(),
+        ]
+    )
+    deduped: List[Path] = []
+    seen = set()
+    for candidate in candidates:
+        normalized = candidate.resolve(strict=False)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(candidate)
+    return deduped
+
+
+def _extract_first_api_key(text: str) -> Optional[str]:
+    match = API_KEY_PATTERN.search(text or "")
+    return match.group(0) if match else None
+
+
+def _read_api_key_from_csv(path: Path) -> Optional[str]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        direct = _extract_first_api_key(sample)
+        if direct:
+            return direct
+        try:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                if not row:
+                    continue
+                for value in row.values():
+                    if value is None:
+                        continue
+                    extracted = _extract_first_api_key(str(value))
+                    if extracted:
+                        return extracted
+        except csv.Error:
+            handle.seek(0)
+        handle.seek(0)
+        reader2 = csv.reader(handle)
+        for row in reader2:
+            for value in row:
+                extracted = _extract_first_api_key(str(value))
+                if extracted:
+                    return extracted
+    return None
+
+
+def _read_api_key_from_file(path: Path) -> Optional[str]:
+    try:
+        if path.suffix.lower() == ".csv":
+            return _read_api_key_from_csv(path)
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                extracted = _extract_first_api_key(line)
+                if extracted:
+                    return extracted
+    except OSError:
+        return None
+    return None
+
+
+def _infer_provider(api_key: str, source_path: Optional[Path]) -> str:
+    lowered_key = api_key.strip().lower()
+    path_text = str(source_path or "").lower()
+    if lowered_key.startswith("sk-kimi-") or "kimi" in path_text:
+        return "kimi-coding"
+    return "openai"
+
+
+def resolve_fallback_embedding_context() -> Optional[EmbeddingAuthContext]:
+    provider = os.getenv("CLAWDB_EMBEDDING_PROVIDER", "").strip().lower()
+    api_key = os.getenv("CLAWDB_EMBEDDING_API_KEY", "").strip()
+    model = os.getenv("CLAWDB_EMBEDDING_MODEL", "").strip() or None
+    base_url = os.getenv("CLAWDB_EMBEDDING_BASE_URL", "").strip() or None
+    auth_source: Optional[str] = None
+    source_path: Optional[Path] = None
+
+    if api_key:
+        auth_source = "env:CLAWDB_EMBEDDING_API_KEY"
+    else:
+        for candidate in _candidate_embedding_key_files():
+            if not candidate.exists():
+                continue
+            resolved = _read_api_key_from_file(candidate)
+            if resolved:
+                api_key = resolved
+                source_path = candidate
+                auth_source = f"file:{candidate.expanduser()}"
+                break
+
+    if not api_key:
+        return None
+
+    if not provider:
+        provider = _infer_provider(api_key, source_path)
+
+    if provider in {"kimi-coding", "kimi", "moonshot"}:
+        if not model:
+            model = "k2p5"
+        if not base_url:
+            base_url = "https://api.kimi.com/coding"
+    elif provider == "openai":
+        if not model:
+            model = "text-embedding-3-small"
+        if not base_url:
+            base_url = "https://api.openai.com/v1"
+    elif provider == "voyage":
+        if not model:
+            model = "voyage-3.5-lite"
+        if not base_url:
+            base_url = "https://api.voyageai.com/v1"
+    elif provider == "mistral":
+        if not model:
+            model = "mistral-embed"
+        if not base_url:
+            base_url = "https://api.mistral.ai/v1"
+
+    return EmbeddingAuthContext(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        auth_source=auth_source,
+    )
 
 
 class EmbeddingRouter:

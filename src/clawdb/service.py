@@ -92,6 +92,7 @@ class ClawDBService:
             sigma2=self.config.topic_gep_sigma2,
             prior_sigma2=self.config.topic_gep_prior_sigma2,
         )
+        self._topic_models_by_scope: Dict[str, GaussianEwensTopicModel] = {}
         self.topic_trie = TopicTrie()
         self.folder_judger = FolderJudger()
         self.retrieval_engine = HybridRetrievalEngine(dim=self.config.topic_gep_dim)
@@ -393,6 +394,86 @@ class ClawDBService:
         self._search_cache.clear()
         self._embedding_cache.clear()
 
+    def _topic_scope_key(
+        self,
+        *,
+        chat_type: Optional[str],
+        group_id: Optional[str],
+        to_id: Optional[str],
+        projection_target_user_key: Optional[str],
+        session_id: Optional[str],
+        message_thread_id: Optional[str],
+    ) -> str:
+        group_text = str(group_id or "").strip()
+        if group_text:
+            return f"group:{group_text}"
+        thread_text = str(message_thread_id or "").strip()
+        if thread_text:
+            return f"thread:{thread_text}"
+        if str(chat_type or "").strip().lower() == "direct":
+            user_text = (
+                str(projection_target_user_key or "").strip()
+                or str(to_id or "").strip()
+                or str(session_id or "").strip()
+                or "default"
+            )
+            return f"dm:{user_text}"
+        session_text = str(session_id or "").strip() or "default"
+        return f"session:{session_text}"
+
+    def _topic_model_input(self, *, content: str, scope_key: str) -> str:
+        text = str(content or "").strip()
+        return f"{scope_key}\n{text}" if text else scope_key
+
+    def _topic_path_for_scope(
+        self,
+        *,
+        tenant_id: str,
+        channel: Optional[str],
+        scope_key: str,
+        topic_id: str,
+    ) -> str:
+        return f"{str(tenant_id or 'default')}/{str(channel or '_')}/{scope_key}/{topic_id}"
+
+    def _topic_scope_key_from_topic_path(
+        self,
+        topic_path: Optional[str],
+        *,
+        chat_type: Optional[str],
+        group_id: Optional[str],
+        session_id: Optional[str],
+        message_thread_id: Optional[str],
+    ) -> str:
+        parts = [part for part in str(topic_path or "").strip("/").split("/") if part]
+        if len(parts) >= 3:
+            return parts[2]
+        return self._topic_scope_key(
+            chat_type=chat_type,
+            group_id=group_id,
+            to_id=None,
+            projection_target_user_key=None,
+            session_id=session_id,
+            message_thread_id=message_thread_id,
+        )
+
+    def _topic_model_for_scope(self, scope_key: str) -> GaussianEwensTopicModel:
+        model = self._topic_models_by_scope.get(scope_key)
+        if model is None:
+            model = GaussianEwensTopicModel(
+                dim=self.config.topic_gep_dim,
+                concentration=self.config.topic_gep_concentration,
+                sigma2=self.config.topic_gep_sigma2,
+                prior_sigma2=self.config.topic_gep_prior_sigma2,
+            )
+            self._topic_models_by_scope[scope_key] = model
+        return model
+
+    def _scoped_topic_id(self, scope_key: str, topic_id: str) -> str:
+        topic_text = str(topic_id or "").strip() or "default"
+        if topic_text.startswith(f"{scope_key}::"):
+            return topic_text
+        return f"{scope_key}::{topic_text}"
+
     async def _refresh_impacted_sessions(self, tenant_id: str, session_ids: Sequence[str]) -> None:
         for session_id in sorted({str(item) for item in session_ids if str(item)}):
             await self.df_store.refresh_session_rollups(
@@ -432,14 +513,25 @@ class ClawDBService:
             sigma2=self.config.topic_gep_sigma2,
             prior_sigma2=self.config.topic_gep_prior_sigma2,
         )
+        self._topic_models_by_scope = {}
         docs = await self.df_store.message_documents(tenant_id="*", session_id=None, row_mode="raw")
         for item in docs:
             topic_id = str(item.get("topic_id") or "default")
             content = str(item.get("content") or "")
             if not content:
                 continue
+            scope_key = self._topic_scope_key_from_topic_path(
+                str(item.get("topic_path") or ""),
+                chat_type=item.get("chat_type"),
+                group_id=item.get("group_id"),
+                session_id=item.get("session_id"),
+                message_thread_id=item.get("message_thread_id"),
+            )
             self.topic_trie.insert(topic_id, content)
-            self.topic_model.observe_replay(topic_id, content)
+            self._topic_model_for_scope(scope_key).observe_replay(
+                topic_id,
+                content,
+            )
 
     async def _resolve_origin_or_raise(
         self,
@@ -498,15 +590,30 @@ class ClawDBService:
         normalized_channel = (req.channel or "").strip().lower() or None
         normalized_chat_type = (req.chat_type or "").strip().lower() or None
         normalized_platform = normalize_platform(req.platform, normalized_channel)
+        topic_scope_key = self._topic_scope_key(
+            chat_type=normalized_chat_type,
+            group_id=req.group_id,
+            to_id=req.to_user_key or req.to_id,
+            projection_target_user_key=req.projection_target_user_key,
+            session_id=req.session_id,
+            message_thread_id=req.message_thread_id,
+        )
         resolved_topic_id = req.topic_id
         auto_topic_assigned = False
         if self.config.topic_auto_classify_enabled and not resolved_topic_id:
-            resolved_topic_id = self.topic_model.propose_topic(req.content)
+            scoped_model = self._topic_model_for_scope(topic_scope_key)
+            resolved_topic_id = self._scoped_topic_id(
+                topic_scope_key,
+                scoped_model.propose_topic(req.content),
+            )
             auto_topic_assigned = bool(resolved_topic_id)
         topic_id = resolved_topic_id or req.topic_id or "default"
         topic_source = req.topic_source or ("gauss_ewens" if auto_topic_assigned else "explicit")
-        topic_path = req.topic_path or (
-            f"{req.topic_parent_id}/{topic_id}" if req.topic_parent_id else topic_id
+        topic_path = req.topic_path or self._topic_path_for_scope(
+            tenant_id=req.tenant_id,
+            channel=normalized_channel,
+            scope_key=topic_scope_key,
+            topic_id=topic_id,
         )
         topic_confidence = req.topic_confidence
         if topic_confidence is None:
@@ -581,6 +688,12 @@ class ClawDBService:
                 if len(self._idempotency_index) > self._cache_cap:
                     self._idempotency_index.pop(next(iter(self._idempotency_index)))
         self._invalidate_query_state()
+        if str(req_with_topic.content or "").strip():
+            self.topic_trie.insert(topic_id, str(req_with_topic.content))
+            self._topic_model_for_scope(topic_scope_key).observe(
+                topic_id,
+                str(req_with_topic.content),
+            )
         await self._wake_semantic_pipeline(
             wal_seq=record.seq,
             tenant_id=req_with_topic.tenant_id,
