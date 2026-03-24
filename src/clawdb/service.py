@@ -524,19 +524,22 @@ class ClawDBService:
         )
         payload_input = req_with_topic.model_dump(mode="json")
         explicit_projection_target = str(req_with_topic.projection_target_user_key or "").strip()
+        explicit_recipient_user = str(req_with_topic.to_user_key or req_with_topic.to_id or "").strip()
+        inference_account = str(req_with_topic.account_key or req_with_topic.account_id or "").strip()
+        inference_group = str(req_with_topic.group_chat_key or req_with_topic.group_id or "").strip()
         if (
             str(req_with_topic.role or "").strip().lower() == "assistant"
             and explicit_projection_target == ""
-            and str(req_with_topic.to_id or "").strip() == ""
+            and explicit_recipient_user == ""
             and str(req_with_topic.chat_type or "").strip().lower() in {"direct", "group"}
         ):
             projection_target_user_key = await self.df_store.infer_projection_target_user_key(
                 tenant_id=req_with_topic.tenant_id,
                 platform=normalized_platform,
-                account_id=req_with_topic.account_id,
+                account_id=inference_account,
                 chat_type=req_with_topic.chat_type,
                 session_id=req_with_topic.session_id,
-                group_id=req_with_topic.group_id,
+                group_id=inference_group,
                 reply_to_id=req_with_topic.reply_to_id,
                 thread_parent_id=req_with_topic.thread_parent_id,
                 message_thread_id=req_with_topic.message_thread_id,
