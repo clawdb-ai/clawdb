@@ -1068,6 +1068,9 @@ def _infer_projection_target_user_key(rows: pd.DataFrame) -> Optional[str]:
     )
 
     def _row_user_key(row: pd.Series) -> str:
+        explicit_target = str(row.get("projection_target_user_key") or "").strip()
+        if explicit_target:
+            return explicit_target
         role = str(row.get("role") or "").strip().lower()
         if role == "assistant":
             normalized_columns = ["to_user_key", "sender_user_key", "from_user_key"]
