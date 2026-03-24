@@ -511,6 +511,25 @@ def _json_string_list(value: object) -> List[str]:
     return out
 
 
+def _group_identity_mask(frame: pd.DataFrame, group_id: object) -> pd.Series:
+    if frame.empty:
+        return pd.Series(dtype=bool)
+    group_text = str(group_id or "").strip()
+    if not group_text:
+        return pd.Series([False] * len(frame), index=frame.index, dtype=bool)
+    group_ids = frame["group_id"].fillna("").astype(str)
+    if "group_chat_key" in frame.columns:
+        group_chat_keys = frame["group_chat_key"].fillna("").astype(str)
+    else:
+        group_chat_keys = pd.Series([""] * len(frame), index=frame.index, dtype="string").astype(str)
+    suffix = group_text.rsplit(":", 1)[-1].strip()
+    canonical_suffix = group_chat_keys.str.rsplit(":", n=1).str[-1]
+    mask = (group_ids == group_text) | (group_chat_keys == group_text)
+    if suffix:
+        mask |= (group_ids == suffix) | (canonical_suffix == suffix)
+    return mask
+
+
 def materialize_session_rollups(
     messages_frame: pd.DataFrame,
     *,
@@ -1587,7 +1606,7 @@ class DataFrameStore:
         if chat_type is not None:
             scoped = scoped[scoped["chat_type"].astype(str) == str(chat_type)]
         if group_id is not None:
-            scoped = scoped[scoped["group_id"].astype(str) == str(group_id)]
+            scoped = scoped[_group_identity_mask(scoped, group_id)]
         if topic_id is not None:
             canonical_ids = self._canonical_topic_ids_locked(tenant_id, [str(topic_id)])
             if canonical_ids:
@@ -4384,6 +4403,7 @@ class DataFrameStore:
             df["session_id"] = df["session_id"].fillna("").astype(str)
             df["projection_kind"] = df["projection_kind"].fillna("").astype(str)
             df["group_id"] = df["group_id"].fillna("").astype(str)
+            df["group_chat_key"] = df["group_chat_key"].fillna("").astype(str)
             df["native_session_id"] = df["native_session_id"].fillna("").astype(str)
             df["updated_at"] = pd.to_datetime(df["updated_at"], utc=True, errors="coerce")
             scoped = df[df["tenant_id"].astype(str) == str(tenant_id)].copy()
@@ -4398,7 +4418,7 @@ class DataFrameStore:
             if projection_kind is not None:
                 scoped = scoped[scoped["projection_kind"].astype(str) == str(projection_kind)]
             if group_id is not None:
-                scoped = scoped[scoped["group_id"].astype(str) == str(group_id)]
+                scoped = scoped[_group_identity_mask(scoped, group_id)]
             if origin_message_id is not None:
                 scoped = scoped[
                     scoped["origin_message_ids_json"].apply(lambda value: _json_contains(value, str(origin_message_id)))
