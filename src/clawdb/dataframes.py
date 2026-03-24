@@ -20,6 +20,7 @@ from .embeddings import (
     embedding_source_hash,
 )
 from .lineage import (
+    CANONICAL_PROJECTION_KINDS,
     DM_MIRROR_PUBLIC_PROJECTION_KIND,
     MESSAGE_STATE_DELETED,
     PLATFORM_IDENTITY_COLUMNS,
@@ -28,6 +29,7 @@ from .lineage import (
     materialize_projection_rows,
     normalize_identity,
     normalize_platform,
+    projection_message_id,
 )
 from .models import SearchResult, WalRecord
 from .projections import PROJECTIONS_COLUMNS, materialize_projection_state
@@ -65,6 +67,7 @@ MESSAGES_COLUMNS = [
     "from_user_key",
     "to_id",
     "to_user_key",
+    "projection_target_user_key",
     "sender_id",
     "sender_user_key",
     "sender_name",
@@ -717,6 +720,20 @@ def _preserved_projection_messages(
     existing["visibility"] = existing["visibility"].fillna("").astype(str)
     existing["native_session_id"] = existing["native_session_id"].fillna("").astype(str)
     existing = existing[existing["projection_kind"].astype(str) != RAW_PROJECTION_KIND]
+    existing = existing[
+        ~existing.apply(
+            lambda row: (
+                str(row["projection_kind"]) in CANONICAL_PROJECTION_KINDS
+                and str(row["message_id"])
+                == projection_message_id(
+                    str(row["origin_message_id"]),
+                    str(row["projection_kind"]),
+                    str(row["projection_scope"]),
+                )
+            ),
+            axis=1,
+        )
+    ]
     if existing.empty:
         return pd.DataFrame(columns=MESSAGES_COLUMNS)
     raw_lookup = {
@@ -1117,6 +1134,7 @@ class DataFrameStore:
                 "from_user_key": "string",
                 "to_id": "string",
                 "to_user_key": "string",
+                "projection_target_user_key": "string",
                 "sender_id": "string",
                 "sender_user_key": "string",
                 "sender_name": "string",

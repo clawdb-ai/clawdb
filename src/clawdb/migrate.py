@@ -168,6 +168,7 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
         "from_user_key": "",
         "to_id": "",
         "to_user_key": "",
+        "projection_target_user_key": "",
         "sender_id": "",
         "sender_user_key": "",
         "sender_name": "",
@@ -222,6 +223,7 @@ def _normalize_messages(frame: pd.DataFrame) -> pd.DataFrame:
     out["from_user_key"] = _fill_string(out["from_user_key"])
     out["to_id"] = _fill_string(out["to_id"])
     out["to_user_key"] = _fill_string(out["to_user_key"])
+    out["projection_target_user_key"] = _fill_string(out["projection_target_user_key"])
     out["sender_id"] = _fill_string(out["sender_id"])
     out["sender_user_key"] = _fill_string(out["sender_user_key"])
     out["sender_name"] = _fill_string(out["sender_name"])

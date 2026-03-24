@@ -12,6 +12,13 @@ RAW_PROJECTION_KIND = "raw_global"
 PRIVATE_DM_PROJECTION_KIND = "private_dm"
 GROUP_PUBLIC_PROJECTION_KIND = "group_public"
 DM_MIRROR_PUBLIC_PROJECTION_KIND = "dm_mirror_public"
+CANONICAL_PROJECTION_KINDS = frozenset(
+    {
+        PRIVATE_DM_PROJECTION_KIND,
+        GROUP_PUBLIC_PROJECTION_KIND,
+        DM_MIRROR_PUBLIC_PROJECTION_KIND,
+    }
+)
 
 MESSAGE_STATE_ACTIVE = "active"
 MESSAGE_STATE_EDITED = "edited"
@@ -262,6 +269,11 @@ def materialize_message_bundle(payload: Mapping[str, object]) -> Dict[str, objec
         "account_id": str(payload.get("account_id") or ""),
         "from_id": str(payload.get("from_id") or ""),
         "to_id": str(payload.get("to_id") or ""),
+        "projection_target_user_key": normalize_identity(
+            platform,
+            str(payload.get("projection_target_user_key") or ""),
+            "user",
+        ),
         "sender_id": str(payload.get("sender_id") or ""),
         "sender_name": str(payload.get("sender_name") or ""),
         "sender_username": str(payload.get("sender_username") or ""),
