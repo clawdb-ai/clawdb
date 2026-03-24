@@ -56,8 +56,8 @@ def _default_projection_scope(message: MessageIn) -> str:
 
 def _message_identity_keys(message: MessageIn) -> List[str]:
     tenant_id = (message.tenant_id or "default").strip() or "default"
-    projection_kind = (message.projection_kind or "raw").strip() or "raw"
-    projection_scope = (message.projection_scope or _default_projection_scope(message)).strip()
+    projection_kind = "raw"
+    projection_scope = _default_projection_scope(message).strip()
     origin_message_id = (message.origin_message_id or message.message_id or "").strip()
     message_id = (message.message_id or "").strip()
     ts = pd.Timestamp(message.ts).tz_convert("UTC").isoformat()
