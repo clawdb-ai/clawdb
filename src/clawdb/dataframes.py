@@ -48,8 +48,12 @@ from .storage_layout import MessageChannelFile, table_parquet_files
 from .textsize import utf8_text_size
 from .topics import (
     DEFAULT_TOPIC_VECTOR_DIM,
+    TOPIC_SHARD_ID_RE,
+    TOPIC_SHARD_THRESHOLD_CHARS,
     TOPICS_COLUMNS,
+    _topic_shard_id,
     _vectorize,
+    materialize_topic_message_routes,
     materialize_topic_lifecycle,
 )
 
@@ -1622,9 +1626,9 @@ class DataFrameStore:
         if group_id is not None:
             scoped = scoped[_group_identity_mask(scoped, group_id)]
         if topic_id is not None:
-            canonical_ids = self._canonical_topic_ids_locked(tenant_id, [str(topic_id)])
-            if canonical_ids:
-                scoped = scoped[scoped["topic_id"].astype(str).isin(canonical_ids)]
+            topic_candidates = self._topic_alias_ids_locked(tenant_id, [str(topic_id)])
+            if topic_candidates:
+                scoped = scoped[scoped["topic_id"].astype(str).isin(topic_candidates)]
             else:
                 scoped = scoped[scoped["topic_id"].astype(str) == str(topic_id)]
         if message_thread_id is not None:
@@ -1681,6 +1685,37 @@ class DataFrameStore:
             }
         )
 
+    def _topic_alias_ids_locked(
+        self,
+        tenant_id: str,
+        topic_ids: List[str],
+    ) -> List[str]:
+        requested = sorted({str(item) for item in topic_ids if str(item)})
+        if not requested:
+            return []
+        if self._state.topics_df.empty:
+            return requested
+        topics = self._state.topics_df.copy()
+        topics["tenant_id"] = topics["tenant_id"].fillna("default").astype(str)
+        topics["topic_id"] = topics["topic_id"].fillna("default").astype(str)
+        topics["canonical_topic_id"] = topics["canonical_topic_id"].fillna(topics["topic_id"]).astype(str)
+        scoped = topics[topics["tenant_id"].astype(str) == str(tenant_id)]
+        canonical_lookup = {
+            str(row["topic_id"]): str(row["canonical_topic_id"] or row["topic_id"])
+            for _, row in scoped.iterrows()
+        }
+        aliases_by_canonical: Dict[str, set[str]] = {}
+        for _, row in scoped.iterrows():
+            canonical = str(row["canonical_topic_id"] or row["topic_id"])
+            aliases_by_canonical.setdefault(canonical, set()).add(str(row["topic_id"]))
+        resolved: set[str] = set()
+        for topic_id in requested:
+            canonical = canonical_lookup.get(str(topic_id), str(topic_id))
+            resolved.add(str(topic_id))
+            resolved.add(str(canonical))
+            resolved.update(aliases_by_canonical.get(str(canonical), {str(canonical)}))
+        return sorted(resolved)
+
     def _apply_materialized_topics_to_messages_locked(self) -> None:
         if self._state.messages_df.empty:
             return
@@ -1696,6 +1731,7 @@ class DataFrameStore:
         scoped["source_topic_path"] = scoped["source_topic_path"].fillna(scoped["topic_path"]).astype(str)
         scoped["topic_parent_id"] = scoped["topic_parent_id"].fillna("").astype(str)
         scoped["projection_kind"] = scoped["projection_kind"].fillna("").astype(str)
+        scoped["origin_message_id"] = scoped["origin_message_id"].fillna(scoped["message_id"]).astype(str)
 
         if self._state.topics_df.empty:
             scoped["topic_id"] = scoped["source_topic_id"]
@@ -1714,6 +1750,7 @@ class DataFrameStore:
             }
             canonical_path_lookup: Dict[Tuple[str, str], str] = {}
             canonical_parent_lookup: Dict[Tuple[str, str], str] = {}
+            default_shard_lookup: Dict[Tuple[str, str], Dict[str, str]] = {}
             for _, row in topics.iterrows():
                 tenant_key = str(row["tenant_id"])
                 canonical_topic_id = str(row["canonical_topic_id"] or row["topic_id"])
@@ -1722,6 +1759,14 @@ class DataFrameStore:
                 if key not in canonical_path_lookup or topic_key == canonical_topic_id:
                     canonical_path_lookup[key] = str(row["topic_path"] or canonical_topic_id)
                     canonical_parent_lookup[key] = str(row["topic_parent_id"] or "")
+                if topic_key != canonical_topic_id and key not in default_shard_lookup:
+                    default_shard_lookup[key] = {
+                        "topic_id": topic_key,
+                        "topic_path": str(row["topic_path"] or topic_key),
+                        "topic_parent_id": str(row["topic_parent_id"] or canonical_topic_id),
+                    }
+
+            message_routes = materialize_topic_message_routes(scoped)
 
             canonical_ids = [
                 canonical_lookup.get((tenant_id, source_topic_id), source_topic_id)
@@ -1730,27 +1775,42 @@ class DataFrameStore:
                     scoped["source_topic_id"].astype(str).tolist(),
                 )
             ]
-            scoped["topic_id"] = canonical_ids
-            scoped["topic_path"] = [
-                source_topic_path
-                or canonical_path_lookup.get(
-                    (tenant_id, canonical_topic_id),
-                    canonical_topic_id,
+            resolved_topic_ids: List[str] = []
+            resolved_topic_paths: List[str] = []
+            resolved_parent_ids: List[str] = []
+            for tenant_id, canonical_topic_id, source_topic_path, topic_parent_id, origin_message_id in zip(
+                scoped["tenant_id"].astype(str).tolist(),
+                canonical_ids,
+                scoped["source_topic_path"].astype(str).tolist(),
+                scoped["topic_parent_id"].astype(str).tolist(),
+                scoped["origin_message_id"].astype(str).tolist(),
+            ):
+                route = message_routes.get((tenant_id, origin_message_id))
+                if route is None:
+                    route = default_shard_lookup.get((tenant_id, canonical_topic_id))
+                if route is not None:
+                    resolved_topic_ids.append(str(route.get("topic_id") or canonical_topic_id))
+                    resolved_topic_paths.append(
+                        str(route.get("topic_path") or source_topic_path or canonical_path_lookup.get((tenant_id, canonical_topic_id), canonical_topic_id))
+                    )
+                    resolved_parent_ids.append(
+                        str(route.get("topic_parent_id") or canonical_topic_id)
+                    )
+                    continue
+                resolved_topic_ids.append(str(canonical_topic_id))
+                resolved_topic_paths.append(
+                    source_topic_path
+                    or canonical_path_lookup.get(
+                        (tenant_id, canonical_topic_id),
+                        canonical_topic_id,
+                    )
                 )
-                for tenant_id, canonical_topic_id, source_topic_path in zip(
-                    scoped["tenant_id"].astype(str).tolist(),
-                    scoped["topic_id"].astype(str).tolist(),
-                    scoped["source_topic_path"].astype(str).tolist(),
+                resolved_parent_ids.append(
+                    canonical_parent_lookup.get((tenant_id, canonical_topic_id), topic_parent_id)
                 )
-            ]
-            scoped["topic_parent_id"] = [
-                canonical_parent_lookup.get((tenant_id, canonical_topic_id), topic_parent_id)
-                for tenant_id, canonical_topic_id, topic_parent_id in zip(
-                    scoped["tenant_id"].astype(str).tolist(),
-                    scoped["topic_id"].astype(str).tolist(),
-                    scoped["topic_parent_id"].astype(str).tolist(),
-                )
-            ]
+            scoped["topic_id"] = resolved_topic_ids
+            scoped["topic_path"] = resolved_topic_paths
+            scoped["topic_parent_id"] = resolved_parent_ids
 
         scoped.loc[scoped["projection_kind"].astype(str) == RAW_PROJECTION_KIND, "capsule_level"] = "L0"
         scoped.loc[scoped["projection_kind"].astype(str) != RAW_PROJECTION_KIND, "capsule_level"] = "L1"
@@ -1942,7 +2002,6 @@ class DataFrameStore:
             ascending=[True, True, False, True],
             kind="stable",
         )
-        scoped = scoped.groupby("canonical_topic_id", sort=True, as_index=False).head(1)
         return scoped.drop(columns=["_canonical_priority"]).reset_index(drop=True)
 
     def _session_rollup_rows_for_scope_locked(
@@ -2251,35 +2310,36 @@ class DataFrameStore:
                 tenant_raw_rows["topic_id"]
             ).astype(str)
             for _, row in topic_rows.iterrows():
-                canonical_topic_id = str(row.get("canonical_topic_id") or row.get("topic_id") or "default")
+                topic_row_id = str(row.get("topic_id") or row.get("canonical_topic_id") or "default")
+                canonical_topic_id = str(row.get("canonical_topic_id") or topic_row_id or "default")
                 aliases = topic_aliases.get(canonical_topic_id, {canonical_topic_id})
                 supporting = tenant_raw_rows[
                     tenant_raw_rows["source_topic_id"].astype(str).isin(sorted(aliases))
                     | (tenant_raw_rows["topic_id"].astype(str) == canonical_topic_id)
                 ]
-                citations = [f"topic:{canonical_topic_id}", *_origin_bounds(supporting)]
+                citations = [f"topic:{topic_row_id}", *_origin_bounds(supporting)]
                 rows.append(
                     {
                         "tenant_id": tenant_id,
-                        "doc_id": f"topic:{canonical_topic_id}",
+                        "doc_id": f"topic:{topic_row_id}",
                         "entity_type": "topic",
-                        "entity_id": canonical_topic_id,
+                        "entity_id": topic_row_id,
                         "source_tier": "L2",
-                        "session_id": f"topic:{canonical_topic_id}",
+                        "session_id": f"topic:{topic_row_id}",
                         "updated_at": _utc_timestamp(row.get("updated_at")),
                         "text": str(row.get("summary") or row.get("vector_text") or ""),
-                        "path": f"memory/topics/{_safe_path_fragment(canonical_topic_id)}.md",
+                        "path": f"memory/topics/{_safe_path_fragment(topic_row_id)}.md",
                         "start_line": 1,
                         "end_line": 1,
                         "snippet": _trim_text(row.get("summary") or row.get("vector_text") or "", 700),
-                        "citation": f"topic:{canonical_topic_id}",
+                        "citation": f"topic:{topic_row_id}",
                         "citations_json": _json_citations(citations),
                         "channel": "",
                         "chat_type": "",
                         "account_id": "",
                         "group_id": "",
-                        "topic_id": canonical_topic_id,
-                        "topic_path": str(row.get("topic_path") or canonical_topic_id),
+                        "topic_id": topic_row_id,
+                        "topic_path": str(row.get("topic_path") or topic_row_id),
                         "message_thread_id": "",
                         "sender_id": "",
                         "origin_message_id": (
@@ -2756,9 +2816,9 @@ class DataFrameStore:
             if group_id is not None:
                 native = native[_group_identity_mask(native, group_id)]
             if topic_id is not None:
-                canonical_ids = self._canonical_topic_ids_locked(tenant_id, [str(topic_id)])
-                if canonical_ids:
-                    native = native[native["topic_id"].astype(str).isin(canonical_ids)]
+                topic_candidates = self._topic_alias_ids_locked(tenant_id, [str(topic_id)])
+                if topic_candidates:
+                    native = native[native["topic_id"].astype(str).isin(topic_candidates)]
                 else:
                     native = native[native["topic_id"].astype(str) == str(topic_id)]
             if message_thread_id is not None:
@@ -3250,6 +3310,76 @@ class DataFrameStore:
                 "topic_id": str(row.get("source_topic_id") or row.get("topic_id") or ""),
                 "topic_path": str(row.get("source_topic_path") or row.get("topic_path") or ""),
                 "topic_source": str(row.get("topic_source") or ""),
+            }
+
+    async def resolve_topic_shard(
+        self,
+        *,
+        tenant_id: str,
+        source_topic_id: str,
+        source_topic_path: Optional[str],
+        message_size: int,
+    ) -> Dict[str, str]:
+        canonical_topic_id = str(source_topic_id or "").strip() or "default"
+        fallback_path = str(source_topic_path or "").strip() or canonical_topic_id
+        async with self._lock:
+            topics = self._state.topics_df.copy().reset_index(drop=True)
+            if topics.empty:
+                shard_id = _topic_shard_id(canonical_topic_id, 1)
+                return {
+                    "topic_id": shard_id,
+                    "topic_path": f"{fallback_path.rstrip('/')}/shard-0001",
+                    "topic_parent_id": canonical_topic_id,
+                }
+            topics["tenant_id"] = topics["tenant_id"].fillna("default").astype(str)
+            topics["topic_id"] = topics["topic_id"].fillna("default").astype(str)
+            topics["canonical_topic_id"] = topics["canonical_topic_id"].fillna(topics["topic_id"]).astype(str)
+            topics["topic_path"] = topics["topic_path"].fillna(topics["canonical_topic_id"]).astype(str)
+            topics["content_char_count"] = pd.to_numeric(
+                topics["content_char_count"], errors="coerce"
+            ).fillna(0).astype(int)
+            scoped = topics[
+                (topics["tenant_id"].astype(str) == str(tenant_id))
+                & (topics["canonical_topic_id"].astype(str) == canonical_topic_id)
+            ].copy()
+            canonical_rows = scoped[scoped["topic_id"].astype(str) == canonical_topic_id].copy()
+            canonical_path = (
+                str(canonical_rows.iloc[0].get("topic_path") or fallback_path)
+                if not canonical_rows.empty
+                else fallback_path
+            )
+            shard_rows = scoped[scoped["topic_id"].astype(str) != canonical_topic_id].copy()
+            if shard_rows.empty:
+                shard_id = _topic_shard_id(canonical_topic_id, 1)
+                return {
+                    "topic_id": shard_id,
+                    "topic_path": f"{canonical_path.rstrip('/')}/shard-0001",
+                    "topic_parent_id": canonical_topic_id,
+                }
+
+            def _shard_sort_key(topic_id: str) -> int:
+                match = TOPIC_SHARD_ID_RE.match(str(topic_id or ""))
+                if match is None:
+                    return 0
+                try:
+                    return int(match.group("ordinal"))
+                except Exception:
+                    return 0
+
+            shard_rows["_ordinal"] = shard_rows["topic_id"].astype(str).map(_shard_sort_key)
+            shard_rows = shard_rows.sort_values(["_ordinal", "topic_id"], ascending=[True, True], kind="stable")
+            last_row = shard_rows.iloc[-1]
+            last_ordinal = int(last_row.get("_ordinal") or 1)
+            last_size = int(last_row.get("content_char_count") or 0)
+            if last_size >= TOPIC_SHARD_THRESHOLD_CHARS:
+                shard_ordinal = last_ordinal + 1
+            else:
+                shard_ordinal = last_ordinal
+            shard_id = _topic_shard_id(canonical_topic_id, shard_ordinal)
+            return {
+                "topic_id": shard_id,
+                "topic_path": f"{canonical_path.rstrip('/')}/shard-{shard_ordinal:04d}",
+                "topic_parent_id": canonical_topic_id,
             }
 
     async def infer_projection_target_user_key(
@@ -4589,13 +4719,14 @@ class DataFrameStore:
 
             if not topic_rows.empty:
                 ordered_topics = topic_rows.sort_values(
-                    ["updated_at", "canonical_topic_id"],
-                    ascending=[False, True],
+                    ["updated_at", "canonical_topic_id", "topic_id"],
+                    ascending=[False, True, True],
                     kind="stable",
                 )
                 for _, row in ordered_topics.iterrows():
-                    canonical_topic_id = str(row.get("canonical_topic_id") or row.get("topic_id") or "default")
-                    primary = f"topic:{canonical_topic_id}"
+                    topic_row_id = str(row.get("topic_id") or row.get("canonical_topic_id") or "default")
+                    canonical_topic_id = str(row.get("canonical_topic_id") or topic_row_id or "default")
+                    primary = f"topic:{topic_row_id}"
                     persisted = _persisted_doc(primary)
                     if persisted is not None:
                         docs.append(persisted)
@@ -4610,21 +4741,21 @@ class DataFrameStore:
                         {
                             "doc_id": primary,
                             "text": str(row.get("summary") or row.get("vector_text") or ""),
-                            "path": f"memory/topics/{_safe_path_fragment(canonical_topic_id)}.md",
+                            "path": f"memory/topics/{_safe_path_fragment(topic_row_id)}.md",
                             "start_line": 1,
                             "end_line": 1,
                             "snippet": _trim_text(row.get("summary") or row.get("vector_text") or "", 700),
                             "source_tier": "L2",
                             "entity_type": "topic",
-                            "entity_id": canonical_topic_id,
+                            "entity_id": topic_row_id,
                             "citation": primary,
                             "citations": citations,
                             "channel": None,
                             "chat_type": None,
                             "account_id": None,
                             "group_id": None,
-                            "topic_id": canonical_topic_id,
-                            "topic_path": str(row.get("topic_path") or canonical_topic_id),
+                            "topic_id": topic_row_id,
+                            "topic_path": str(row.get("topic_path") or topic_row_id),
                             "message_thread_id": None,
                             "sender_id": None,
                             "origin_message_id": (
@@ -4876,8 +5007,8 @@ class DataFrameStore:
                 session_candidates = sorted({str(session_id), *resolved})
                 scoped = scoped[scoped["session_id"].astype(str).isin(session_candidates)]
             if topic_id is not None:
-                canonical_ids = self._canonical_topic_ids_locked(str(tenant_id), [str(topic_id)])
-                topic_candidates = sorted({str(topic_id), *canonical_ids})
+                topic_candidates = self._topic_alias_ids_locked(str(tenant_id), [str(topic_id)])
+                topic_candidates = sorted({str(topic_id), *topic_candidates})
                 scoped = scoped[scoped["topic_id"].astype(str).isin(topic_candidates)]
             scoped = scoped.sort_values(
                 ["updated_at", "scope_type", "scope_key"],

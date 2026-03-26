@@ -64,6 +64,7 @@ from .models import (
 from .mq import AsyncMessageQueue, build_event, create_queue
 from .research import get_research_corpus
 from .retrieval import HybridRetrievalEngine, RetrievalDoc, resolve_retrieval_weights
+from .textsize import utf8_text_size
 from .trie import TopicTrie
 from .topics import GaussianEwensTopicModel, _vectorize
 from .wal import WalManager
@@ -742,20 +743,29 @@ class ClawDBService:
             normalized_chat_type=normalized_chat_type,
         )
         topic_scope_key = str(topic_assignment["topic_scope_key"])
-        topic_id = str(topic_assignment["topic_id"])
-        topic_path = str(topic_assignment["topic_path"])
+        classified_topic_id = str(topic_assignment["topic_id"])
         topic_source = str(topic_assignment["topic_source"])
         topic_confidence = float(topic_assignment["topic_confidence"])
         topic_vector = list(topic_assignment["topic_vector"])
         scoped_model = topic_assignment["scoped_model"]
         content_text = str(req.content or "").strip()
+        shard_assignment = await self.df_store.resolve_topic_shard(
+            tenant_id=req.tenant_id,
+            source_topic_id=str(topic_assignment["source_topic_id"]),
+            source_topic_path=str(topic_assignment["source_topic_path"]),
+            message_size=utf8_text_size(content_text),
+        )
+        message_topic_id = str(shard_assignment["topic_id"])
+        message_topic_path = str(shard_assignment["topic_path"])
+        message_topic_parent_id = str(shard_assignment["topic_parent_id"])
         req_with_topic = req.model_copy(
             update={
                 "channel": normalized_channel,
                 "platform": normalized_platform,
                 "chat_type": normalized_chat_type,
-                "topic_id": topic_id,
-                "topic_path": topic_path,
+                "topic_id": message_topic_id,
+                "topic_parent_id": message_topic_parent_id,
+                "topic_path": message_topic_path,
                 "topic_source": topic_source,
                 "topic_confidence": topic_confidence,
             }
@@ -826,11 +836,11 @@ class ClawDBService:
                     self._idempotency_index.pop(next(iter(self._idempotency_index)))
         self._invalidate_query_state()
         if content_text:
-            self.topic_trie.insert(topic_id, str(req_with_topic.content))
+            self.topic_trie.insert(classified_topic_id, str(req_with_topic.content))
             if topic_vector:
-                scoped_model.observe_vector(topic_id, topic_vector)
+                scoped_model.observe_vector(classified_topic_id, topic_vector)
             else:
-                scoped_model.observe(topic_id, str(req_with_topic.content))
+                scoped_model.observe(classified_topic_id, str(req_with_topic.content))
         await self._wake_semantic_pipeline(
             wal_seq=record.seq,
             tenant_id=req_with_topic.tenant_id,

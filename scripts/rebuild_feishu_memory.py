@@ -304,7 +304,7 @@ def summarize_state(service: ClawDBService, fetched_messages: int, source_chats:
         topics["canonical_topic_id"] = topics["canonical_topic_id"].fillna(topics["topic_id"]).astype(str)
         topics["status"] = topics["status"].fillna("").astype(str)
         canonical_topic_count = int((topics["topic_id"] == topics["canonical_topic_id"]).sum())
-        split_topic_shard_count = int(topics["topic_id"].str.contains("::split:", regex=False).sum())
+        split_topic_shard_count = int(topics["topic_id"].str.contains("::shard:", regex=False).sum())
         topic_status_counts = {
             str(key): int(value)
             for key, value in topics["status"].value_counts(dropna=False).to_dict().items()

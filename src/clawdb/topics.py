@@ -16,6 +16,7 @@ from .textsize import utf8_text_size
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 TOPIC_ID_SUFFIX_RE = re.compile(r"(?P<prefix>[A-Za-z0-9_-]+)-(?P<ordinal>\d+)$")
+TOPIC_SHARD_ID_RE = re.compile(r"^(?P<canonical>.+)::shard:(?P<ordinal>\d+)$")
 TOPIC_STATUS_ACTIVE = "active"
 TOPIC_STATUS_MERGED = "merged"
 TOPIC_STATUS_SPLIT = "split"
@@ -54,10 +55,7 @@ TOPIC_SUMMARY_MAX_CHARS = 2400
 TOPIC_KEYWORD_LIMIT = 6
 TOPIC_MERGE_MAX_LIVE_MESSAGES = 2
 TOPIC_MERGE_MIN_SCORE = 0.82
-TOPIC_SPLIT_MIN_MESSAGES = 4
-TOPIC_SPLIT_SEED_MAX_SIMILARITY = 0.18
-TOPIC_SPLIT_CLUSTER_MAX_SIMILARITY = 0.45
-TOPIC_SPLIT_MIN_MARGIN = 0.15
+TOPIC_SHARD_THRESHOLD_CHARS = 100_000
 TOPIC_DRIFT_THRESHOLD = 0.6
 TOPIC_REPARENT_MIN_SCORE = 0.56
 
@@ -203,6 +201,10 @@ def _path_parent_hint(path_hint: str) -> str:
 def _json_list(values: Sequence[str]) -> str:
     items = sorted({str(item) for item in values if str(item)})
     return json.dumps(items, separators=(",", ":"))
+
+
+def _topic_shard_id(topic_id: str, ordinal: int) -> str:
+    return f"{str(topic_id)}::shard:{int(ordinal):04d}"
 
 
 def _render_topic_text(
@@ -354,51 +356,91 @@ def _merge_score(left: TopicSlice, right: TopicSlice) -> float:
     return (0.8 * cosine) + (0.2 * overlap)
 
 
-def _propose_split(messages: Sequence[TopicMessage], vector_dim: int) -> List[List[TopicMessage]]:
-    ordered = list(messages)
-    if len(ordered) < TOPIC_SPLIT_MIN_MESSAGES:
+def _sequential_topic_shards(
+    messages: Sequence[TopicMessage],
+    *,
+    threshold_chars: int,
+) -> List[List[TopicMessage]]:
+    ordered = sorted(messages, key=lambda item: (item.ts, item.message_id))
+    if not ordered:
         return []
-    seed_pair: Optional[Tuple[int, int]] = None
-    seed_score = 1.0
-    for left_idx in range(len(ordered)):
-        for right_idx in range(left_idx + 1, len(ordered)):
-            score = _cosine_similarity(ordered[left_idx].vector, ordered[right_idx].vector)
-            if score < seed_score:
-                seed_score = score
-                seed_pair = (left_idx, right_idx)
-    if seed_pair is None or seed_score > TOPIC_SPLIT_SEED_MAX_SIMILARITY:
-        return []
-    seed_left = ordered[seed_pair[0]]
-    seed_right = ordered[seed_pair[1]]
-    left_cluster: List[TopicMessage] = []
-    right_cluster: List[TopicMessage] = []
+    resolved_threshold = max(1, int(threshold_chars))
+    total_chars = sum(utf8_text_size(message.content) for message in ordered)
+    shards: List[List[TopicMessage]] = []
+    current: List[TopicMessage] = []
+    current_chars = 0
     for message in ordered:
-        left_score = _cosine_similarity(message.vector, seed_left.vector)
-        right_score = _cosine_similarity(message.vector, seed_right.vector)
-        if left_score >= right_score:
-            left_cluster.append(message)
-        else:
-            right_cluster.append(message)
-    if min(len(left_cluster), len(right_cluster)) < 2:
-        return []
-    left_centroid = _mean_vector([message.vector for message in left_cluster], vector_dim)
-    right_centroid = _mean_vector([message.vector for message in right_cluster], vector_dim)
-    if _cosine_similarity(left_centroid, right_centroid) > TOPIC_SPLIT_CLUSTER_MAX_SIMILARITY:
-        return []
-    margins: List[float] = []
-    for cluster, own_centroid, other_centroid in (
-        (left_cluster, left_centroid, right_centroid),
-        (right_cluster, right_centroid, left_centroid),
-    ):
-        for message in cluster:
-            margins.append(
-                _cosine_similarity(message.vector, own_centroid)
-                - _cosine_similarity(message.vector, other_centroid)
-            )
-    avg_margin = (sum(margins) / len(margins)) if margins else 0.0
-    if avg_margin < TOPIC_SPLIT_MIN_MARGIN:
-        return []
-    return [sorted(left_cluster, key=lambda item: (item.ts, item.message_id)), sorted(right_cluster, key=lambda item: (item.ts, item.message_id))]
+        message_chars = utf8_text_size(message.content)
+        current.append(message)
+        current_chars += message_chars
+        if current_chars >= resolved_threshold:
+            shards.append(list(current))
+            current = []
+            current_chars = 0
+    if current:
+        shards.append(list(current))
+    return [shard for shard in shards if shard]
+
+
+def materialize_topic_message_routes(
+    messages_frame: pd.DataFrame,
+    *,
+    shard_threshold_chars: int = TOPIC_SHARD_THRESHOLD_CHARS,
+) -> Dict[Tuple[str, str], Dict[str, str]]:
+    if messages_frame.empty:
+        return {}
+    scoped = messages_frame.copy().reset_index(drop=True)
+    if "projection_kind" not in scoped.columns or "message_state" not in scoped.columns:
+        return {}
+    scoped = scoped[scoped["projection_kind"].astype(str) == RAW_PROJECTION_KIND].copy()
+    if scoped.empty:
+        return {}
+    scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+    scoped["topic_id"] = scoped["topic_id"].fillna("default").astype(str)
+    if "source_topic_id" not in scoped.columns:
+        scoped["source_topic_id"] = scoped["topic_id"]
+    scoped["source_topic_id"] = scoped["source_topic_id"].fillna(scoped["topic_id"]).astype(str)
+    if "source_topic_path" not in scoped.columns:
+        scoped["source_topic_path"] = scoped.get("topic_path", scoped["source_topic_id"])
+    scoped["source_topic_path"] = scoped["source_topic_path"].fillna(
+        scoped.get("topic_path", scoped["source_topic_id"])
+    ).astype(str)
+    scoped["message_state"] = scoped["message_state"].fillna("active").astype(str)
+    scoped["origin_message_id"] = scoped["origin_message_id"].fillna(scoped["message_id"]).astype(str)
+    scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
+    scoped = scoped[scoped["ts"].notna()].copy()
+    if scoped.empty:
+        return {}
+
+    routes: Dict[Tuple[str, str], Dict[str, str]] = {}
+    resolved_threshold = max(1, int(shard_threshold_chars))
+    for (tenant_id, source_topic_id), group in scoped.groupby(["tenant_id", "source_topic_id"], sort=True):
+        ordered = group.sort_values(["ts", "origin_message_id", "message_id"], kind="stable").reset_index(drop=True)
+        live_rows = ordered[ordered["message_state"].astype(str) != MESSAGE_STATE_DELETED].copy()
+        if live_rows.empty:
+            continue
+        path_hint = _mode_string(
+            live_rows["source_topic_path"].astype(str).tolist()
+            or ordered["source_topic_path"].astype(str).tolist(),
+            default=str(source_topic_id),
+        )
+        shard_ordinal = 1
+        shard_chars = 0
+        for _, row in live_rows.iterrows():
+            shard_id = _topic_shard_id(str(source_topic_id), shard_ordinal)
+            shard_path = f"{path_hint.rstrip('/')}/shard-{shard_ordinal:04d}"
+            origin_id = str(row.get("origin_message_id") or row.get("message_id") or "")
+            if origin_id:
+                routes[(str(tenant_id), origin_id)] = {
+                    "topic_id": shard_id,
+                    "topic_path": shard_path,
+                    "topic_parent_id": str(source_topic_id),
+                }
+            shard_chars += utf8_text_size(row.get("content") or "")
+            if shard_chars >= resolved_threshold:
+                shard_ordinal += 1
+                shard_chars = 0
+    return routes
 
 
 def _resolve_parent_ids(plans: Sequence[TopicRowPlan]) -> Dict[str, str]:
@@ -476,6 +518,7 @@ def materialize_topic_lifecycle(
     messages_frame: pd.DataFrame,
     *,
     vector_dim: int = DEFAULT_TOPIC_VECTOR_DIM,
+    shard_threshold_chars: int = TOPIC_SHARD_THRESHOLD_CHARS,
 ) -> pd.DataFrame:
     if messages_frame.empty:
         return pd.DataFrame(columns=TOPICS_COLUMNS)
@@ -530,23 +573,74 @@ def materialize_topic_lifecycle(
             vector_dim=resolved_dim,
         )
 
+    resolved_shard_threshold = max(1, int(shard_threshold_chars))
     plans: List[TopicRowPlan] = []
     for (tenant_id, topic_id), seed in sorted(seeds.items()):
-        status = TOPIC_STATUS_COMPACTED if seed.message_count == 0 else TOPIC_STATUS_ACTIVE
+        if seed.message_count == 0:
+            plans.append(
+                TopicRowPlan(
+                    tenant_id=tenant_id,
+                    topic_id=topic_id,
+                    source_topic_id=topic_id,
+                    canonical_topic_id=topic_id,
+                    status=TOPIC_STATUS_COMPACTED,
+                    preferred_parent_id=seed.parent_hint,
+                    leaf_name=seed.leaf_name,
+                    slice=seed,
+                    merged_topic_ids=[],
+                    split_topic_ids=[],
+                )
+            )
+            continue
+
+        shard_groups = _sequential_topic_shards(
+            seed.messages,
+            threshold_chars=resolved_shard_threshold,
+        )
+        shard_ids = [_topic_shard_id(topic_id, idx) for idx in range(1, len(shard_groups) + 1)]
         plans.append(
             TopicRowPlan(
                 tenant_id=tenant_id,
                 topic_id=topic_id,
                 source_topic_id=topic_id,
                 canonical_topic_id=topic_id,
-                status=status,
+                status=TOPIC_STATUS_SPLIT,
                 preferred_parent_id=seed.parent_hint,
                 leaf_name=seed.leaf_name,
                 slice=seed,
                 merged_topic_ids=[],
-                split_topic_ids=[],
+                split_topic_ids=shard_ids,
             )
         )
+        for shard_idx, shard_messages in enumerate(shard_groups, start=1):
+            shard_id = shard_ids[shard_idx - 1]
+            shard_path_hint = f"{seed.path_hint.rstrip('/')}/shard-{shard_idx:04d}"
+            shard_slice = _build_topic_slice(
+                tenant_id=tenant_id,
+                topic_id=shard_id,
+                parent_hint=topic_id,
+                path_hint=shard_path_hint,
+                messages=shard_messages,
+                historical_message_count=len(shard_messages),
+                deleted_message_count=0,
+                first_ts=min(message.ts for message in shard_messages),
+                last_ts=max(message.ts for message in shard_messages),
+                vector_dim=resolved_dim,
+            )
+            plans.append(
+                TopicRowPlan(
+                    tenant_id=tenant_id,
+                    topic_id=shard_id,
+                    source_topic_id=topic_id,
+                    canonical_topic_id=topic_id,
+                    status=TOPIC_STATUS_ACTIVE,
+                    preferred_parent_id=topic_id,
+                    leaf_name=shard_slice.leaf_name,
+                    slice=shard_slice,
+                    merged_topic_ids=[],
+                    split_topic_ids=[],
+                )
+            )
 
     canonical_topic_ids = {plan.topic_id for plan in plans}
     parent_ids: Dict[str, str] = {}
