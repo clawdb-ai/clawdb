@@ -191,6 +191,55 @@ def resolve_fallback_embedding_context() -> Optional[EmbeddingAuthContext]:
     )
 
 
+def resolve_topic_embedding_context() -> Optional[EmbeddingAuthContext]:
+    provider = os.getenv("CLAWDB_TOPIC_EMBEDDING_PROVIDER", "").strip().lower()
+    api_key = os.getenv("CLAWDB_TOPIC_EMBEDDING_API_KEY", "").strip()
+    model = os.getenv("CLAWDB_TOPIC_EMBEDDING_MODEL", "").strip() or None
+    base_url = os.getenv("CLAWDB_TOPIC_EMBEDDING_BASE_URL", "").strip() or None
+    auth_source: Optional[str] = None
+
+    key_file = os.getenv("CLAWDB_TOPIC_EMBEDDING_KEY_FILE", "").strip()
+    if not api_key and key_file:
+        candidate = Path(key_file).expanduser()
+        if candidate.exists():
+            resolved = _read_api_key_from_file(candidate)
+            if resolved:
+                api_key = resolved
+                auth_source = f"file:{candidate.expanduser()}"
+
+    if not provider and any([api_key, model, base_url]):
+        provider = "openai"
+    if not provider:
+        provider = "openai"
+
+    if not api_key and base_url:
+        api_key = "local-topic-embedder"
+        auth_source = "implicit:local-base-url"
+    elif api_key and auth_source is None:
+        auth_source = "env:CLAWDB_TOPIC_EMBEDDING_API_KEY"
+
+    if provider in {"openai", "kimi-coding", "kimi", "moonshot"}:
+        if not model:
+            model = "Qwen/Qwen3-Embedding-0.6B"
+        if not base_url:
+            base_url = "http://127.0.0.1:11440/v1"
+        if not api_key:
+            api_key = "local-topic-embedder"
+            if auth_source is None:
+                auth_source = "implicit:default-local-topic-embedder"
+
+    if not api_key:
+        return None
+
+    return EmbeddingAuthContext(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        auth_source=auth_source,
+    )
+
+
 class EmbeddingRouter:
     async def embed_texts(
         self,

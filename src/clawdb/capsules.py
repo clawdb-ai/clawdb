@@ -7,6 +7,7 @@ from typing import Dict, List, Sequence, Tuple
 import pandas as pd
 
 from .lineage import MESSAGE_STATE_DELETED, RAW_PROJECTION_KIND
+from .textsize import normalize_text, utf8_text_size
 from .topics import DEFAULT_TOPIC_VECTOR_DIM, _vectorize
 
 
@@ -65,12 +66,11 @@ def _utc_timestamp(value: object) -> pd.Timestamp:
 
 
 def _normalize_body_text(value: object) -> str:
-    text = str(value or "")
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalize_text(value)
 
 
 def capsule_body_char_count(value: object) -> int:
-    return len(_normalize_body_text(value))
+    return utf8_text_size(value)
 
 
 def _json_list(values: Sequence[object]) -> str:

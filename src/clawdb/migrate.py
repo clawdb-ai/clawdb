@@ -16,6 +16,7 @@ from .beliefs import BELIEFS_COLUMNS
 from .capsules import CAPSULES_COLUMNS
 from .dataframes import (
     CACHE_INDEX_COLUMNS,
+    DataFrameStore,
     EMBEDDING_INDEX_METADATA_COLUMNS,
     MESSAGES_COLUMNS,
     SESSION_ROLLUPS_COLUMNS,
@@ -934,6 +935,39 @@ def _build_plan_sync(
     metadata_parquet_path: Path,
     target_version: int,
 ) -> SchemaMigrationPlan:
+    source_from_metadata = _read_schema_version_sync(metadata_parquet_path)
+    if source_from_metadata == target_version:
+        tables: List[TableMigrationPlan] = []
+        legacy_layout_detected = False
+        zero_byte_detected = False
+        for table in TABLE_COLUMNS:
+            table_dir = parquet_dir / table
+            has_legacy_layout = table_has_legacy_partitions(table_dir)
+            has_zero_byte = table_has_zero_byte_parquet(table_dir)
+            legacy_layout_detected = legacy_layout_detected or has_legacy_layout
+            zero_byte_detected = zero_byte_detected or has_zero_byte
+            raw_file_count = (
+                sum(1 for path in table_dir.rglob("*.parquet") if path.is_file()) if table_dir.exists() else 0
+            )
+            tables.append(
+                TableMigrationPlan(
+                    table=table,
+                    file_count=raw_file_count,
+                    row_count=0,
+                    missing_columns=[],
+                    needs_rewrite=bool(has_legacy_layout or has_zero_byte),
+                )
+            )
+        if not legacy_layout_detected and not zero_byte_detected:
+            return SchemaMigrationPlan(
+                source_version=source_from_metadata,
+                target_version=target_version,
+                needs_migration=False,
+                needs_metadata_update=False,
+                tables=tables,
+                reason="schema metadata already current",
+            )
+
     tables: List[TableMigrationPlan] = []
     frames: Dict[str, pd.DataFrame] = {}
     legacy_layout_detected = False
@@ -960,7 +994,6 @@ def _build_plan_sync(
                 needs_rewrite=bool(missing or has_legacy_layout or has_zero_byte),
             )
         )
-    source_from_metadata = _read_schema_version_sync(metadata_parquet_path)
     source_version = (
         source_from_metadata
         if source_from_metadata is not None
@@ -1069,6 +1102,28 @@ async def migrate_schema(
     if dry_run:
         return SchemaMigrationResult(plan=plan, applied=False, backup_dir=None, report_path=None)
 
+    has_table_rewrite = any(item.needs_rewrite for item in plan.tables)
+    if not has_table_rewrite and plan.needs_metadata_update:
+        metadata = DataFrameMetadataStore(metadata_parquet_path)
+        await metadata.save_checkpoint(target_version, slot=SCHEMA_VERSION_SLOT)
+        report_dir = data_root / "checkpoints"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = _iso_now()
+        report_path = report_dir / f"schema-migration-report-{timestamp}.json"
+        report_payload = {
+            "plan": _plan_to_dict(plan),
+            "metadata_only": True,
+            "backup_dir": None,
+            "applied_at": timestamp,
+        }
+        report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+        return SchemaMigrationResult(
+            plan=plan,
+            applied=True,
+            backup_dir=None,
+            report_path=str(report_path),
+        )
+
     timestamp = _iso_now()
     backup_path: Optional[Path] = None
     if backup:
@@ -1100,10 +1155,20 @@ async def migrate_schema(
     normalized_tables["session_rollups"] = rebuilt_storage["session_rollups"]
     normalized_tables["topics"] = rebuilt_storage["topics"]
     normalized_tables["capsules"] = rebuilt_storage["capsules"]
-    normalized_tables["search_docs"] = pd.DataFrame(columns=SEARCH_DOC_COLUMNS)
-    normalized_tables["lexical_index"] = pd.DataFrame(columns=LEXICAL_INDEX_COLUMNS)
-    normalized_tables["vector_index"] = pd.DataFrame(columns=VECTOR_INDEX_COLUMNS)
     normalized_tables["embedding_index_metadata"] = rebuilt_storage["embedding_index_metadata"]
+    search_store = DataFrameStore()
+    search_store.state.messages_df = normalized_tables["messages"].copy()
+    search_store.state.projections_df = normalized_tables["projections"].copy()
+    search_store.state.beliefs_df = normalized_tables["beliefs"].copy()
+    search_store.state.sessions_df = normalized_tables["sessions"].copy()
+    search_store.state.session_rollups_df = normalized_tables["session_rollups"].copy()
+    search_store.state.topics_df = normalized_tables["topics"].copy()
+    search_store.state.capsules_df = normalized_tables["capsules"].copy()
+    search_store.state.embedding_index_metadata_df = normalized_tables["embedding_index_metadata"].copy()
+    await search_store.rebuild_search_indexes(vector_dim=_rollup_vector_dim_from_env())
+    normalized_tables["search_docs"] = search_store.state.search_docs_df.copy()
+    normalized_tables["lexical_index"] = search_store.state.lexical_index_df.copy()
+    normalized_tables["vector_index"] = search_store.state.vector_index_df.copy()
 
     tmp_parquet = parquet_dir.parent / f"{parquet_dir.name}.tmp-schema-{timestamp}"
     if tmp_parquet.exists():

@@ -11,9 +11,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 
 from .lineage import MESSAGE_STATE_DELETED, RAW_PROJECTION_KIND
+from .textsize import utf8_text_size
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+TOPIC_ID_SUFFIX_RE = re.compile(r"(?P<prefix>[A-Za-z0-9_-]+)-(?P<ordinal>\d+)$")
 TOPIC_STATUS_ACTIVE = "active"
 TOPIC_STATUS_MERGED = "merged"
 TOPIC_STATUS_SPLIT = "split"
@@ -336,7 +338,7 @@ def _build_topic_slice(
         message_count=len(ordered),
         historical_message_count=int(historical_message_count),
         deleted_message_count=int(deleted_message_count),
-        content_char_count=sum(len(message.content) for message in ordered),
+        content_char_count=sum(utf8_text_size(message.content) for message in ordered),
         keywords=_top_keywords(texts),
         centroid=centroid,
         recent_centroid=recent_centroid,
@@ -528,152 +530,32 @@ def materialize_topic_lifecycle(
             vector_dim=resolved_dim,
         )
 
-    canonical_map: Dict[Tuple[str, str], str] = {}
-    merged_groups: Dict[Tuple[str, str], List[str]] = {}
-    for tenant_id in sorted({tenant for tenant, _ in seeds.keys()}):
-        tenant_seeds = {
-            topic_id: seed
-            for (seed_tenant, topic_id), seed in seeds.items()
-            if seed_tenant == tenant_id and seed.message_count > 0
-        }
-        seen_topics: set[str] = set()
-        for topic_id, seed in sorted(tenant_seeds.items()):
-            if topic_id in seen_topics:
-                continue
-            group = [topic_id]
-            seen_topics.add(topic_id)
-            for other_id, other in sorted(tenant_seeds.items()):
-                if other_id in seen_topics or other_id == topic_id:
-                    continue
-                if seed.parent_hint != other.parent_hint:
-                    continue
-                if max(seed.message_count, other.message_count) > TOPIC_MERGE_MAX_LIVE_MESSAGES:
-                    continue
-                if _merge_score(seed, other) < TOPIC_MERGE_MIN_SCORE:
-                    continue
-                group.append(other_id)
-                seen_topics.add(other_id)
-            canonical = sorted(
-                group,
-                key=lambda item: (
-                    -tenant_seeds[item].message_count,
-                    -tenant_seeds[item].historical_message_count,
-                    tenant_seeds[item].first_ts,
-                    item,
-                ),
-            )[0]
-            merged_groups[(tenant_id, canonical)] = sorted(group)
-            for member in group:
-                canonical_map[(tenant_id, member)] = canonical
-        for topic_id in sorted(
-            {item[1] for item in seeds.keys() if item[0] == tenant_id} - set(tenant_seeds.keys())
-        ):
-            canonical_map[(tenant_id, topic_id)] = topic_id
-            merged_groups[(tenant_id, topic_id)] = [topic_id]
-        for topic_id in tenant_seeds:
-            canonical_map.setdefault((tenant_id, topic_id), topic_id)
-            merged_groups.setdefault((tenant_id, canonical_map[(tenant_id, topic_id)]), [canonical_map[(tenant_id, topic_id)]])
-
-    group_slices: Dict[Tuple[str, str], TopicSlice] = {}
-    split_children: Dict[Tuple[str, str], List[TopicSlice]] = {}
-    for (tenant_id, canonical_topic_id), members in merged_groups.items():
-        member_slices = [seeds[(tenant_id, member)] for member in members if (tenant_id, member) in seeds]
-        if not member_slices:
-            continue
-        merged_messages = [
-            message
-            for seed in member_slices
-            for message in seed.messages
-        ]
-        merged_messages = sorted(merged_messages, key=lambda item: (item.ts, item.message_id))
-        parent_hint = _mode_string([seed.parent_hint for seed in member_slices])
-        canonical_seed = seeds[(tenant_id, canonical_topic_id)]
-        path_hint = canonical_seed.path_hint
-        group_slice = _build_topic_slice(
-            tenant_id=tenant_id,
-            topic_id=canonical_topic_id,
-            parent_hint=parent_hint,
-            path_hint=path_hint,
-            messages=merged_messages,
-            historical_message_count=sum(seed.historical_message_count for seed in member_slices),
-            deleted_message_count=sum(seed.deleted_message_count for seed in member_slices),
-            first_ts=min(seed.first_ts for seed in member_slices),
-            last_ts=max(seed.last_ts for seed in member_slices),
-            vector_dim=resolved_dim,
-        )
-        group_slices[(tenant_id, canonical_topic_id)] = group_slice
-        clusters = _propose_split(group_slice.messages, resolved_dim)
-        if not clusters:
-            continue
-        children: List[TopicSlice] = []
-        for idx, cluster in enumerate(clusters, start=1):
-            child_id = f"{canonical_topic_id}::split:{idx:02d}"
-            child_slice = _build_topic_slice(
-                tenant_id=tenant_id,
-                topic_id=child_id,
-                parent_hint=canonical_topic_id,
-                path_hint=f"{group_slice.path_hint.rstrip('/')}/split-{idx:02d}",
-                messages=cluster,
-                historical_message_count=len(cluster),
-                deleted_message_count=0,
-                first_ts=min(message.ts for message in cluster),
-                last_ts=max(message.ts for message in cluster),
-                vector_dim=resolved_dim,
-            )
-            children.append(child_slice)
-        split_children[(tenant_id, canonical_topic_id)] = children
-
     plans: List[TopicRowPlan] = []
     for (tenant_id, topic_id), seed in sorted(seeds.items()):
-        canonical_topic_id = canonical_map.get((tenant_id, topic_id), topic_id)
-        merged_ids = merged_groups.get((tenant_id, canonical_topic_id), [canonical_topic_id])
-        group_slice = group_slices.get((tenant_id, canonical_topic_id), seed)
-        children = split_children.get((tenant_id, canonical_topic_id), [])
-        if seed.message_count == 0:
-            status = TOPIC_STATUS_COMPACTED
-            active_slice = seed
-        elif topic_id != canonical_topic_id:
-            status = TOPIC_STATUS_MERGED
-            active_slice = seed
-        elif children:
-            status = TOPIC_STATUS_SPLIT
-            active_slice = group_slice
-        else:
-            status = TOPIC_STATUS_ACTIVE
-            active_slice = group_slice
+        status = TOPIC_STATUS_COMPACTED if seed.message_count == 0 else TOPIC_STATUS_ACTIVE
         plans.append(
             TopicRowPlan(
                 tenant_id=tenant_id,
                 topic_id=topic_id,
                 source_topic_id=topic_id,
-                canonical_topic_id=canonical_topic_id,
+                canonical_topic_id=topic_id,
                 status=status,
-                preferred_parent_id=active_slice.parent_hint,
+                preferred_parent_id=seed.parent_hint,
                 leaf_name=seed.leaf_name,
-                slice=active_slice,
-                merged_topic_ids=list(merged_ids if topic_id == canonical_topic_id else merged_ids),
-                split_topic_ids=[child.topic_id for child in children] if topic_id == canonical_topic_id else [],
+                slice=seed,
+                merged_topic_ids=[],
+                split_topic_ids=[],
             )
         )
-        if topic_id != canonical_topic_id:
-            continue
-        for child in children:
-            plans.append(
-                TopicRowPlan(
-                    tenant_id=tenant_id,
-                    topic_id=child.topic_id,
-                    source_topic_id=topic_id,
-                    canonical_topic_id=child.topic_id,
-                    status=TOPIC_STATUS_ACTIVE,
-                    preferred_parent_id=topic_id,
-                    leaf_name=child.leaf_name,
-                    slice=child,
-                    merged_topic_ids=[],
-                    split_topic_ids=[],
-                )
-            )
 
-    parent_ids = _resolve_parent_ids(plans)
+    canonical_topic_ids = {plan.topic_id for plan in plans}
+    parent_ids: Dict[str, str] = {}
+    for plan in plans:
+        preferred_parent = str(plan.preferred_parent_id or "")
+        if preferred_parent and preferred_parent != plan.topic_id and preferred_parent in canonical_topic_ids:
+            parent_ids[plan.topic_id] = preferred_parent
+            continue
+        parent_ids[plan.topic_id] = ""
     paths = _resolve_paths(plans, parent_ids)
     materialized_at = pd.Timestamp.now(tz="UTC")
     rows: List[Dict[str, object]] = []
@@ -756,9 +638,7 @@ class TopicStats:
 
 class GaussianEwensTopicModel:
     """
-    Online Gaussian-Ewens-process style topic assignment:
-    - Ewens prior for existing vs new topic probabilities.
-    - Isotropic Gaussian likelihood over hashed text vectors.
+    Online Gaussian-Ewens-process style topic assignment over dense vectors.
     """
 
     def __init__(
@@ -768,19 +648,40 @@ class GaussianEwensTopicModel:
         concentration: float = 0.8,
         sigma2: float = 0.7,
         prior_sigma2: float = 1.2,
+        min_dot_product: float = 0.45,
         topic_prefix: str = "geptopic",
     ) -> None:
         self.dim = max(8, int(dim))
         self.concentration = max(1e-6, float(concentration))
         self.sigma2 = max(1e-6, float(sigma2))
         self.prior_sigma2 = max(1e-6, float(prior_sigma2))
+        self.min_dot_product = max(-1.0, min(1.0, float(min_dot_product)))
         self.topic_prefix = topic_prefix
         self._stats: Dict[str, TopicStats] = {}
         self._total = 0
         self._next = 1
 
+    def _observe_existing_topic_id(self, topic_id: str) -> None:
+        match = TOPIC_ID_SUFFIX_RE.search(str(topic_id or "").strip())
+        if match is None:
+            return
+        if str(match.group("prefix") or "").strip() != self.topic_prefix:
+            return
+        try:
+            ordinal = int(match.group("ordinal"))
+        except Exception:
+            return
+        if ordinal >= self._next:
+            self._next = ordinal + 1
+
     def _squared_dist(self, a: List[float], b: List[float]) -> float:
-        return sum((x - y) * (x - y) for x, y in zip(a, b))
+        dims = max(len(a), len(b))
+        total = 0.0
+        for idx in range(dims):
+            left = float(a[idx]) if idx < len(a) else 0.0
+            right = float(b[idx]) if idx < len(b) else 0.0
+            total += (left - right) * (left - right)
+        return total
 
     def _log_gaussian(self, x: List[float], mean: List[float], sigma2: float) -> float:
         dist2 = self._squared_dist(x, mean)
@@ -791,34 +692,66 @@ class GaussianEwensTopicModel:
         self._next += 1
         return topic_id
 
+    def _normalize_vector(self, vector: Sequence[float]) -> List[float]:
+        raw = [float(item) for item in vector]
+        if not raw:
+            return [0.0] * self.dim
+        norm = math.sqrt(sum(item * item for item in raw))
+        if norm <= 0.0:
+            return [0.0] * len(raw)
+        return [item / norm for item in raw]
+
+    def _mean_size(self, topic_id: str, vector_length: int) -> List[float]:
+        stats = self._stats.get(topic_id)
+        if stats is None:
+            return [0.0] * max(1, int(vector_length))
+        if len(stats.mean) >= vector_length:
+            return list(stats.mean)
+        return list(stats.mean) + ([0.0] * (vector_length - len(stats.mean)))
+
     def propose_topic(self, text: str) -> str:
-        x = _vectorize(text, self.dim)
+        return self.propose_topic_vector(_vectorize(text, self.dim))
+
+    def propose_topic_vector(self, vector: Sequence[float]) -> str:
+        x = self._normalize_vector(vector)
         if not self._stats:
             return self._new_topic_id()
 
         total_plus_theta = float(self._total) + self.concentration
         best_topic = ""
         best_score = float("-inf")
+        best_similarity = float("-inf")
 
         for topic_id, stats in self._stats.items():
+            similarity = _cosine_similarity(x, self._mean_size(topic_id, len(x)))
+            best_similarity = max(best_similarity, similarity)
+            if similarity < self.min_dot_product:
+                continue
             prior = math.log(max(1e-12, float(stats.count) / total_plus_theta))
-            ll = self._log_gaussian(x, stats.mean, self.sigma2)
+            ll = self._log_gaussian(x, self._mean_size(topic_id, len(x)), self.sigma2)
             score = prior + ll
             if score > best_score:
                 best_score = score
                 best_topic = topic_id
 
+        if not best_topic and best_similarity < self.min_dot_product:
+            return self._new_topic_id()
+
         new_prior = math.log(max(1e-12, self.concentration / total_plus_theta))
-        zero_mean = [0.0] * self.dim
+        zero_mean = [0.0] * len(x)
         new_ll = self._log_gaussian(x, zero_mean, self.prior_sigma2)
         new_score = new_prior + new_ll
 
-        if new_score > best_score:
+        if not best_topic or new_score > best_score:
             return self._new_topic_id()
         return best_topic
 
     def observe(self, topic_id: str, text: str) -> None:
-        x = _vectorize(text, self.dim)
+        self.observe_vector(topic_id, _vectorize(text, self.dim))
+
+    def observe_vector(self, topic_id: str, vector: Sequence[float]) -> None:
+        self._observe_existing_topic_id(topic_id)
+        x = self._normalize_vector(vector)
         stats = self._stats.get(topic_id)
         if stats is None:
             self._stats[topic_id] = TopicStats(topic_id=topic_id, count=1, mean=x)
@@ -827,10 +760,29 @@ class GaussianEwensTopicModel:
 
         n = stats.count
         new_n = n + 1
-        stats.mean = [((m * n) + xv) / new_n for m, xv in zip(stats.mean, x)]
+        dims = max(len(stats.mean), len(x))
+        current_mean = list(stats.mean) + ([0.0] * (dims - len(stats.mean)))
+        observed = list(x) + ([0.0] * (dims - len(x)))
+        stats.mean = [((m * n) + xv) / new_n for m, xv in zip(current_mean, observed)]
         stats.count = new_n
         self._total += 1
 
     def observe_replay(self, topic_id: str, text: str) -> None:
         # replay should restore model state; behavior identical to observe
         self.observe(topic_id, text)
+
+    def observe_replay_vector(self, topic_id: str, vector: Sequence[float]) -> None:
+        self.observe_vector(topic_id, vector)
+
+    def hydrate_topic_vector(self, topic_id: str, count: int, mean: Sequence[float]) -> None:
+        resolved_count = max(0, int(count))
+        if resolved_count <= 0:
+            return
+        self._observe_existing_topic_id(topic_id)
+        normalized_mean = self._normalize_vector(mean)
+        self._stats[str(topic_id)] = TopicStats(
+            topic_id=str(topic_id),
+            count=resolved_count,
+            mean=normalized_mean,
+        )
+        self._total += resolved_count

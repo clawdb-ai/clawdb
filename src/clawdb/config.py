@@ -27,6 +27,7 @@ class ClawDBConfig:
     topic_gep_concentration: float
     topic_gep_sigma2: float
     topic_gep_prior_sigma2: float
+    topic_gep_min_dot_product: float
     openclaw_require_signature: bool
     flush_interval_seconds: int
     lock_timeout_seconds: float
@@ -78,6 +79,9 @@ class ClawDBConfig:
             topic_gep_concentration=float(os.getenv("CLAWDB_TOPIC_GEP_CONCENTRATION", "0.8")),
             topic_gep_sigma2=float(os.getenv("CLAWDB_TOPIC_GEP_SIGMA2", "0.7")),
             topic_gep_prior_sigma2=float(os.getenv("CLAWDB_TOPIC_GEP_PRIOR_SIGMA2", "1.2")),
+            topic_gep_min_dot_product=float(
+                os.getenv("CLAWDB_TOPIC_GEP_MIN_DOT_PRODUCT", "0.45")
+            ),
             openclaw_require_signature=_env_bool("CLAWDB_OPENCLAW_REQUIRE_SIGNATURE", "true"),
             flush_interval_seconds=int(os.getenv("CLAWDB_FLUSH_INTERVAL_SECONDS", "10")),
             lock_timeout_seconds=float(os.getenv("CLAWDB_LOCK_TIMEOUT_SECONDS", "1.5")),

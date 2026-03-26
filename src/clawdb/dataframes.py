@@ -45,6 +45,7 @@ from .search_index import (
     parse_vector_json,
 )
 from .storage_layout import MessageChannelFile, table_parquet_files
+from .textsize import utf8_text_size
 from .topics import (
     DEFAULT_TOPIC_VECTOR_DIM,
     TOPICS_COLUMNS,
@@ -593,7 +594,7 @@ def materialize_session_rollups(
                     source_first_ts=source_first_ts,
                     source_last_ts=source_last_ts,
                     message_count=int(bucket_ordered.shape[0]),
-                    content_char_count=int(bucket_ordered["content"].astype(str).map(len).sum()),
+                    content_char_count=int(bucket_ordered["content"].astype(str).map(utf8_text_size).sum()),
                 )
                 vector_text = summary
                 rows.append(
@@ -608,7 +609,9 @@ def materialize_session_rollups(
                         "source_first_ts": source_first_ts,
                         "source_last_ts": source_last_ts,
                         "message_count": int(bucket_ordered.shape[0]),
-                        "content_char_count": int(bucket_ordered["content"].astype(str).map(len).sum()),
+                        "content_char_count": int(
+                            bucket_ordered["content"].astype(str).map(utf8_text_size).sum()
+                        ),
                         "summary": summary,
                         "vector_text": vector_text,
                         "vector_ref": (
@@ -3127,7 +3130,7 @@ class DataFrameStore:
                 replaced_existing=replaced_existing,
             )
 
-    async def resolve_origin_message_id(
+    def _resolve_origin_message_id_locked(
         self,
         *,
         tenant_id: str,
@@ -3137,51 +3140,117 @@ class DataFrameStore:
         platform_message_id: Optional[str] = None,
     ) -> Optional[str]:
         explicit = str(origin_message_id or "").strip()
-        async with self._lock:
-            if explicit:
-                mask = (
-                    (self._state.messages_df["tenant_id"].astype(str) == str(tenant_id))
-                    & (self._state.messages_df["origin_message_id"].astype(str) == explicit)
-                )
-                if mask.any():
-                    return explicit
-                return None
-            platform_message_id_text = str(platform_message_id or "").strip()
-            if not platform_message_id_text:
-                return None
-            resolved_platform = None
-            if platform is not None and str(platform).strip():
-                resolved_platform = normalize_platform(str(platform))
-            df = self._state.messages_df
+        if explicit:
             mask = (
+                (self._state.messages_df["tenant_id"].astype(str) == str(tenant_id))
+                & (self._state.messages_df["origin_message_id"].astype(str) == explicit)
+            )
+            if mask.any():
+                return explicit
+            return None
+        platform_message_id_text = str(platform_message_id or "").strip()
+        if not platform_message_id_text:
+            return None
+        resolved_platform = None
+        if platform is not None and str(platform).strip():
+            resolved_platform = normalize_platform(str(platform))
+        df = self._state.messages_df
+        mask = (
+            (df["tenant_id"].astype(str) == str(tenant_id))
+            & (df["projection_kind"].astype(str) == RAW_PROJECTION_KIND)
+            & (df["platform_message_id"].astype(str) == platform_message_id_text)
+        )
+        if resolved_platform is not None:
+            mask &= df["platform"].astype(str) == str(resolved_platform)
+        if account_id is not None and str(account_id).strip():
+            account_id_text = str(account_id).strip()
+            account_candidates = {account_id_text}
+            if resolved_platform is not None:
+                account_candidates.add(
+                    normalize_identity(str(resolved_platform), account_id_text, "account")
+                )
+            if "account_key" not in df.columns:
+                df = df.copy()
+                df["account_key"] = ""
+            mask &= (
+                df["account_id"].astype(str).isin(account_candidates)
+                | df["account_key"].astype(str).isin(account_candidates)
+            )
+        matches = df[mask]["origin_message_id"].astype(str).dropna().unique().tolist()
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise ValueError(
+                f"platform_message_id resolved to multiple origin_message_id values: {platform_message_id_text}"
+            )
+        return str(matches[0])
+
+    async def resolve_origin_message_id(
+        self,
+        *,
+        tenant_id: str,
+        origin_message_id: Optional[str] = None,
+        platform: Optional[str] = None,
+        account_id: Optional[str] = None,
+        platform_message_id: Optional[str] = None,
+    ) -> Optional[str]:
+        async with self._lock:
+            return self._resolve_origin_message_id_locked(
+                tenant_id=tenant_id,
+                origin_message_id=origin_message_id,
+                platform=platform,
+                account_id=account_id,
+                platform_message_id=platform_message_id,
+            )
+
+    async def resolve_message_topic(
+        self,
+        *,
+        tenant_id: str,
+        reference_message_id: Optional[str],
+        platform: Optional[str] = None,
+        account_id: Optional[str] = None,
+    ) -> Optional[Dict[str, str]]:
+        reference_text = str(reference_message_id or "").strip()
+        if not reference_text:
+            return None
+        async with self._lock:
+            resolved_origin = self._resolve_origin_message_id_locked(
+                tenant_id=tenant_id,
+                origin_message_id=reference_text,
+            )
+            if resolved_origin is None:
+                resolved_origin = self._resolve_origin_message_id_locked(
+                    tenant_id=tenant_id,
+                    platform=platform,
+                    account_id=account_id,
+                    platform_message_id=reference_text,
+                )
+            if resolved_origin is None:
+                return None
+            df = self._state.messages_df
+            scoped = df[
                 (df["tenant_id"].astype(str) == str(tenant_id))
                 & (df["projection_kind"].astype(str) == RAW_PROJECTION_KIND)
-                & (df["platform_message_id"].astype(str) == platform_message_id_text)
-            )
-            if resolved_platform is not None:
-                mask &= df["platform"].astype(str) == str(resolved_platform)
-            if account_id is not None and str(account_id).strip():
-                account_id_text = str(account_id).strip()
-                account_candidates = {account_id_text}
-                if resolved_platform is not None:
-                    account_candidates.add(
-                        normalize_identity(str(resolved_platform), account_id_text, "account")
-                    )
-                if "account_key" not in df.columns:
-                    df = df.copy()
-                    df["account_key"] = ""
-                mask &= (
-                    df["account_id"].astype(str).isin(account_candidates)
-                    | df["account_key"].astype(str).isin(account_candidates)
-                )
-            matches = df[mask]["origin_message_id"].astype(str).dropna().unique().tolist()
-            if not matches:
+                & (df["origin_message_id"].astype(str) == str(resolved_origin))
+                & (df["message_state"].astype(str) != MESSAGE_STATE_DELETED)
+            ].copy()
+            if scoped.empty:
                 return None
-            if len(matches) > 1:
-                raise ValueError(
-                    f"platform_message_id resolved to multiple origin_message_id values: {platform_message_id_text}"
-                )
-            return str(matches[0])
+            scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
+            scoped["ts"] = pd.to_datetime(scoped["ts"], utc=True, errors="coerce")
+            scoped = scoped.sort_values(
+                ["updated_at", "ts", "message_id"],
+                ascending=[False, False, False],
+                kind="stable",
+            )
+            row = scoped.iloc[0]
+            return {
+                "origin_message_id": str(resolved_origin),
+                "topic_id": str(row.get("source_topic_id") or row.get("topic_id") or ""),
+                "topic_path": str(row.get("source_topic_path") or row.get("topic_path") or ""),
+                "topic_source": str(row.get("topic_source") or ""),
+            }
 
     async def infer_projection_target_user_key(
         self,
@@ -4948,6 +5017,65 @@ class DataFrameStore:
                     }
                 )
             return out
+
+    async def topic_runtime_rows(self) -> List[Dict[str, object]]:
+        async with self._lock:
+            topics = self._state.topics_df
+            if topics.empty:
+                return []
+            scoped = topics.copy().reset_index(drop=True)
+            scoped["tenant_id"] = scoped["tenant_id"].fillna("default").astype(str)
+            scoped["topic_id"] = scoped["topic_id"].fillna("default").astype(str)
+            scoped["canonical_topic_id"] = scoped["canonical_topic_id"].fillna(scoped["topic_id"]).astype(str)
+            scoped["topic_path"] = scoped["topic_path"].fillna(scoped["canonical_topic_id"]).astype(str)
+            scoped["status"] = scoped["status"].fillna("").astype(str)
+            scoped["summary"] = scoped["summary"].fillna("").astype(str)
+            scoped["vector_text"] = scoped["vector_text"].fillna(scoped["summary"]).astype(str)
+            scoped["message_count"] = pd.to_numeric(
+                scoped["message_count"], errors="coerce"
+            ).fillna(0).astype(int)
+            scoped["updated_at"] = pd.to_datetime(scoped["updated_at"], utc=True, errors="coerce")
+            scoped = scoped[scoped["status"].astype(str) != "compacted"].copy()
+            if scoped.empty:
+                return []
+            scoped["_canonical_priority"] = (
+                scoped["topic_id"].astype(str) != scoped["canonical_topic_id"].astype(str)
+            ).astype(int)
+            scoped = scoped.sort_values(
+                ["tenant_id", "canonical_topic_id", "_canonical_priority", "updated_at", "topic_id"],
+                ascending=[True, True, True, False, True],
+                kind="stable",
+            )
+            scoped = scoped.groupby(
+                ["tenant_id", "canonical_topic_id"], sort=True, as_index=False
+            ).head(1)
+            rows: List[Dict[str, object]] = []
+            for _, row in scoped.iterrows():
+                rows.append(
+                    {
+                        "tenant_id": str(row.get("tenant_id") or "default"),
+                        "topic_id": str(row.get("canonical_topic_id") or row.get("topic_id") or "default"),
+                        "topic_path": str(row.get("topic_path") or row.get("canonical_topic_id") or row.get("topic_id") or "default"),
+                        "vector_text": str(row.get("vector_text") or row.get("summary") or ""),
+                        "message_count": int(row.get("message_count") or 0),
+                    }
+                )
+            return rows
+
+    async def needs_materialized_rebuild(self) -> bool:
+        async with self._lock:
+            raw_messages = authoritative_raw_messages(self._state.messages_df)
+            if raw_messages.empty:
+                return False
+            return bool(
+                self._state.topics_df.empty
+                or self._state.capsules_df.empty
+                or self._state.projections_df.empty
+                or self._state.session_rollups_df.empty
+                or self._state.search_docs_df.empty
+                or self._state.lexical_index_df.empty
+                or self._state.vector_index_df.empty
+            )
 
     async def virtual_memory_file(self, rel_path: str) -> Tuple[str, str]:
         normalized = rel_path.replace("\\", "/").lstrip("/")

@@ -1,0 +1,16 @@
+[Unit]
+Description=ClawDB local Qwen3 topic embedder
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Github/clawdb/deploy
+Environment=QWEN3_TOPIC_EMBEDDER_MODEL=Qwen/Qwen3-Embedding-0.6B
+Environment=QWEN3_TOPIC_EMBEDDER_HOST=127.0.0.1
+Environment=QWEN3_TOPIC_EMBEDDER_PORT=11440
+ExecStart=%h/.openclaw/topic-embedder/.venv/bin/python %h/Github/clawdb/deploy/qwen3_topic_embedder.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

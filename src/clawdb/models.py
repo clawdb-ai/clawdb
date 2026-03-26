@@ -51,7 +51,7 @@ class MessageIn(BaseModel):
     topic_parent_id: Optional[str] = None
     topic_path: Optional[str] = None
     topic_confidence: Optional[float] = None
-    topic_source: Optional[Literal["explicit", "gauss_ewens", "trie", "manual", "replay"]] = None
+    topic_source: Optional[Literal["explicit", "gauss_ewens", "trie", "manual", "replay", "reply"]] = None
     capsule_level: Literal["L0", "L1", "L2"] = "L0"
     idempotency_key: Optional[str] = None
     message_id: str = Field(default_factory=lambda: str(uuid4()))
