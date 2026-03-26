@@ -1,0 +1,21 @@
+[Unit]
+Description=ClawDB live Feishu ingester
+After=network.target clawdb.service
+Wants=clawdb.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/sansha/Github/clawdb
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/home/sansha/Github/clawdb/src
+Environment=CLAWDB_BASE_URL=http://127.0.0.1:8080
+Environment=FEISHU_SECRETS_PATH=%h/.openclaw/secrets.store.json
+Environment=FEISHU_LIVE_STATE_PATH=%h/.openclaw/feishu/clawdb-live-state.json
+Environment=FEISHU_LIVE_POLL_SECONDS=30
+Environment=FEISHU_LIVE_CHAT_REFRESH_SECONDS=300
+ExecStart=/home/sansha/anaconda3/bin/python /home/sansha/Github/clawdb/scripts/ingest_feishu_live.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
